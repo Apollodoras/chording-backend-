@@ -1,0 +1,131 @@
+"""The engine registry — and the reason it is empty.
+
+§8 step 2: *"Benchmark 2+ chord engines and 2+ beat trackers on a handful of
+tracks the user picks. **Report results and let them choose** before committing."*
+That choice has not been made, so **no engine is registered here yet** and
+`build` answers with a clean "unavailable" rather than quietly picking one. A
+default engine chosen by the person who happened to write the module is exactly
+the commitment the handoff asks not to make.
+
+What this file provides today is the seam that makes the choice cheap when it
+comes: an adapter registers itself under a name, `CHORDS_CHORD_ENGINE` /
+`CHORDS_BEAT_TRACKER` select it, and `name@version` is persisted on every stored
+map (§5.3) so upgrading one engine invalidates only the caches it produced.
+
+Adding an engine is three steps and no changes to anything upstream:
+
+1. write the adapter (`analyze(pcm, sr) -> list[RawChordSpan]`, Harte or symbolic
+   labels — `postprocess` normalizes them),
+2. `register_chord_engine("btc", lambda: BtcEngine())`,
+3. add its dependency to the `engines-btc` extra in `pyproject.toml` and to the
+   worker image in `modal_app.py` — **never** to the API image (§4).
+
+Candidates, from §5.2/§5.3, with what the benchmark has to settle:
+
+- chords: **BTC** (strongest on pop/rock; needs a GPU — available per-function on
+  Modal, but a GPU cold start per job may cost more latency than Chordino's
+  accuracy gap costs quality, and this pipeline is already async),
+  **Chordino/NNLS-Chroma** (predictable, no GPU), **autochord** (weaker).
+- beats: **madmom** (the accuracy benchmark, effectively unmaintained, breaks on
+  NumPy 2.x — hence the `<2` pin), **beat_this**, **BeatNet**,
+  **librosa.beat.beat_track** (fast, weaker on downbeats).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Callable
+
+from ..errors import AnalysisError, CODE_FEATURE_DISABLED
+from .types import BeatTracker, ChordEngine, OnsetDetector
+
+log = logging.getLogger("chords.engines")
+
+ChordEngineFactory = Callable[[], ChordEngine]
+BeatTrackerFactory = Callable[[], BeatTracker]
+OnsetDetectorFactory = Callable[[], OnsetDetector]
+
+_CHORD_ENGINES: dict[str, ChordEngineFactory] = {}
+_BEAT_TRACKERS: dict[str, BeatTrackerFactory] = {}
+_ONSET_DETECTORS: dict[str, OnsetDetectorFactory] = {}
+
+
+def register_chord_engine(name: str, factory: ChordEngineFactory) -> None:
+    _CHORD_ENGINES[name] = factory
+
+
+def register_beat_tracker(name: str, factory: BeatTrackerFactory) -> None:
+    _BEAT_TRACKERS[name] = factory
+
+
+def register_onset_detector(name: str, factory: OnsetDetectorFactory) -> None:
+    _ONSET_DETECTORS[name] = factory
+
+
+def available() -> dict[str, list[str]]:
+    """What this build can actually run. Reported by `/healthz`, so a deployment
+    that shipped without its engines says so rather than 500ing on first use."""
+    return {
+        "chords": sorted(_CHORD_ENGINES),
+        "beats": sorted(_BEAT_TRACKERS),
+        "onsets": sorted(_ONSET_DETECTORS),
+    }
+
+
+class EngineUnavailable(AnalysisError):
+    """No engine is registered or configured — analysis cannot run at all.
+
+    Deliberately the same 503 + `feature_disabled` shape as the kill switch: from
+    the player's side "we haven't chosen an engine yet" and "we turned it off"
+    are the same fact, and the client already renders it.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, CODE_FEATURE_DISABLED, status=503)
+
+
+def _pick(kind: str, registry: dict, configured: str | None):
+    if not registry:
+        raise EngineUnavailable(
+            f"Chord analysis isn’t available yet — no {kind} engine is installed in this build."
+        )
+    if configured is None:
+        raise EngineUnavailable(
+            f"Chord analysis isn’t available yet — no {kind} engine has been selected."
+        )
+    factory = registry.get(configured)
+    if factory is None:
+        raise EngineUnavailable(
+            f"Chord analysis isn’t available yet — {kind} engine {configured!r} isn’t "
+            f"installed (have: {', '.join(sorted(registry)) or 'none'})."
+        )
+    return factory()
+
+
+def build_chord_engine(settings) -> ChordEngine:
+    return _pick("chord", _CHORD_ENGINES, settings.chord_engine)
+
+
+def build_beat_tracker(settings) -> BeatTracker:
+    return _pick("beat", _BEAT_TRACKERS, settings.beat_tracker)
+
+
+def build_onset_detector(settings) -> OnsetDetector | None:
+    """Optional: without one, §14 falls back to a quarter-note downstroke bar,
+    which is a song that plays rather than a song that fails."""
+    if not _ONSET_DETECTORS:
+        return None
+    name = settings.beat_tracker if settings.beat_tracker in _ONSET_DETECTORS else None
+    if name is None:
+        name = sorted(_ONSET_DETECTORS)[0]
+    return _ONSET_DETECTORS[name]()
+
+
+def is_ready(settings) -> bool:
+    """Whether an analysis could run right now. Used by `/healthz` and by the
+    route that decides between 202-and-a-job and a clean 503."""
+    return bool(
+        _CHORD_ENGINES and _BEAT_TRACKERS
+        and settings.chord_engine in _CHORD_ENGINES
+        and settings.beat_tracker in _BEAT_TRACKERS
+    )

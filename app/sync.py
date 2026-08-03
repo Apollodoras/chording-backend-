@@ -1,0 +1,161 @@
+"""The video-sync sidecar (handoff §13) — and the invariant that makes it work.
+
+A ``CompositionPayload`` is a **relative** grid: tempo + meter + bars. A real
+recording is **absolute** and drifts. The sidecar is the map between them, and it
+travels *beside* the song rather than inside it, so the payload stays
+byte-identical to what ``ComposerService.import`` expects and stays shareable
+as-is.
+
+All times are **integer milliseconds** from video start. Float drift over four
+minutes is real, and the client's own clock is milliseconds.
+
+---
+
+**The load-bearing invariant (§13.2), and where it came from.**
+
+The client addresses its cursor in *song beats* (``JamSongSheet.dueBeat(of:)`` =
+``barIndex × barBeats + beatOffset``), and a video clock is in milliseconds, so
+``beatAnchors`` is the interpolation table between the two::
+
+    songBeat = piecewise_linear(beatAnchors, videoCurrentTimeMs - offsetMs)
+
+That only works if ``songBeat`` here is the *same axis* the compiled chart
+produces — bar *n* of the payload must start at ``songBeat = n × barBeats``.
+
+Reading the client settles one thing the handoff did not spell out.
+``JamSongSheet.from(chart:barBeats:secondsPerBeat:)`` derives every stroke's bar
+as ``floor(beat / barBeats)`` **on a single song-level tempo and meter**; its own
+comment says per-section tempo/meter overrides make that "approximate ... only
+the bar grouping can drift". Approximate bar grouping is fine for a self-paced
+campfire song and fatal for a video-synced one, because the anchors would be
+addressing beats the cursor never lands on.
+
+So: **a song that carries a sidecar must have one uniform grid** — no
+``tempoOverride``, no ``timeSignatureOverride``, anywhere. Tempo drift belongs
+entirely in the anchors, which is precisely what they are for. ``app/lint.py``
+enforces this, and it is the rule to reach for first if a synced song ever walks
+off its own chart.
+"""
+
+from __future__ import annotations
+
+from bisect import bisect_right
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+SOURCE_YOUTUBE = "youtube"
+
+
+class Confidence(BaseModel):
+    """A measured value and how much to believe it."""
+
+    bpm: float
+    confidence: float
+
+
+class BeatAnchor(BaseModel):
+    """One (song beat ↔ video millisecond) correspondence.
+
+    ``songBeat`` is float because a downbeat can land on a fractional beat of the
+    song's grid once an offset is applied; ``tMs`` is integer because it is a
+    clock reading.
+    """
+
+    songBeat: float
+    tMs: int
+
+
+class EngineVersions(BaseModel):
+    """What produced this map — ``name@version``, e.g. ``btc@1.2.0``.
+
+    Persisted on every stored map (§5.3) so a cache can be invalidated
+    *selectively* when one engine is upgraded, rather than dropped wholesale.
+    """
+
+    chords: str
+    beats: str
+
+
+class VideoSync(BaseModel):
+    source: str = SOURCE_YOUTUBE
+    videoId: str
+    durationMs: int
+    # Nullable, admin-settable per video (§6 as amended). The app has NO latency
+    # calibration any more — it was deleted with the scoring it corrected — so a
+    # player-facing early/late nudge (§17.7) is the only correction path that
+    # exists, and this is the value it nudges.
+    offsetMs: Optional[int] = 0
+    tempo: Confidence
+    timeSignature: str
+    lowConfidence: bool = False
+    # §14: the strumming pattern's direction assignment is a *convention*, not a
+    # measurement, and support can be thin. Carried so the client can say so.
+    patternConfidence: Optional[float] = None
+    beatAnchors: list[BeatAnchor] = Field(default_factory=list)
+    engine: EngineVersions
+    analyzedAt: str
+
+
+class AnalyzeResponse(BaseModel):
+    """The §13.1 envelope: the song and its sidecar, side by side.
+
+    ``videoSync`` is ``None`` when beat tracking was too weak to trust (§13.3) —
+    a self-paced campfire song that's right beats a video-synced one that's
+    wrong, and the player has no score to protect, so the only cost of bad sync
+    is that the app feels broken.
+    """
+
+    song: dict
+    videoSync: Optional[VideoSync] = None
+
+
+def anchors_for(
+    downbeat_ms: list[int],
+    *,
+    bar_beats: float,
+    first_bar_index: int = 0,
+) -> list[BeatAnchor]:
+    """Downbeat times → anchors on the payload's beat axis.
+
+    One anchor per downbeat, which is what §13.2 asks for ("every downbeat is
+    ideal — cheap, and it makes the interpolation exact rather than
+    approximate"): bar *n* starts at ``songBeat = n × barBeats``, exactly the
+    axis ``dueBeat`` walks.
+
+    ``first_bar_index`` exists because the song may not start at the recording's
+    first downbeat — an intro the analysis discarded, or a pickup. It shifts the
+    beat axis without touching the timestamps.
+    """
+    return [
+        BeatAnchor(songBeat=(first_bar_index + i) * bar_beats, tMs=int(round(t)))
+        for i, t in enumerate(downbeat_ms)
+    ]
+
+
+def song_beat_at(anchors: list[BeatAnchor], t_ms: float) -> float:
+    """The client's interpolation, in Python — the reference implementation the
+    tests assert the anchors against.
+
+    Piecewise-linear inside the table; **linear extrapolation** off either end
+    using the nearest segment's slope, so a video that keeps playing past the
+    last anchor keeps producing beats rather than freezing the cursor. A single
+    anchor has no slope to extrapolate along, so it holds.
+    """
+    if not anchors:
+        return 0.0
+    if len(anchors) == 1:
+        return anchors[0].songBeat
+
+    times = [a.tMs for a in anchors]
+    index = bisect_right(times, t_ms) - 1
+    # Clamp to a real segment: -1 (before the first) uses the first segment's
+    # slope, and the last anchor uses the final one.
+    index = max(0, min(index, len(anchors) - 2))
+    left, right = anchors[index], anchors[index + 1]
+
+    span_ms = right.tMs - left.tMs
+    if span_ms <= 0:
+        return left.songBeat
+    ratio = (t_ms - left.tMs) / span_ms
+    return left.songBeat + ratio * (right.songBeat - left.songBeat)

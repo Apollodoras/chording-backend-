@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Explicit, because flat-layout auto-discovery trips over `tests`/`bench`/
+# `scripts` sitting beside `app` and refuses to guess.
+[tool.setuptools]
+packages = ["app", "app.analysis"]
+
+[project]
+name = "chords-backend"
+version = "0.1.0"
+description = "Chord analysis for Rosetta GP — turns a video id into a CompositionPayload v2 song (chord-backend-handoff.md)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.8",
+    "httpx>=0.27",
+    "firebase-admin>=6.5",
+    # The Postgres store. Imported lazily in app/store.py, so a SQLite-only run
+    # never touches it — but it ships in the deployed image. Same seam as Mo's.
+    "psycopg[binary,pool]>=3.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+# The audio half. Deliberately NOT a default dependency: the API container must
+# not be able to fetch or decode audio at all (handoff §2.1 blast radius, §4
+# "worker isolation matters"). Only the worker image installs this group, and
+# only the worker function is granted the credentials it needs.
+#
+# Engine choice is still open (handoff §8 step 2 — benchmark, then the owner
+# chooses), so this pins only what every candidate needs. The engines themselves
+# are added to `engines-*` groups once chosen; see app/analysis/engines.py.
+audio = [
+    "yt-dlp>=2024.8",
+    "numpy>=1.26,<2",   # madmom cannot load under NumPy 2.x (handoff §5.2)
+    "soundfile>=0.12",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

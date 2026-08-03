@@ -1,0 +1,88 @@
+{
+  "analyzedAt": "2026-08-03T08:57:50.455686Z",
+  "beatAnchors": [
+    {
+      "songBeat": 0.0,
+      "tMs": 0
+    },
+    {
+      "songBeat": 4.0,
+      "tMs": 2000
+    },
+    {
+      "songBeat": 8.0,
+      "tMs": 4000
+    },
+    {
+      "songBeat": 12.0,
+      "tMs": 6000
+    },
+    {
+      "songBeat": 16.0,
+      "tMs": 8000
+    },
+    {
+      "songBeat": 20.0,
+      "tMs": 10000
+    },
+    {
+      "songBeat": 24.0,
+      "tMs": 12000
+    },
+    {
+      "songBeat": 28.0,
+      "tMs": 14000
+    },
+    {
+      "songBeat": 32.0,
+      "tMs": 16000
+    },
+    {
+      "songBeat": 36.0,
+      "tMs": 18000
+    },
+    {
+      "songBeat": 40.0,
+      "tMs": 20000
+    },
+    {
+      "songBeat": 44.0,
+      "tMs": 22000
+    },
+    {
+      "songBeat": 48.0,
+      "tMs": 24000
+    },
+    {
+      "songBeat": 52.0,
+      "tMs": 26000
+    },
+    {
+      "songBeat": 56.0,
+      "tMs": 28000
+    },
+    {
+      "songBeat": 60.0,
+      "tMs": 30000
+    },
+    {
+      "songBeat": 64.0,
+      "tMs": 32000
+    }
+  ],
+  "durationMs": 32000,
+  "engine": {
+    "beats": "reference@1.0.0",
+    "chords": "reference@1.0.0"
+  },
+  "lowConfidence": false,
+  "offsetMs": 0,
+  "patternConfidence": 1.0,
+  "source": "youtube",
+  "tempo": {
+    "bpm": 120.0,
+    "confidence": 0.95
+  },
+  "timeSignature": "4/4",
+  "videoId": "dQw4w9WgXcQ"
+}

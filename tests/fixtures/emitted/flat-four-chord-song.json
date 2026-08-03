@@ -1,0 +1,94 @@
+{
+  "arrangement": {
+    "sections": [
+      {
+        "beatsPerChord": 4,
+        "chordNames": [
+          "G",
+          "D",
+          "Em",
+          "C"
+        ],
+        "id": "4A1E6C2E-0000-4000-8000-000000000001",
+        "kindRaw": "custom",
+        "name": "Part 1",
+        "patternID": "yt:pat-reference-dduudu",
+        "repeats": 4
+      }
+    ]
+  },
+  "beatsPerChord": 4,
+  "chordNames": [
+    "G",
+    "D",
+    "Em",
+    "C"
+  ],
+  "id": "yt:dQw4w9WgXcQ:normal",
+  "mode": "major",
+  "patternID": "yt:pat-reference-dduudu",
+  "patterns": [
+    {
+      "id": "yt:pat-reference-dduudu",
+      "name": "Part 1 strum",
+      "strokes": [
+        {
+          "accent": true,
+          "beat": 0.0,
+          "direction": "down",
+          "id": "4A1E6C2E-0000-4000-8000-000000000101",
+          "msOffset": 0
+        },
+        {
+          "accent": false,
+          "beat": 1.0,
+          "direction": "down",
+          "id": "4A1E6C2E-0000-4000-8000-000000000102",
+          "msOffset": 0
+        },
+        {
+          "accent": false,
+          "beat": 1.5,
+          "direction": "up",
+          "id": "4A1E6C2E-0000-4000-8000-000000000103",
+          "msOffset": 0
+        },
+        {
+          "accent": false,
+          "beat": 2.5,
+          "direction": "up",
+          "id": "4A1E6C2E-0000-4000-8000-000000000104",
+          "msOffset": 0
+        },
+        {
+          "accent": false,
+          "beat": 3.0,
+          "direction": "down",
+          "id": "4A1E6C2E-0000-4000-8000-000000000105",
+          "msOffset": 0
+        },
+        {
+          "accent": false,
+          "beat": 3.5,
+          "direction": "up",
+          "id": "4A1E6C2E-0000-4000-8000-000000000106",
+          "msOffset": 0
+        }
+      ],
+      "tags": [
+        "yt",
+        "extracted",
+        "directions-by-convention"
+      ],
+      "tempo": 120,
+      "timeSignature": "4/4"
+    }
+  ],
+  "progressions": [],
+  "repeats": 4,
+  "tempo": 120,
+  "timeSignature": "4/4",
+  "title": "Known Song",
+  "tonic": "G",
+  "version": 2
+}

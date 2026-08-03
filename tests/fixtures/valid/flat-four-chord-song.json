@@ -1,0 +1,47 @@
+{
+  "version": 2,
+  "id": "yt:dQw4w9WgXcQ:normal",
+  "title": "Known Song",
+  "tonic": "G",
+  "mode": "major",
+  "tempo": 120,
+  "timeSignature": "4/4",
+  "chordNames": ["G", "D", "Em", "C"],
+  "patternID": "yt:pat-reference-dduudu",
+  "beatsPerChord": 4,
+  "repeats": 4,
+  "arrangement": {
+    "sections": [
+      {
+        "id": "4A1E6C2E-0000-4000-8000-000000000001",
+        "name": "Part 1",
+        "kindRaw": "custom",
+        "chordNames": ["G", "D", "Em", "C"],
+        "patternID": "yt:pat-reference-dduudu",
+        "beatsPerChord": 4,
+        "repeats": 4,
+        "tempoOverride": null,
+        "timeSignatureOverride": null,
+        "bars": null
+      }
+    ]
+  },
+  "patterns": [
+    {
+      "id": "yt:pat-reference-dduudu",
+      "name": "Part 1 strum",
+      "timeSignature": "4/4",
+      "tempo": 120,
+      "strokes": [
+        { "id": "4A1E6C2E-0000-4000-8000-000000000101", "beat": 0.0, "direction": "down", "accent": true,  "msOffset": 0, "strings": null },
+        { "id": "4A1E6C2E-0000-4000-8000-000000000102", "beat": 1.0, "direction": "down", "accent": false, "msOffset": 0, "strings": null },
+        { "id": "4A1E6C2E-0000-4000-8000-000000000103", "beat": 1.5, "direction": "up",   "accent": false, "msOffset": 0, "strings": null },
+        { "id": "4A1E6C2E-0000-4000-8000-000000000104", "beat": 2.5, "direction": "up",   "accent": false, "msOffset": 0, "strings": null },
+        { "id": "4A1E6C2E-0000-4000-8000-000000000105", "beat": 3.0, "direction": "down", "accent": false, "msOffset": 0, "strings": null },
+        { "id": "4A1E6C2E-0000-4000-8000-000000000106", "beat": 3.5, "direction": "up",   "accent": false, "msOffset": 0, "strings": null }
+      ],
+      "tags": ["yt", "extracted", "directions-by-convention"]
+    }
+  ],
+  "progressions": []
+}

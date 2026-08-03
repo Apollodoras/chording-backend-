@@ -1,0 +1,75 @@
+{
+  "version": 2,
+  "id": "yt:aBcDeFgHiJk:hard",
+  "title": "Mid-Bar Changes",
+  "tonic": "D",
+  "mode": "minor",
+  "tempo": 96,
+  "timeSignature": "4/4",
+  "chordNames": ["Dm", "Bb", "F", "C"],
+  "patternID": "yt:pat-reference-quarters",
+  "beatsPerChord": 4,
+  "repeats": 1,
+  "arrangement": {
+    "sections": [
+      {
+        "id": "4A1E6C2E-0000-4000-8000-000000000201",
+        "name": "Part 1",
+        "kindRaw": "custom",
+        "chordNames": ["Dm", "Bb", "F", "C"],
+        "patternID": "yt:pat-reference-quarters",
+        "beatsPerChord": 4,
+        "repeats": 1,
+        "tempoOverride": null,
+        "timeSignatureOverride": null,
+        "bars": [
+          {
+            "id": "4A1E6C2E-0000-4000-8000-000000000211",
+            "chordSpans": [
+              { "chordName": "Dm", "startBeat": 0.0, "lengthBeats": 2.0 },
+              { "chordName": "Bb", "startBeat": 2.0, "lengthBeats": 2.0 }
+            ],
+            "rhythm": { "inherit": {} }
+          },
+          {
+            "id": "4A1E6C2E-0000-4000-8000-000000000212",
+            "chordSpans": [
+              { "chordName": "F", "startBeat": 0.0, "lengthBeats": 4.0 }
+            ],
+            "rhythm": { "inherit": {} }
+          },
+          {
+            "id": "4A1E6C2E-0000-4000-8000-000000000213",
+            "chordSpans": [
+              { "chordName": "C", "startBeat": 0.0, "lengthBeats": 4.0 }
+            ],
+            "rhythm": { "inherit": {} }
+          },
+          {
+            "id": "4A1E6C2E-0000-4000-8000-000000000214",
+            "chordSpans": [
+              { "chordName": "Dm", "startBeat": 0.0, "lengthBeats": 4.0 }
+            ],
+            "rhythm": { "inherit": {} }
+          }
+        ]
+      }
+    ]
+  },
+  "patterns": [
+    {
+      "id": "yt:pat-reference-quarters",
+      "name": "Part 1 strum",
+      "timeSignature": "4/4",
+      "tempo": 96,
+      "strokes": [
+        { "id": "4A1E6C2E-0000-4000-8000-000000000221", "beat": 0.0, "direction": "down", "accent": false, "msOffset": 0, "strings": null },
+        { "id": "4A1E6C2E-0000-4000-8000-000000000222", "beat": 1.0, "direction": "down", "accent": false, "msOffset": 0, "strings": null },
+        { "id": "4A1E6C2E-0000-4000-8000-000000000223", "beat": 2.0, "direction": "down", "accent": false, "msOffset": 0, "strings": null },
+        { "id": "4A1E6C2E-0000-4000-8000-000000000224", "beat": 3.0, "direction": "down", "accent": false, "msOffset": 0, "strings": null }
+      ],
+      "tags": ["yt", "extracted", "directions-by-convention", "fallback"]
+    }
+  ],
+  "progressions": []
+}

@@ -1,0 +1,164 @@
+"""Job lifecycle — the seam between "the API accepted it" and "a worker ran it".
+
+§16.1 chose job-id + poll over Mo's long synchronous request, because analysis
+has a fetch + decode + DSP tail. That means something has to carry the work off
+the request thread, and **which** something is a deployment decision, so it lives
+behind `JobRunner.submit`:
+
+- `ThreadJobRunner` — a background thread in the API process. Fine for local dev
+  and a single-container run, and **not** what production should use: it shares
+  the API container's filesystem and credentials, which is precisely what §4's
+  worker isolation exists to prevent.
+- `ModalJobRunner` (`modal_app.py`) — spawns the isolated worker function:
+  separate image, separate secrets, read-only root, tmpfs scratch, its own
+  timeout and memory cap.
+
+Both call the same `run_job`, so the thing being tested locally is the thing that
+runs in production, minus the isolation.
+
+**On the hard timeout.** §5.1 wants a hard wall-clock budget with a kill-and-clean
+on breach. A Python thread cannot be killed from outside, so `ThreadJobRunner`
+only *checks* the deadline between stages — the real guarantee is the container's
+(Modal's `timeout=`, or Docker's), which is another reason the thread runner is
+for development. The scratch directory is destroyed either way: its cleanup runs
+in a `finally`, and a killed container takes its tmpfs with it.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+from .analysis import engines
+from .analysis.pipeline import analyze as run_pipeline
+from .errors import AnalysisError, CODE_ANALYSIS_FAILED, CODE_VIDEO_BLOCKED
+from .store import (
+    STATUS_ANALYZING,
+    STATUS_BLOCKED,
+    STATUS_FAILED,
+    STATUS_READY,
+    STATUS_UNAVAILABLE,
+    Store,
+)
+
+log = logging.getLogger("chords.jobs")
+
+# Failures that cost us nothing and are not the player's fault: the video was
+# blocked, private, region-locked, or too long — all decided from metadata,
+# before a byte is fetched. Charging a daily analysis for an error message would
+# be charging for nothing.
+REFUNDABLE_CODES = {
+    CODE_VIDEO_BLOCKED,
+    "video_unavailable",
+    "video_too_long",
+    "feature_disabled",
+}
+
+# Which terminal job status each error code maps to. `blocked` and `unavailable`
+# are separate from `failed` because the client renders them as calm states, not
+# errors (§17.8) — nothing went wrong, the video just isn't analyzable.
+_STATUS_FOR_CODE = {
+    CODE_VIDEO_BLOCKED: STATUS_BLOCKED,
+    "video_unavailable": STATUS_UNAVAILABLE,
+    "video_too_long": STATUS_UNAVAILABLE,
+}
+
+
+def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
+            settings, store: Store, source) -> None:
+    """Execute one analysis and record the outcome. Never raises.
+
+    Never raises on purpose: this runs detached from any request, so an escaping
+    exception would leave the job row stuck in `analyzing` forever and the client
+    polling something that will never move. Every exit path writes a terminal
+    status.
+    """
+    started = time.monotonic()
+
+    def progress(status: str, fraction: float) -> None:
+        store.update_job(job_id, status=status, progress=fraction)
+        if time.monotonic() - started > settings.job_deadline_s:
+            raise AnalysisError("That video took too long to analyze — try a shorter one.")
+
+    try:
+        store.update_job(job_id, status=STATUS_ANALYZING, progress=0.05)
+        outcome = run_pipeline(
+            video_id=video_id,
+            settings=settings,
+            store=store,
+            source=source,
+            chord_engine=engines.build_chord_engine(settings),
+            beat_tracker=engines.build_beat_tracker(settings),
+            onset_detector=engines.build_onset_detector(settings),
+            progress=progress,
+        )
+    except AnalysisError as exc:
+        _finish_failed(store, job_id, uid, exc.code, exc.message)
+        return
+    except Exception:
+        log.exception("job %s (%s) crashed", job_id, video_id)
+        _finish_failed(store, job_id, uid, CODE_ANALYSIS_FAILED,
+                       "That video couldn’t be analyzed.")
+        return
+
+    # One row per difficulty: all three tiers are computed from one analysis
+    # (§5.5 — "compute once, store all three, let the client pick") and stored
+    # together, so switching difficulty later is a cache hit rather than a job.
+    sync_wire = outcome.sync.model_dump() if outcome.sync else None
+    for tier, song in outcome.songs.items():
+        store.put_map(
+            video_id=video_id, difficulty=tier, song=song, sync=sync_wire,
+            engine_chords=outcome.engine_chords, engine_beats=outcome.engine_beats,
+            analyzed_at=outcome.analyzed_at, channel_id=outcome.meta.channel_id,
+            title=outcome.meta.title, duration_ms=outcome.duration_ms,
+            low_confidence=outcome.low_confidence,
+        )
+
+    store.update_job(job_id, status=STATUS_READY, progress=1.0)
+    log.info("job %s ready: %s (%s) in %.1fs", job_id, video_id,
+             ", ".join(sorted(outcome.songs)), time.monotonic() - started)
+
+
+def _finish_failed(store: Store, job_id: str, uid: str, code: str, message: str) -> None:
+    status = _STATUS_FOR_CODE.get(code, STATUS_FAILED)
+    store.update_job(job_id, status=status, progress=1.0,
+                     error_code=code, error_message=message)
+    if code in REFUNDABLE_CODES:
+        store.refund_use(uid)
+
+
+class JobRunner:
+    """Base: run inline. Only sensible in tests, where determinism beats
+    concurrency and a job that has finished by the time `submit` returns makes
+    assertions readable."""
+
+    def __init__(self, settings, store: Store, source):
+        self.settings = settings
+        self.store = store
+        self.source = source
+
+    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str) -> None:
+        run_job(job_id=job_id, video_id=video_id, difficulty=difficulty, uid=uid,
+                settings=self.settings, store=self.store, source=self.source)
+
+
+class ThreadJobRunner(JobRunner):
+    """Background threads in the API process — development and single-container
+    runs only. See the module docstring on why this is not production."""
+
+    def __init__(self, settings, store: Store, source, *, max_workers: int = 2):
+        super().__init__(settings, store, source)
+        self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="analysis")
+        self._lock = threading.Lock()
+
+    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str) -> None:
+        with self._lock:
+            self._pool.submit(
+                run_job, job_id=job_id, video_id=video_id, difficulty=difficulty,
+                uid=uid, settings=self.settings, store=self.store, source=self.source,
+            )
+
+    def shutdown(self) -> None:
+        self._pool.shutdown(wait=False)

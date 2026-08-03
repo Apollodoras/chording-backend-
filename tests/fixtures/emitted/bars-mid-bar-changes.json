@@ -1,0 +1,140 @@
+{
+  "arrangement": {
+    "sections": [
+      {
+        "bars": [
+          {
+            "chordSpans": [
+              {
+                "chordName": "Dm",
+                "lengthBeats": 2.0,
+                "startBeat": 0.0
+              },
+              {
+                "chordName": "Bb",
+                "lengthBeats": 2.0,
+                "startBeat": 2.0
+              }
+            ],
+            "id": "4A1E6C2E-0000-4000-8000-000000000211",
+            "rhythm": {
+              "inherit": {}
+            }
+          },
+          {
+            "chordSpans": [
+              {
+                "chordName": "F",
+                "lengthBeats": 4.0,
+                "startBeat": 0.0
+              }
+            ],
+            "id": "4A1E6C2E-0000-4000-8000-000000000212",
+            "rhythm": {
+              "inherit": {}
+            }
+          },
+          {
+            "chordSpans": [
+              {
+                "chordName": "C",
+                "lengthBeats": 4.0,
+                "startBeat": 0.0
+              }
+            ],
+            "id": "4A1E6C2E-0000-4000-8000-000000000213",
+            "rhythm": {
+              "inherit": {}
+            }
+          },
+          {
+            "chordSpans": [
+              {
+                "chordName": "Dm",
+                "lengthBeats": 4.0,
+                "startBeat": 0.0
+              }
+            ],
+            "id": "4A1E6C2E-0000-4000-8000-000000000214",
+            "rhythm": {
+              "inherit": {}
+            }
+          }
+        ],
+        "beatsPerChord": 4,
+        "chordNames": [
+          "Dm",
+          "Bb",
+          "F",
+          "C"
+        ],
+        "id": "4A1E6C2E-0000-4000-8000-000000000201",
+        "kindRaw": "custom",
+        "name": "Part 1",
+        "patternID": "yt:pat-reference-quarters",
+        "repeats": 1
+      }
+    ]
+  },
+  "beatsPerChord": 4,
+  "chordNames": [
+    "Dm",
+    "Bb",
+    "F",
+    "C"
+  ],
+  "id": "yt:aBcDeFgHiJk:hard",
+  "mode": "minor",
+  "patternID": "yt:pat-reference-quarters",
+  "patterns": [
+    {
+      "id": "yt:pat-reference-quarters",
+      "name": "Part 1 strum",
+      "strokes": [
+        {
+          "accent": false,
+          "beat": 0.0,
+          "direction": "down",
+          "id": "4A1E6C2E-0000-4000-8000-000000000221",
+          "msOffset": 0
+        },
+        {
+          "accent": false,
+          "beat": 1.0,
+          "direction": "down",
+          "id": "4A1E6C2E-0000-4000-8000-000000000222",
+          "msOffset": 0
+        },
+        {
+          "accent": false,
+          "beat": 2.0,
+          "direction": "down",
+          "id": "4A1E6C2E-0000-4000-8000-000000000223",
+          "msOffset": 0
+        },
+        {
+          "accent": false,
+          "beat": 3.0,
+          "direction": "down",
+          "id": "4A1E6C2E-0000-4000-8000-000000000224",
+          "msOffset": 0
+        }
+      ],
+      "tags": [
+        "yt",
+        "extracted",
+        "directions-by-convention",
+        "fallback"
+      ],
+      "tempo": 96,
+      "timeSignature": "4/4"
+    }
+  ],
+  "progressions": [],
+  "repeats": 1,
+  "tempo": 96,
+  "timeSignature": "4/4",
+  "title": "Mid-Bar Changes",
+  "tonic": "D",
+  "version": 2
+}

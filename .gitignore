@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# Local state
+*.sqlite3
+.env
+
+# Scratch. Nothing decoded should ever reach the working tree (handoff §2.1),
+# but an ignore entry means a mistake is at least never committed.
+scratch/
+bench/audio/
+
+# Editable-install metadata
+*.egg-info/
