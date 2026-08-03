@@ -30,13 +30,49 @@ dev = ["pytest>=8", "pytest-asyncio>=0.24"]
 # "worker isolation matters"). Only the worker image installs this group, and
 # only the worker function is granted the credentials it needs.
 #
-# Engine choice is still open (handoff §8 step 2 — benchmark, then the owner
-# chooses), so this pins only what every candidate needs. The engines themselves
-# are added to `engines-*` groups once chosen; see app/analysis/engines.py.
+# What every engine needs, and the fetch stage. Not enough to analyze anything
+# on its own — add an `engines-*` group for that.
 audio = [
     "yt-dlp>=2024.8",
-    "numpy>=1.26,<2",   # madmom cannot load under NumPy 2.x (handoff §5.2)
+    # <2.1 is a real constraint, not caution: numba (via librosa) tops out
+    # there on the wheels that exist for macOS x86_64, and building llvmlite
+    # from source needs a matching LLVM. The old `<2` pin was for madmom, which
+    # this build no longer uses — upstream madmom does not import on Python
+    # 3.11 at all (see app/analysis/engines.py).
+    "numpy>=1.26,<2.1",
     "soundfile>=0.12",
+]
+
+# The chosen pair (§8 step 2 — see the benchmark table in README.md).
+engines = [
+    "chords-backend[audio,engines-btc,engines-beat-this]",
+]
+
+# BTC — the chord engine. `torch` is the CPU build; the model is small and a GPU
+# mostly buys cold-start latency (§18). The checkout itself is not a pip
+# dependency: BTC is research code with no package, so the worker image clones
+# it and points CHORDS_BTC_ROOT at the result (see modal_app.py).
+engines-btc = [
+    "torch>=2.0,<3",
+    "librosa>=0.10",
+    "pyyaml>=6",
+]
+
+# Beat This! — the beat tracker. Installed from git: there is no PyPI release.
+engines-beat-this = [
+    "torch>=2.0,<3",
+    "einops",
+    "soxr",
+    "rotary-embedding-torch",
+    # Pinned to a commit, matching modal_app.py: a branch zip would mean two
+    # deploys of identical code could install different models.
+    "beat-this @ https://github.com/CPJKU/beat_this/archive/b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c.zip",
+]
+
+# The chroma-template baseline. Not deployed — it is the benchmark's control,
+# and the reason the numbers above mean anything.
+engines-chroma = [
+    "librosa>=0.10",
 ]
 
 [tool.pytest.ini_options]

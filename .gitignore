@@ -15,3 +15,6 @@ bench/audio/
 
 # Editable-install metadata
 *.egg-info/
+
+# Third-party checkouts (BTC weights are 24MB; cloned, not vendored)
+vendor/

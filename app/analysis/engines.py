@@ -33,6 +33,8 @@ Candidates, from §5.2/§5.3, with what the benchmark has to settle:
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import logging
 from typing import Callable
 
@@ -60,6 +62,74 @@ def register_beat_tracker(name: str, factory: BeatTrackerFactory) -> None:
 
 def register_onset_detector(name: str, factory: OnsetDetectorFactory) -> None:
     _ONSET_DETECTORS[name] = factory
+
+
+# --- built-in adapters -------------------------------------------------------
+#
+# `name -> (module, class, required top-level imports)`. Registration checks the
+# requirements with `find_spec`, which does **not** import them: the API image
+# has none of this installed (§4) and must not be made to try. The adapter module
+# itself imports its dependency inside `analyze`/`track`, so even a registered
+# engine costs nothing until it is built.
+
+_BUILTIN_CHORD_ENGINES = {
+    "chroma": (".adapters.chroma", "ChromaTemplateEngine", ("librosa", "numpy")),
+    "chordino": (".adapters.chordino", "ChordinoEngine", ("vamp", "numpy")),
+    "btc": (".adapters.btc", "BtcEngine", ("torch", "librosa")),
+}
+
+_BUILTIN_BEAT_TRACKERS = {
+    "librosa": (".adapters.librosa_beats", "LibrosaBeatTracker", ("librosa", "numpy")),
+    "beat_this": (".adapters.beat_this_tracker", "BeatThisTracker", ("beat_this", "torch")),
+    "madmom": (".adapters.madmom_beats", "MadmomBeatTracker", ("madmom", "numpy")),
+}
+
+_BUILTIN_ONSET_DETECTORS = {
+    "librosa": (".adapters.librosa_beats", "LibrosaOnsetDetector", ("librosa", "numpy")),
+}
+
+
+def _installed(requirements: tuple[str, ...]) -> bool:
+    for requirement in requirements:
+        try:
+            if importlib.util.find_spec(requirement) is None:
+                return False
+        except (ImportError, ValueError):
+            return False
+    return True
+
+
+def _lazy(module: str, attribute: str):
+    def factory():
+        loaded = importlib.import_module(module, package=__package__)
+        return getattr(loaded, attribute)()
+    return factory
+
+
+def register_builtins() -> None:
+    """Register every adapter whose dependency is present in *this* image.
+
+    Called at import so `/healthz` and `is_ready` describe what actually built —
+    the same principle the health check follows everywhere else. Idempotent.
+    """
+    for registry, table, register in (
+        (_CHORD_ENGINES, _BUILTIN_CHORD_ENGINES, register_chord_engine),
+        (_BEAT_TRACKERS, _BUILTIN_BEAT_TRACKERS, register_beat_tracker),
+        (_ONSET_DETECTORS, _BUILTIN_ONSET_DETECTORS, register_onset_detector),
+    ):
+        for name, (module, attribute, requirements) in table.items():
+            if name in registry or not _installed(requirements):
+                continue
+            # The adapter module itself must exist too. Without this, an
+            # unwritten adapter registers on the strength of its dependency
+            # being installed, and `available()` — which /healthz publishes as
+            # fact — advertises an engine that cannot be built.
+            try:
+                if importlib.util.find_spec(module, package=__package__) is None:
+                    continue
+            except (ImportError, ValueError):
+                continue
+            register(name, _lazy(module, attribute))
 
 
 def available() -> dict[str, list[str]]:
@@ -129,3 +199,6 @@ def is_ready(settings) -> bool:
         and settings.chord_engine in _CHORD_ENGINES
         and settings.beat_tracker in _BEAT_TRACKERS
     )
+
+
+register_builtins()

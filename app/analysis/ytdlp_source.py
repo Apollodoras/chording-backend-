@@ -1,0 +1,279 @@
+"""The fetch/decode implementation — §8 step 4, behind `fetch.py`'s seam.
+
+`fetch.py` states the contract and the reason for it; this is the half that
+touches a recording, and it exists **only in the worker image**. If this module
+is importable from the API container, the split that makes §2's blast-radius
+argument true has already been lost.
+
+Two calls, kept apart on purpose:
+
+- **`probe`** runs yt-dlp with `download=False`. Metadata only — duration, title,
+  channel id — because §3's blocklist is per-video *and* per-channel and the
+  10-minute cap is a rejection, so both must be decidable before a byte of audio
+  moves. The pipeline calls `gate()` between the two.
+- **`decode`** fetches the audio stream into the caller's scratch directory and
+  pipes it through ffmpeg to mono float32 at 22.05 kHz. It writes nothing outside
+  that directory and returns no paths — only samples, which die with the worker.
+
+**Everything is bounded.** A fetch stage with no limits is a worker that hangs on
+one pathological video and takes its container's whole timeout with it, so:
+socket timeout and retry count on yt-dlp, a wall-clock timeout on each
+subprocess, a hard ceiling on the downloaded file, and a re-check of the real
+duration after decoding — because the metadata cap is only as honest as the
+metadata, and `duration` is a field a video can simply not have.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from ..errors import AnalysisError, VideoUnavailable
+from .types import PCM, VideoMeta
+
+log = logging.getLogger("chords.fetch.ytdlp")
+
+_SAMPLE_RATE = 22050
+
+# Wall-clock ceilings. Both sit under the job deadline (§5.1's 180 s) so a stuck
+# fetch fails as a fetch rather than as an unexplained job timeout.
+_PROBE_TIMEOUT_S = 45
+_FETCH_TIMEOUT_S = 240
+_DECODE_TIMEOUT_S = 120
+
+# A 10-minute song at a sane bitrate is a few MB. 256 MB means something is
+# wrong — a mislabelled duration, a live stream, a video that is not a song —
+# and downloading it is how a worker with a memory cap dies instead of erroring.
+_MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
+
+# Substrings yt-dlp puts in its stderr for the "can't have it" family. These are
+# a *player-visible* outcome (§16.3's `video_unavailable`), not a bug, and must
+# not be reported as "something went wrong on our side".
+_UNAVAILABLE_MARKERS = (
+    "video unavailable", "private video", "removed by the uploader",
+    "not available in your country", "blocked it in your country",
+    "sign in to confirm your age", "age-restricted", "members-only",
+    "this live event", "has been terminated", "account associated with this video",
+    "unable to extract", "no video formats", "requested format is not available",
+    "sign in to confirm you're not a bot",
+)
+
+
+class FetchError(AnalysisError):
+    """A fetch or decode failed for a reason that is ours, not the video's."""
+
+    def __init__(self, message: str = "That video couldn’t be downloaded."):
+        super().__init__(message)
+
+
+def _looks_unavailable(stderr: str) -> bool:
+    lowered = (stderr or "").lower()
+    return any(marker in lowered for marker in _UNAVAILABLE_MARKERS)
+
+
+def _run(command: list[str], *, timeout: int, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(command, capture_output=True, text=True,
+                              timeout=timeout, cwd=str(cwd) if cwd else None,
+                              check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise FetchError("That video took too long to download — try a shorter one.") from exc
+    except FileNotFoundError as exc:
+        # Wrong image: this is the API container, or ffmpeg is missing from the
+        # worker. Loud, because it is a deployment error and not a video problem.
+        raise FetchError(f"Required tool missing from this image: {command[0]}") from exc
+
+
+class YtDlpSource:
+    """`VideoSource` — yt-dlp for the bytes, ffmpeg for the samples."""
+
+    name = "yt-dlp"
+
+    def __init__(self, settings=None) -> None:
+        self._settings = settings
+        self._ytdlp = [sys.executable, "-m", "yt_dlp"]
+        self._ffmpeg = os.environ.get("CHORDS_FFMPEG", "ffmpeg")
+        # Optional cookies file. YouTube increasingly answers datacentre IPs with
+        # a bot check; this is the supported escape hatch, and it is a path
+        # rather than a baked-in secret so it can be mounted where it is needed.
+        self._cookies = os.environ.get("CHORDS_YTDLP_COOKIES") or None
+
+    @property
+    def version(self) -> str:
+        """The yt-dlp version, resolved once and cached.
+
+        Persisted on every stored map (§5.3): yt-dlp changes behaviour often
+        enough that "which version fetched this" is a question worth being able
+        to answer when a cached map turns out to be wrong.
+        """
+        cached = getattr(self, "_version", None)
+        if cached is None:
+            result = _run(self._ytdlp + ["--version"], timeout=30)
+            cached = (result.stdout or "unknown").strip() or "unknown"
+            self._version = cached
+        return cached
+
+    def _common_args(self) -> list[str]:
+        args = ["--no-warnings", "--no-playlist", "--socket-timeout", "15",
+                "--retries", "2", "--no-progress"]
+        if self._cookies:
+            args += ["--cookies", self._cookies]
+        return args
+
+    # -- metadata only ------------------------------------------------------
+
+    def probe(self, video_id: str) -> VideoMeta:
+        result = _run(
+            self._ytdlp + self._common_args() + [
+                "--skip-download", "--dump-single-json",
+                f"https://www.youtube.com/watch?v={video_id}",
+            ],
+            timeout=_PROBE_TIMEOUT_S,
+        )
+        if result.returncode != 0:
+            if _looks_unavailable(result.stderr):
+                raise VideoUnavailable()
+            log.warning("probe failed for %s: %s", video_id, (result.stderr or "").strip()[:400])
+            raise FetchError("That video couldn’t be looked up.")
+
+        try:
+            info = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise FetchError("That video’s details couldn’t be read.") from exc
+
+        if info.get("is_live") or info.get("live_status") in {"is_live", "is_upcoming"}:
+            raise VideoUnavailable("That’s a live stream — try a recorded song.")
+
+        duration = info.get("duration")
+        if duration is None:
+            # No duration means the length cap cannot be enforced, and §18's cap
+            # is not advisory. Refuse rather than fetch something unbounded.
+            raise VideoUnavailable("That video’s length couldn’t be determined.")
+
+        return VideoMeta(
+            video_id=video_id,
+            title=(info.get("title") or video_id).strip(),
+            duration_s=float(duration),
+            channel_id=info.get("channel_id") or info.get("uploader_id"),
+        )
+
+    # -- the only code that holds audio -------------------------------------
+
+    def decode(self, video_id: str, workdir: Path, *,
+               sample_rate: int = _SAMPLE_RATE) -> tuple[PCM, int]:
+        """Fetch and decode into `workdir`, which the caller destroys.
+
+        `workdir` is a `scratch.scratch()` directory. Nothing here writes outside
+        it and nothing returns a path — the samples are the only thing that
+        leaves, and they live in the worker's memory until it dies.
+        """
+        import numpy as np
+
+        workdir = Path(workdir)
+        media = self._fetch(video_id, workdir)
+        wav = workdir / "decoded.wav"
+
+        result = _run([
+            self._ffmpeg, "-y", "-loglevel", "error",
+            "-i", str(media),
+            "-ac", "1", "-ar", str(sample_rate), "-c:a", "pcm_s16le",
+            str(wav),
+        ], timeout=_DECODE_TIMEOUT_S)
+        if result.returncode != 0 or not wav.is_file():
+            log.warning("decode failed for %s: %s", video_id, (result.stderr or "").strip()[:400])
+            raise FetchError("That video’s audio couldn’t be decoded.")
+
+        # Freed as soon as it is redundant. The scratch teardown would remove it
+        # anyway; dropping it here keeps the peak footprint to one copy, which is
+        # what the worker's memory cap is sized against.
+        try:
+            media.unlink()
+        except OSError:
+            pass
+
+        pcm = _read_wav(np, wav)
+        try:
+            wav.unlink()
+        except OSError:
+            pass
+
+        if pcm.size == 0:
+            raise FetchError("That video had no audio track.")
+
+        # The cap, re-checked against what was actually decoded. `probe`'s
+        # duration is metadata, and metadata can be wrong or absent; this is the
+        # number that is true. Belt and braces on §18's ceiling.
+        limit = getattr(self._settings, "max_video_seconds", None)
+        if limit and pcm.size / sample_rate > limit * 1.1:
+            from ..errors import VideoTooLong
+            raise VideoTooLong(int(limit))
+
+        return pcm, sample_rate
+
+    def _fetch(self, video_id: str, workdir: Path) -> Path:
+        """Download the smallest usable audio-only stream into `workdir`."""
+        template = str(workdir / "media.%(ext)s")
+        result = _run(
+            self._ytdlp + self._common_args() + [
+                # Audio-only, preferring the smallest acceptable stream: the
+                # pipeline resamples to 22.05 kHz mono regardless, so a
+                # high-bitrate download buys nothing but transfer time.
+                "-f", "worstaudio[abr>=64]/bestaudio/best",
+                "--max-filesize", str(_MAX_DOWNLOAD_BYTES),
+                "-o", template,
+                f"https://www.youtube.com/watch?v={video_id}",
+            ],
+            timeout=_FETCH_TIMEOUT_S,
+            cwd=workdir,
+        )
+        if result.returncode != 0:
+            if _looks_unavailable(result.stderr):
+                raise VideoUnavailable()
+            log.warning("fetch failed for %s: %s", video_id, (result.stderr or "").strip()[:400])
+            raise FetchError()
+
+        candidates = sorted(p for p in workdir.iterdir() if p.name.startswith("media"))
+        if not candidates:
+            # yt-dlp exits 0 when --max-filesize aborts the download.
+            raise FetchError("That video’s audio was too large to download.")
+        return candidates[0]
+
+
+def _read_wav(np, path: Path):
+    """16-bit PCM WAV → mono float32 in [-1, 1].
+
+    The stdlib `wave` module rather than soundfile/librosa: ffmpeg has already
+    produced exactly the format we asked for, so this needs no format guessing,
+    and it keeps one more C library out of the image that handles recordings.
+    """
+    import wave
+
+    with wave.open(str(path)) as source:
+        frames = source.readframes(source.getnframes())
+    if not frames:
+        return np.zeros(0, dtype="float32")
+    return np.frombuffer(frames, dtype="<i2").astype("float32") / 32768.0
+
+
+def available() -> bool:
+    """Whether this image can actually fetch — used by `build_source`.
+
+    `find_spec` rather than an import: this runs on the API container's startup
+    path, and that container is defined by *not* being able to touch audio (§4).
+    Importing yt-dlp to discover that we shouldn't have would be a small
+    contradiction, and it is the kind that a later refactor turns into a real
+    one. Checked presence, never loaded.
+    """
+    import importlib.util
+
+    if shutil.which(os.environ.get("CHORDS_FFMPEG", "ffmpeg")) is None:
+        return False
+    try:
+        return importlib.util.find_spec("yt_dlp") is not None
+    except (ImportError, ValueError):
+        return False

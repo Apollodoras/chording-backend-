@@ -236,6 +236,15 @@ class Store:
     _RATE_PRUNE_INTERVAL_S = 600.0
     _last_rate_prune = 0.0
 
+    # How long a finished job row is kept. `GET /v1/analyze/{jobId}` tells a
+    # caller with an unknown id that the analysis "has expired" — which was a
+    # lie for as long as nothing expired, since rows were only ever removed by a
+    # takedown. A day is comfortably longer than any client would keep polling
+    # and short enough that the table stays small.
+    _JOB_TTL_S = 86_400.0
+    _JOB_PRUNE_INTERVAL_S = 3_600.0
+    _last_job_prune = 0.0
+
     # -- backend seam --------------------------------------------------------
 
     @contextmanager
@@ -384,6 +393,36 @@ class Store:
             cur.execute(self._sql("DELETE FROM rate_events WHERE ts <= ?"), (now - older_than_s,))
             return cur.rowcount
 
+    def _maybe_prune_jobs(self, now: float | None = None) -> None:
+        """Occasional sweep of finished job rows, from whoever creates the next.
+
+        Same shape and same reasoning as the rate-event prune: no scheduler to
+        depend on, and housekeeping must never fail the request that triggered
+        it. **Only terminal rows** — a job still queued or analyzing is the one
+        thing in this table that someone is waiting on.
+        """
+        now = time.time() if now is None else now
+        if now - self._last_job_prune < self._JOB_PRUNE_INTERVAL_S:
+            return
+        self._last_job_prune = now
+        try:
+            self.prune_jobs(older_than_s=self._JOB_TTL_S, now=now)
+        except Exception:  # pragma: no cover - housekeeping, never fatal
+            log.warning("job prune failed (request unaffected)", exc_info=True)
+
+    def prune_jobs(self, older_than_s: float, now: float | None = None) -> int:
+        now = time.time() if now is None else now
+        cutoff = datetime.fromtimestamp(now - older_than_s, tz=timezone.utc)
+        placeholders = ", ".join("?" for _ in TERMINAL_STATUSES)
+        with self._cursor(write=True) as cur:
+            cur.execute(
+                self._sql(
+                    f"DELETE FROM jobs WHERE status IN ({placeholders}) AND updated_at < ?"
+                ),
+                (*sorted(TERMINAL_STATUSES), cutoff.isoformat().replace("+00:00", "Z")),
+            )
+            return cur.rowcount
+
     # -- chord maps (the cache) ----------------------------------------------
 
     def put_map(self, *, video_id: str, difficulty: str, song: dict,
@@ -457,6 +496,7 @@ class Store:
     # -- jobs ----------------------------------------------------------------
 
     def create_job(self, *, job_id: str, uid: str, video_id: str, difficulty: str) -> Job:
+        self._maybe_prune_jobs()
         now = _now_iso()
         with self._cursor(write=True) as cur:
             cur.execute(self._sql(

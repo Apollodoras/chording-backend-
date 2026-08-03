@@ -177,8 +177,11 @@ def test_an_unknown_difficulty_is_rejected(client):
 
 
 def test_the_daily_quota_is_enforced_with_the_code_the_client_reads(settings, store):
+    # Inline explicitly: the default is now a background thread (a job must not
+    # run on the request thread), and this test asserts on the *second* request's
+    # status, so a worker still writing job rows during teardown is only noise.
     app = create_app(replace(settings, daily_quota=1), store=store, source=FakeSource(),
-                     runner=None)
+                     runner=JobRunner(settings, store, FakeSource()))
     with TestClient(app) as client:
         client.post("/v1/analyze", json={"videoId": "aaaaaaaaaaa"}, headers=AUTH)
         response = client.post("/v1/analyze", json={"videoId": "bbbbbbbbbbb"}, headers=AUTH)

@@ -212,6 +212,38 @@ def _bar(bar: list[BarChord], *, flats: bool, seed: str) -> Bar:
     )
 
 
+def _within_duration(downbeats_ms: list[int], duration_ms: int, bpm: float) -> list[int]:
+    """Keep anchors inside the recording, pinning a rounding overshoot to the end.
+
+    Truncating by bar count is not the same as truncating by the clock, and the
+    difference is measured in milliseconds: a tracker working from decoded audio
+    can place the final downbeat a few ms after the duration YouTube's metadata
+    reports. `lint_sync` then rejects the sidecar — correctly, by its own rule —
+    and the song loses video sync over a **6 ms** disagreement between two
+    different measurements of the same recording. (Observed: five of the
+    benchmark's synthetic tracks, all by 6–20 ms.)
+
+    So an overshoot within one beat is treated as what it is — the two clocks
+    rounding differently — and pinned to the end. Anything beyond that is a real
+    disagreement about where the song ends, and those anchors are dropped:
+    inventing a position for them is how a cursor walks off a chart.
+    """
+    if not downbeats_ms:
+        return downbeats_ms
+    tolerance = int(60_000 / bpm) if bpm and bpm > 0 else 500
+
+    kept: list[int] = []
+    for time_ms in downbeats_ms:
+        if time_ms <= duration_ms:
+            kept.append(time_ms)
+        elif time_ms - duration_ms <= tolerance and (not kept or kept[-1] < duration_ms):
+            kept.append(duration_ms)
+            break
+        else:
+            break
+    return kept
+
+
 def build_sync(
     *,
     video_id: str,
@@ -238,6 +270,7 @@ def build_sync(
     the end would address bars that don't exist.
     """
     usable = downbeats_ms[:max(1, total_bars + 1)] if total_bars else downbeats_ms
+    usable = _within_duration(usable, duration_ms, bpm)
     return VideoSync(
         videoId=video_id,
         durationMs=duration_ms,

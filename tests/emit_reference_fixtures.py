@@ -46,6 +46,13 @@ from tests.conftest import (  # noqa: E402
 VALID = ROOT / "tests" / "fixtures" / "valid"
 EMITTED = ROOT / "tests" / "fixtures" / "emitted"
 
+# The sidecar carries `analyzedAt`, which is a wall clock and therefore the one
+# field that makes these files differ on every run. Pinned here so a diff in
+# `emitted/` means **the analysis changed** — which is the entire value of
+# committing them. The importer only cares that the field is present and well
+# formed, never what instant it names, so freezing it costs the contract nothing.
+REFERENCE_ANALYZED_AT = "2026-01-01T00:00:00Z"
+
 
 def emit_hand_written() -> int:
     problems_found = 0
@@ -81,7 +88,8 @@ def emit_from_pipeline() -> int:
     # byte-identical to what the importer expects.
     if outcome.sync is not None:
         sidecar = EMITTED / "pipeline-known-song-videosync.json"
-        sidecar.write_text(json.dumps(outcome.sync.model_dump(), ensure_ascii=False,
+        stable = outcome.sync.model_copy(update={"analyzedAt": REFERENCE_ANALYZED_AT})
+        sidecar.write_text(json.dumps(stable.model_dump(), ensure_ascii=False,
                                       sort_keys=True, indent=2) + "\n")
         print(f"emitted {sidecar.name}")
     return 0

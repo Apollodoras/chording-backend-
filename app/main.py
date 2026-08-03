@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -51,7 +52,7 @@ from .errors import (
     AnalysisError,
     fail,
 )
-from .jobs import JobRunner
+from .jobs import JobRunner, ThreadJobRunner
 from .store import (
     BLOCK_CHANNEL,
     BLOCK_VIDEO,
@@ -103,7 +104,17 @@ def create_app(
     source=_UNSET,
 ) -> FastAPI:
     settings = settings or load_settings()
-    app = FastAPI(title="Rosetta GP — chord analysis", version="1.0")
+
+    @asynccontextmanager
+    async def lifespan(instance: FastAPI):
+        yield
+        # Only the thread runner owns anything; the inline and Modal runners
+        # have nothing to release.
+        shutdown = getattr(instance.state.runner, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+
+    app = FastAPI(title="Rosetta GP — chord analysis", version="1.0", lifespan=lifespan)
 
     app.state.settings = settings
     app.state.store = store or build_store(settings)
@@ -111,7 +122,13 @@ def create_app(
     # None on the API container by design (§4): it has no audio stack, cannot
     # fetch or decode, and serves cached maps only. The worker builds its own.
     app.state.source = build_source(settings) if source is _UNSET else source
-    app.state.runner = runner or JobRunner(settings, app.state.store, app.state.source)
+    # A background thread, not the base runner. `JobRunner.submit` executes the
+    # analysis **inline**, so defaulting to it would run fetch + decode + DSP on
+    # the request thread and return the 202 only once the job it describes had
+    # already finished — which is the job-id-and-poll contract (§16.1) inverted.
+    # Modal replaces this with its own; tests that want determinism pass the
+    # inline one explicitly.
+    app.state.runner = runner or ThreadJobRunner(settings, app.state.store, app.state.source)
 
     _install_cors(app, settings)
     _install_error_handlers(app)

@@ -101,8 +101,15 @@ def build_source(settings) -> VideoSource | None:
     no source behaves exactly like a deployment with the switch off.
     """
     try:
-        from .ytdlp_source import YtDlpSource   # noqa: F401  (§8 step 4)
+        from .ytdlp_source import YtDlpSource, available
     except ImportError:
         log.info("fetch: no audio source in this build (API container, or `audio` extra not installed)")
+        return None
+    # Importable is not the same as usable: `ytdlp_source` drives yt-dlp and
+    # ffmpeg as subprocesses, so it imports fine in an image that has neither.
+    # Checking the tools rather than the import is what keeps `/healthz`'s
+    # `fetch: configured` from being a lie the first job discovers.
+    if not available():
+        log.info("fetch: yt-dlp or ffmpeg missing — no audio source in this build")
         return None
     return YtDlpSource(settings)

@@ -88,20 +88,60 @@ api_image = (
 
 # The worker image. Everything that touches audio lives here and nowhere else.
 #
-# When the §8-step-2 benchmark picks engines, add them to THIS list only, and
-# register them in `app/analysis/engines.py`. NumPy is pinned `<2` because madmom
-# cannot load under 2.x (§5.2) — if the benchmark picks a tracker that doesn't
-# need madmom, that pin can go.
+# The engines are the §8-step-2 benchmark's picks (README has the table): BTC for
+# chords, Beat This! for beats, librosa for onsets. Anything added here must NOT
+# be added to the API image (§4).
+BTC_ROOT = "/opt/BTC-ISMIR19"
+
+# Both engines are pinned to a commit rather than to a branch. Neither is a
+# packaged release — one is a zip of a git ref, the other a clone — so "latest"
+# would mean the image quietly changes between two deploys of identical code.
+# For BTC it is stronger than housekeeping: the pretrained weights live in the
+# repo and have to agree with the model code that loads them.
+BTC_COMMIT = "2682317be668032e6e4b269ded36adaa2ad57df0"
+BEAT_THIS_COMMIT = "b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c"
+
 worker_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg")
+    .apt_install("ffmpeg", "git")
     .pip_install(
         *BASE_PACKAGES,
         "yt-dlp>=2024.8",
-        "numpy>=1.26,<2",
+        "numpy>=1.26,<2.1",
         "soundfile>=0.12",
+        "librosa>=0.10",
+        "pyyaml>=6",
     )
-    .env({"CHORDS_SCRATCH_ROOT": "/tmp/chords-scratch"})
+    # CPU torch explicitly. The default wheel carries the whole CUDA runtime —
+    # some two gigabytes of image, per container pull, for hardware this
+    # deployment does not have. Both models are small enough that a GPU would
+    # mostly buy cold-start latency (§18), and the pipeline is already async.
+    .pip_install("torch>=2.0,<3", index_url="https://download.pytorch.org/whl/cpu")
+    .pip_install(
+        "einops", "soxr", "rotary-embedding-torch",
+        f"https://github.com/CPJKU/beat_this/archive/{BEAT_THIS_COMMIT}.zip",
+    )
+    # BTC is research code with no package and no PyPI release, so it is cloned
+    # rather than installed. Pinned to a commit: the weights and the model code
+    # have to agree, and "whatever main was on deploy day" is not a version.
+    .run_commands(
+        f"git clone https://github.com/jayg996/BTC-ISMIR19 {BTC_ROOT}",
+        f"git -C {BTC_ROOT} checkout --quiet {BTC_COMMIT}",
+        # The weights ship in the repo, so a checkout that silently lacks them
+        # would produce an image whose first job fails. Fail the build instead.
+        f"test -f {BTC_ROOT}/test/btc_model_large_voca.pt",
+    )
+    # Bake Beat This!'s checkpoint into the image. Left to run time it is
+    # downloaded on the first request of every cold container — which turns a
+    # cold start into a dependency on someone else's file server, inside a job
+    # that already has a 300 s timeout.
+    .run_commands(
+        "python -c \"from beat_this.inference import load_model; load_model('final0', device='cpu')\""
+    )
+    .env({
+        "CHORDS_SCRATCH_ROOT": "/tmp/chords-scratch",
+        "CHORDS_BTC_ROOT": BTC_ROOT,
+    })
     .add_local_python_source("app")
 )
 

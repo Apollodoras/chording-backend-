@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The suite as the README claims it runs: no database, no audio stack, no
+  # network, no credentials. Installing the `audio` extra here would quietly
+  # destroy that guarantee — the day a test starts needing librosa, this job is
+  # what says so.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install (base + dev only)
+        run: pip install -e ".[dev]"
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Contract fixtures are byte-stable
+        # §16.5: every id is derived from content rather than from the clock, so
+        # regenerating must produce identical bytes. A diff here means the
+        # analysis changed — which is worth knowing deliberately, since the app's
+        # importer is the final judge of these files.
+        run: |
+          python tests/emit_reference_fixtures.py
+          git diff --exit-code -- tests/fixtures/emitted \
+            || { echo "::error::emitted fixtures changed — commit them if intended"; exit 1; }
+
+      - name: The API image must not be able to touch audio
+        # §4's isolation, as a test rather than a comment: the modules the API
+        # container imports must not drag in yt-dlp, ffmpeg bindings or an engine.
+        run: |
+          python - <<'PY'
+          import sys
+          import app.main  # noqa: F401
+          banned = {"yt_dlp", "librosa", "torch", "soundfile", "numpy", "vamp"}
+          leaked = banned & set(sys.modules)
+          if leaked:
+              raise SystemExit(f"API surface imported an audio dependency: {sorted(leaked)}")
+          print("API surface is audio-free")
+          PY
+
+  # The deployed backend is Postgres, and every other job runs on SQLite. This
+  # is the only place `PostgresStore`'s SQL actually executes.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: chords_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Postgres store
+        env:
+          CHORDS_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/chords_test
+        run: python -m pytest tests/test_store_postgres.py -q
+
+      - name: The suite passes on Postgres too
+        # The store is swapped underneath everything else: the API tests are
+        # backend-agnostic by construction, and this proves it rather than
+        # assuming it.
+        env:
+          CHORDS_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/chords_test
+        run: python -m pytest -q

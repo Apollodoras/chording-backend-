@@ -72,12 +72,17 @@ class Settings:
     # Mean-confidence floor below which the map is flagged `lowConfidence` and
     # videoSync is withheld entirely (§5.4.6, §13.3).
     confidence_floor: float = 0.5
-    # Which chord engine / beat tracker to use. Unset until the §8-step-2
-    # benchmark is run and the owner chooses — an unset engine makes the
-    # analysis path answer a clean 503 rather than guessing (see
-    # app/analysis/engines.py).
-    chord_engine: str | None = None
-    beat_tracker: str | None = None
+    # Which chord engine / beat tracker to use. Chosen by the §8-step-2
+    # benchmark (`bench/run_bench.py`, results in README):
+    #
+    #   chords  BTC        0.805 vs chroma's 0.531 on real tracks, and 3× faster
+    #   beats   beat_this  downbeat F 0.893 vs librosa's 0.486 — and §13.2's
+    #                      anchors *are* downbeats, so that is the whole margin
+    #
+    # Naming an engine that this image did not install is still a clean 503, not
+    # a guess: `engines.is_ready()` checks the registry, not this string.
+    chord_engine: str | None = "btc"
+    beat_tracker: str | None = "beat_this"
 
     cors_allow_origins: str = ""
 
@@ -112,7 +117,7 @@ def load_settings() -> Settings:
         job_deadline_s=float(os.environ.get("CHORDS_JOB_DEADLINE_S", "180")),
         scratch_root=os.environ.get("CHORDS_SCRATCH_ROOT", "/tmp/chords-scratch"),
         confidence_floor=float(os.environ.get("CHORDS_CONFIDENCE_FLOOR", "0.5")),
-        chord_engine=os.environ.get("CHORDS_CHORD_ENGINE") or None,
-        beat_tracker=os.environ.get("CHORDS_BEAT_TRACKER") or None,
+        chord_engine=os.environ.get("CHORDS_CHORD_ENGINE") or "btc",
+        beat_tracker=os.environ.get("CHORDS_BEAT_TRACKER") or "beat_this",
         cors_allow_origins=os.environ.get("CHORDS_CORS_ORIGINS", ""),
     )
