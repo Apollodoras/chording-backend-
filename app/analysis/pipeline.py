@@ -35,9 +35,9 @@ from ..chords import DIFFICULTIES, NORMAL
 from ..errors import AnalysisError, FeatureDisabled, VideoBlocked, VideoTooLong
 from ..lint import lint, lint_sync, repair
 from ..payload import CompositionPayload
-from ..payload import bar_beats as parse_bar_beats
 from ..sync import VideoSync
 from . import postprocess
+from .axis import build_axis
 from .compile import build_sync, compile_song
 from .keyfinder import detect_key
 from .scratch import scratch
@@ -156,17 +156,22 @@ def assemble(
     analyzed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     duration_ms = int(round(meta.duration_s * 1000))
 
-    if not grid.is_usable:
+    # ONE beat axis, built once and shared by everything downstream: the chart
+    # quantizes against it, the bars are sliced out of it, the onsets fold onto
+    # it, and the sidecar's anchors are read off it. Three modules used to derive
+    # this independently and disagree about where beat 0 was — see `axis.py`.
+    axis = build_axis(grid)
+    if axis is None or not axis.is_usable or not grid.is_usable:
         raise AnalysisError(
             "That track’s rhythm wasn’t clear enough to chart — try a video with a steadier beat."
         )
 
-    beats = parse_bar_beats(grid.time_signature) or 4.0
-    bar_beats = int(round(beats))
+    beats = float(axis.bar_beats)
+    bar_beats = axis.bar_beats
     tempo = int(round(grid.bpm))
 
     # --- §5.4, once per tier -------------------------------------------------
-    reference = postprocess.process(raw, grid, difficulty=NORMAL, bar_beats=bar_beats)
+    reference = postprocess.process(raw, axis, difficulty=NORMAL)
     if not reference:
         raise AnalysisError("No chords could be read from that video.")
 
@@ -180,7 +185,7 @@ def assemble(
     pattern_confidence: float | None = None
 
     for difficulty in DIFFICULTIES:
-        spans = postprocess.process(raw, grid, difficulty=difficulty, bar_beats=bar_beats)
+        spans = postprocess.process(raw, axis, difficulty=difficulty)
         if not spans:
             continue
         bars = bars_from_spans(spans, bar_beats)
@@ -188,7 +193,7 @@ def assemble(
             continue
         sections = segment(bars)
         patterns = _patterns_for(
-            sections, onsets=onsets, grid=grid, bar_beats=beats, tempo=tempo,
+            sections, onsets=onsets, axis=axis, bar_beats=beats, tempo=tempo,
         )
         # The anchor list has to cover the LONGEST tier, since one sidecar serves
         # whichever the player asked for.
@@ -225,7 +230,10 @@ def assemble(
         sync = build_sync(
             video_id=meta.video_id,
             duration_ms=duration_ms,
-            downbeats_ms=grid.downbeats_ms,
+            # The axis's downbeats, not the tracker's: `times_ms[k · bar_beats]`
+            # IS the time of the chart's bar k, so the anchor and the bar it
+            # addresses cannot disagree.
+            downbeats_ms=axis.downbeats_ms,
             bar_beats=beats,
             time_signature=grid.time_signature,
             bpm=grid.bpm,
@@ -264,7 +272,7 @@ def assemble(
     )
 
 
-def _patterns_for(sections: list[Section], *, onsets: list[Onset], grid: BeatGrid,
+def _patterns_for(sections: list[Section], *, onsets: list[Onset], axis,
                   bar_beats: float, tempo: int) -> dict[int, ExtractedPattern]:
     """One pattern per section (§14).
 
@@ -275,14 +283,17 @@ def _patterns_for(sections: list[Section], *, onsets: list[Onset], grid: BeatGri
     out: dict[int, ExtractedPattern] = {}
     for index, section in enumerate(sections):
         name = f"{section.name or section.kind.title()} strum"
+        time_signature = f"{axis.bar_beats}/4"
         if not onsets:
             out[index] = fallback(bar_beats=bar_beats, tempo=tempo, name=name,
-                                  time_signature=grid.time_signature)
+                                  time_signature=time_signature)
             continue
         first_beat = section.start_bar * bar_beats
         last_beat = first_beat + section.total_bars * bar_beats
-        folded = fold_onsets(onsets, grid.beats_ms, bar_beats=bar_beats,
+        # Folded onto the same axis the chart uses, so a stroke the extractor
+        # calls "the downbeat" is the beat the chart calls bar-start too.
+        folded = fold_onsets(onsets, axis, bar_beats=bar_beats,
                              first_beat=first_beat, last_beat=last_beat)
         out[index] = extract(folded, bar_beats=bar_beats, bars=section.total_bars,
-                             tempo=tempo, name=name, time_signature=grid.time_signature)
+                             tempo=tempo, name=name, time_signature=time_signature)
     return out

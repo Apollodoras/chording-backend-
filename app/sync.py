@@ -44,7 +44,11 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from .payload import CompositionPayload, bar_beats, section_beats
+
 SOURCE_YOUTUBE = "youtube"
+
+_EPS = 1e-9
 
 
 class Confidence(BaseModel):
@@ -159,3 +163,78 @@ def song_beat_at(anchors: list[BeatAnchor], t_ms: float) -> float:
         return left.songBeat
     ratio = (t_ms - left.tMs) / span_ms
     return left.songBeat + ratio * (right.songBeat - left.songBeat)
+
+
+# ---------------------------------------------------------------------------
+# The other half of the reference implementation: what the player actually SEES
+# ---------------------------------------------------------------------------
+#
+# ``song_beat_at`` maps a video clock onto the song's beat axis. That is only
+# half of what the client does — the other half is reading the chord off the
+# chart at that beat, and until both halves existed in Python there was no way
+# to ask the only question that matters for a chords-over-a-recording product:
+#
+#     at video millisecond t, does the app show the chord that is playing?
+#
+# Everything the service validates today (``lint``, ``lint_sync``) checks the
+# song's *internal* consistency, which a chart can satisfy while being uniformly
+# wrong against the recording. These two functions are what let a test and the
+# benchmark score the deliverable instead of the engine.
+
+
+def chord_at_song_beat(payload: CompositionPayload, beat: float) -> str | None:
+    """The chord name the compiled chart sounds at ``beat``, or None past the end.
+
+    Walks the arrangement the way the app's compiler does: sections concatenate
+    on one uniform grid, a bars-mode section indexes its bars directly (and
+    ignores ``repeats``, as ``compileBars`` does), and a flat section tiles its
+    ``chordNames`` at ``beatsPerChord`` and loops through ``repeats``.
+    """
+    beats_per_bar = bar_beats(payload.timeSignature) or 4.0
+    sections = payload.arrangement.sections if payload.arrangement else []
+
+    if beat < -_EPS:
+        # Before the song's first downbeat. The client extrapolates backwards off
+        # the first anchor, so this is reachable whenever a recording opens with
+        # a pickup or an intro the chart doesn't cover — and the honest answer is
+        # that there is no chord yet, not the first one wrapped around.
+        return None
+
+    cursor = 0.0
+    for section in sections:
+        length = section_beats(section, beats_per_bar)
+        if beat < cursor + length - _EPS:
+            local = beat - cursor
+            if section.bars is not None:
+                index = int(local // beats_per_bar)
+                if not (0 <= index < len(section.bars)):
+                    return None
+                in_bar = local - index * beats_per_bar
+                spans = sorted(section.bars[index].chordSpans, key=lambda s: s.startBeat)
+                for span in spans:
+                    if span.startBeat - _EPS <= in_bar < span.startBeat + span.lengthBeats - _EPS:
+                        return span.chordName
+                # Between spans (a bar the compiler leaves partly uncovered): the
+                # last chord to have started is the one still sounding.
+                earlier = [s for s in spans if s.startBeat - _EPS <= in_bar]
+                return earlier[-1].chordName if earlier else None
+            if not section.chordNames:
+                return None
+            per_chord = max(1, section.beatsPerChord)
+            one_pass = len(section.chordNames) * per_chord
+            index = int((local % one_pass) // per_chord)
+            return section.chordNames[index]
+        cursor += length
+    return None
+
+
+def chord_at_video_ms(payload: CompositionPayload, sync: "VideoSync", t_ms: float) -> str | None:
+    """What the player sees at video millisecond ``t_ms`` — both halves together.
+
+    This is the composition the client performs every frame, and the function a
+    test or the benchmark should score against ground truth. ``offsetMs`` is
+    applied here exactly as §13.2 specifies it.
+    """
+    if not sync.beatAnchors:
+        return None
+    return chord_at_song_beat(payload, song_beat_at(sync.beatAnchors, t_ms - (sync.offsetMs or 0)))

@@ -13,9 +13,18 @@ What it scores:
   the app plays the same chord for both. Root-only accuracy is reported beside
   it, because the gap between them is a different problem from getting the chord
   wrong — it is the engine hearing the right harmony and the wrong quality.
-- **the whole pipeline** — whether the emitted song lints clean and whether the
-  sidecar survives `lint_sync`. An engine pairing that produces beautiful numbers
-  and an unusable song has not won anything.
+- **the whole pipeline** — whether the emitted song lints clean, whether the
+  sidecar survives `lint_sync`, and **what the player actually sees**. An engine
+  pairing that produces beautiful numbers and an unusable song has not won
+  anything.
+
+  That last one (`delivered`) is the column to read, and it is deliberately
+  separate from the chord-engine score above. Everything else here measures a
+  *component* against ground truth; `delivered` measures the **deliverable** —
+  it reconstructs "what chord is on screen at video millisecond t" from
+  `(song, videoSync)` the way the client does, after quantization, structure,
+  `repeats` and simplification have all had their say. The two can diverge a long
+  way, and when they do it is this one that describes the product.
 
 Two corpora, reported separately and never averaged together:
 
@@ -46,14 +55,18 @@ sys.path.insert(0, str(ROOT))
 
 from app.analysis import engines  # noqa: E402
 from app.analysis.pipeline import assemble  # noqa: E402
-from app.analysis.postprocess import quantize  # noqa: E402
 from app.analysis.types import BeatGrid, EngineInfo, RawChordSpan, VideoMeta  # noqa: E402
-from app.chords import NORMAL, normalize, render  # noqa: E402
+from app.chords import HARD, NORMAL, normalize, prefers_flats, render  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.lint import lint, lint_sync  # noqa: E402
 from app.payload import CompositionPayload  # noqa: E402
+from app.sync import chord_at_video_ms  # noqa: E402
 
 AUDIO = ROOT / "bench" / "audio"
+
+# Sampling step for the delivered-accuracy metric. Fine enough that a one-beat
+# phase error cannot hide between samples at any tempo this service accepts.
+FRAME_STEP_MS = 50
 
 # The MIREX-standard beat-tracking tolerance. Not arbitrary: it is roughly the
 # window inside which a listener hears two attacks as simultaneous.
@@ -195,6 +208,43 @@ def root_accuracy(spans: list[RawChordSpan], truth: dict) -> float:
     return _chord_score(spans, truth, root_only=True)
 
 
+def delivered_accuracy(payload: CompositionPayload, sync, truth: dict) -> float:
+    """Share of the track whose chord the **player actually sees** correctly.
+
+    Everything above scores an *engine*: raw spans, straight against ground
+    truth, before quantization, structure, `repeats` and simplification have
+    touched them. This scores the *deliverable* — it reconstructs "what chord is
+    on screen at video millisecond t" from `(song, videoSync)` exactly as the
+    client does (`app/sync.py`) and compares that.
+
+    The two numbers answer different questions and can diverge a long way. A
+    perfect engine still scores badly here if the chart is laid onto the wrong
+    beat axis, and that failure is invisible to `lint`, to `lint_sync` and to
+    every other number this harness prints — all of which check the song against
+    itself rather than against the recording.
+
+    Returns NaN when there is no sidecar: a self-paced song has no map from video
+    time to song beat, so the question doesn't apply and averaging a zero in
+    would libel a pairing that correctly declined to guess (§13.3).
+    """
+    if sync is None or not sync.beatAnchors:
+        return float("nan")
+
+    flats = prefers_flats(payload.tonic, payload.mode)
+    total_ms = correct_ms = 0
+    for chord in truth["chords"]:
+        target = normalize(chord["name"])
+        if target is None:            # `N`/`X` — nothing to be right about
+            continue
+        expected = render(target[0], target[1], flats=flats)
+        start, end = int(chord["startMs"]), int(chord["endMs"])
+        for t in range(start, end, FRAME_STEP_MS):
+            total_ms += FRAME_STEP_MS
+            if chord_at_video_ms(payload, sync, t) == expected:
+                correct_ms += FRAME_STEP_MS
+    return correct_ms / total_ms if total_ms else float("nan")
+
+
 def grid_from(truth: dict) -> BeatGrid:
     return BeatGrid(
         beats_ms=truth["beats_ms"], downbeats_ms=truth["downbeats_ms"],
@@ -269,7 +319,6 @@ def bench_chords(cases: list[Case]) -> dict[str, Tally]:
             accuracy = chord_accuracy(spans, case.truth)
             roots = root_accuracy(spans, case.truth)
             tallies[name].add(case, accuracy=accuracy, root=roots, seconds=elapsed)
-            quantize(spans, grid_from(case.truth))
             print(f"{name:<12}{case.name:<22}{accuracy:>10.3f}{roots:>11.3f}"
                   f"{len(spans):>8}{elapsed:>7.1f}")
     print()
@@ -278,18 +327,25 @@ def bench_chords(cases: list[Case]) -> dict[str, Tally]:
 
 def bench_pipeline(cases: list[Case]) -> None:
     """The number that actually decides: does the pairing produce a song the app
-    will play, and a sidecar that agrees with it?"""
+    will play, a sidecar that agrees with it, **and the right chord on screen**?
+
+    `clean`/`synced` are self-consistency counts — they say the song is
+    well-formed, not that it is true. `delivered` is the accuracy the player
+    experiences, and it is the column to read: a pairing can be 15/15 clean,
+    15/15 synced, and still be showing the wrong chord for most of every song.
+    """
     chord_names = sorted(engines._CHORD_ENGINES)
     beat_names = sorted(engines._BEAT_TRACKERS)
     if not (chord_names and beat_names):
         return
 
     settings = Settings(scratch_root="/tmp/chords-scratch")
-    print("END TO END  (does the pairing produce a song the app will play?)")
-    print(f"{'pairing':<24}{'clean':>7}{'synced':>8}{'failed':>8}  notes")
+    print("END TO END  (does the pairing produce a song the app will play — and play right?)")
+    print(f"{'pairing':<24}{'clean':>7}{'synced':>8}{'delivered':>11}{'failed':>8}  notes")
     for chord_name in chord_names:
         for beat_name in beat_names:
             clean = synced = failed = 0
+            delivered: list[float] = []
             reasons: dict[str, int] = {}
             for case in cases:
                 grid, _ = grid_for(beat_name, case)
@@ -310,9 +366,23 @@ def bench_pipeline(cases: list[Case]) -> None:
                     clean += 1
                 if outcome.sync is not None and not lint_sync(payload, outcome.sync):
                     synced += 1
+                # Scored on `hard`, not on the `normal` payload linted above.
+                # `normal` deliberately folds diminished and augmented onto their
+                # nearest playable triad (§5.5), so scoring it against a truth
+                # containing those chords charges the pipeline for a reduction it
+                # was asked to make — Michelle reads 0.812 at `normal` and 0.952
+                # at `hard` for exactly that reason. `hard` is the whole grammar,
+                # so what it loses is pipeline error and nothing else.
+                accuracy = delivered_accuracy(
+                    CompositionPayload.model_validate(outcome.songs[HARD]),
+                    outcome.sync, case.truth,
+                )
+                if accuracy == accuracy:      # not NaN — a sidecar was emitted
+                    delivered.append(accuracy)
             note = ", ".join(f"{k}×{v}" for k, v in sorted(reasons.items())) or "-"
+            mean_delivered = f"{statistics.mean(delivered):.3f}" if delivered else "-"
             print(f"{chord_name + '+' + beat_name:<24}{clean:>4}/{len(cases):<2}"
-                  f"{synced:>5}/{len(cases):<2}{failed:>8}  {note}")
+                  f"{synced:>5}/{len(cases):<2}{mean_delivered:>11}{failed:>8}  {note}")
     print()
 
 

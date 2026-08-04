@@ -25,11 +25,11 @@ easy chart shows the player a chord change that doesn't happen.
 
 from __future__ import annotations
 
-from bisect import bisect_left
 from dataclasses import replace
 
 from ..chords import DIFFICULTIES, EASY, normalize, simplify
-from .types import BeatGrid, GridSpan, RawChordSpan
+from .axis import BeatAxis
+from .types import GridSpan, RawChordSpan
 
 # §5.4.3's floor: "shorter than one beat, or < 250ms". Working in beats, one beat
 # IS the floor, and it is the more honest of the two — at 60 bpm a 250 ms span is
@@ -40,7 +40,7 @@ MIN_SPAN_BEATS = 1
 EASY_MIN_SPAN_BARS = 1
 
 
-def quantize(spans: list[RawChordSpan], grid: BeatGrid) -> list[GridSpan]:
+def quantize(spans: list[RawChordSpan], axis: BeatAxis) -> list[GridSpan]:
     """Snap every chord boundary to the nearest beat, in beat-index units.
 
     A chord change that lands 40 ms before the beat is the same musical event as
@@ -48,11 +48,16 @@ def quantize(spans: list[RawChordSpan], grid: BeatGrid) -> list[GridSpan]:
     unquantized boundary shows up as a chord that changes *between* two strokes,
     which reads as a glitch rather than as detail.
 
+    The index is into the **`BeatAxis`**, not into whatever the tracker happened
+    to emit: beat 0 is the song's first downbeat, so a chord landing on bar 3's
+    downbeat lands on beat `3 · bar_beats` here and on anchor 3 in the sidecar.
+    Those used to be two different origins (see `axis.py`), which put the whole
+    chart out of phase with its own recording.
+
     Spans that collapse to zero length are dropped here rather than emitted as
     empty: a chord shorter than half a beat has no beat of its own to live on.
     """
-    beats = grid.beats_ms
-    if len(beats) < 2:
+    if len(axis.times_ms) < 2:
         return []
 
     out: list[GridSpan] = []
@@ -63,8 +68,8 @@ def quantize(spans: list[RawChordSpan], grid: BeatGrid) -> list[GridSpan]:
             # hole it leaves by extending its neighbour.
             continue
         root, quality, exact = parsed
-        start = _nearest_beat(beats, span.start_ms)
-        end = _nearest_beat(beats, span.end_ms)
+        start = axis.beat_at(span.start_ms)
+        end = axis.beat_at(span.end_ms)
         if end <= start:
             continue
         out.append(GridSpan(
@@ -73,23 +78,6 @@ def quantize(spans: list[RawChordSpan], grid: BeatGrid) -> list[GridSpan]:
             confidence=span.confidence, exact=exact,
         ))
     return out
-
-
-def _nearest_beat(beats: list[int], t_ms: int) -> int:
-    """Index of the beat closest to `t_ms`, clamped to the grid.
-
-    Clamping rather than extrapolating: a chord that starts before the first
-    detected beat belongs to beat 0, and one that runs past the last belongs to
-    the last. Inventing beats outside the grid would put chords on a timeline the
-    sidecar has no anchors for.
-    """
-    index = bisect_left(beats, t_ms)
-    if index <= 0:
-        return 0
-    if index >= len(beats):
-        return len(beats) - 1
-    before, after = beats[index - 1], beats[index]
-    return index if (after - t_ms) < (t_ms - before) else index - 1
 
 
 def merge(spans: list[GridSpan]) -> list[GridSpan]:
@@ -240,12 +228,20 @@ def exact_ratio(spans: list[GridSpan]) -> float:
     return sum(s.length_beats for s in spans if s.exact) / total
 
 
-def process(spans: list[RawChordSpan], grid: BeatGrid, *,
-            difficulty: str, bar_beats: int = 4,
-            total_beats: int | None = None) -> list[GridSpan]:
-    """The whole §5.4 chain, in order. The pipeline calls this once per tier."""
-    quantized = quantize(spans, grid)
+def process(spans: list[RawChordSpan], axis: BeatAxis, *,
+            difficulty: str, total_beats: int | None = None) -> list[GridSpan]:
+    """The whole §5.4 chain, in order. The pipeline calls this once per tier.
+
+    `total_beats` defaults to the axis's own length, which is what makes the
+    chart cover the **whole recording**: without it the harmony stopped at the
+    last chord the engine was confident about, and the bars after that were
+    simply dropped (§5.4's hold rule applied to the end of the song, not just to
+    the gaps inside it).
+    """
+    quantized = quantize(spans, axis)
     merged = merge(quantized)
     trimmed = drop_short(merged)
-    filled = hold_through_gaps(trimmed, total_beats=total_beats)
-    return simplify_tier(filled, difficulty, bar_beats=bar_beats)
+    filled = hold_through_gaps(
+        trimmed, total_beats=axis.total_beats if total_beats is None else total_beats
+    )
+    return simplify_tier(filled, difficulty, bar_beats=axis.bar_beats)

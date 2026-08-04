@@ -208,17 +208,37 @@ def _merge_similar(sections: list[Section]) -> list[Section]:
 
     A verse whose second pass changes one chord is one verse played twice, not
     two sections — and the player reads the section rail, so an extra boundary is
-    a visible mistake in a way a slightly-wrong chord is not. The kept version is
-    the earlier one, so the section reads as the shape it established.
+    a visible mistake in a way a slightly-wrong chord is not.
+
+    **Merging the boundary must not merge the harmony.** This used to keep the
+    earlier block's bars and bump ``repeats``, which replays pass one in place of
+    pass two — so at the 0.75 threshold, one differing bar in a four-bar unit was
+    silently overwritten by the bar it "nearly" matched. On a self-paced song
+    that is defensible smoothing; on a song played against the recording it is
+    showing the player a chord that is not being played, and neither ``lint`` nor
+    ``lint_sync`` can see it (the chart is perfectly self-consistent and wrong).
+
+    So the two cases are now told apart:
+
+    - **identical** — collapse with ``repeats``, which is lossless and is what
+      §15 wants on the wire ("a 4-bar progression played 4× is one section with
+      repeats: 4");
+    - **merely similar** — merge the *section*, keep both passes' bars explicitly.
+      One boundary on the rail, every bar its own harmony.
     """
     if not sections:
         return []
     out = [sections[0]]
     for section in sections[1:]:
         previous = out[-1]
-        if (len(previous.bars) == len(section.bars)
-                and _similarity(previous.signature, section.signature) >= MERGE_SIMILARITY):
+        if len(previous.bars) != len(section.bars):
+            out.append(section)
+            continue
+        if previous.signature == section.signature:
             previous.repeats += section.repeats
+        elif _similarity(previous.signature, section.signature) >= MERGE_SIMILARITY:
+            previous.bars = _expanded(previous) + _expanded(section)
+            previous.repeats = 1
         else:
             out.append(section)
     return out

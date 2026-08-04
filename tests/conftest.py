@@ -23,6 +23,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.analysis.axis import BeatAxis, build_axis  # noqa: E402
 from app.analysis.types import BeatGrid, Onset, RawChordSpan, VideoMeta  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.store import SQLiteStore  # noqa: E402
@@ -62,6 +63,20 @@ def known_grid(*, confidence: float = 0.95) -> BeatGrid:
     )
 
 
+def known_axis() -> BeatAxis:
+    """The known song's beat axis — what the chart is actually built on.
+
+    Everything downstream of the beat tracker addresses song beats through a
+    `BeatAxis` rather than through a raw `BeatGrid`, because the grid alone does
+    not say where beat 0 is (see `app/analysis/axis.py`). For the known song the
+    two coincide, which is exactly why the distinction went unnoticed for so
+    long.
+    """
+    axis = build_axis(known_grid())
+    assert axis is not None, "the known song's grid must yield an axis"
+    return axis
+
+
 def known_chords(*, confidence: float = 0.9) -> list[RawChordSpan]:
     spans: list[RawChordSpan] = []
     t = 0
@@ -91,6 +106,101 @@ def known_onsets() -> list[Onset]:
 def known_meta(video_id: str = "dQw4w9WgXcQ") -> VideoMeta:
     return VideoMeta(video_id=video_id, title="Known Song",
                      duration_s=DURATION_S, channel_id="UCtest")
+
+
+# --- a recording with a pickup ----------------------------------------------
+#
+# `known_grid` above starts the song at t=0 on beat 0 AND downbeat 0. That is the
+# one alignment case that needs no reconciliation between the chart's beat axis
+# and the sidecar's anchors, and for a long time it was the only case the suite
+# had — so a chart that was uniformly phase-shifted against its recording scored
+# 303 green tests.
+#
+# Real recordings almost never oblige: a beat tracker emits beats from the first
+# audible pulse, and the first *downbeat* is typically one to three beats later
+# (a pickup, a count-in, an intro fill). This builder makes that difference a
+# parameter, so a test can ask for the normal case rather than the lucky one.
+
+@dataclass(frozen=True)
+class Recording:
+    """A synthetic recording with exact ground truth, in the units the pipeline
+    consumes: engine-native chord labels in ms, and a beat grid."""
+
+    grid: BeatGrid
+    chords: list[RawChordSpan]
+    meta: VideoMeta
+    # (start_ms, end_ms, engine label) per bar — what is actually sounding.
+    truth: list[tuple[int, int, str]]
+
+    @property
+    def duration_ms(self) -> int:
+        return int(round(self.meta.duration_s * 1000))
+
+    def label_at(self, t_ms: float) -> str | None:
+        for start, end, label in self.truth:
+            if start <= t_ms < end:
+                return label
+        return None
+
+
+def recording(
+    *,
+    progression: list[str] | None = None,
+    bars: int = 16,
+    pickup_beats: int = 0,
+    ms_per_beat: int = MS_PER_BEAT,
+    first_beat_ms: int = 0,
+    bar_beats: int = BAR_BEATS,
+    confidence: float = 0.95,
+    odd_bars: dict[int, int] | None = None,
+) -> Recording:
+    """A recording whose first downbeat is `pickup_beats` beats after beat 0.
+
+    `pickup_beats=0` reproduces `known_grid`'s geometry. Anything above 0 is the
+    case a real tracker produces, and the case the chart has to reconcile.
+
+    `odd_bars` maps a bar index to its real beat count, for songs that do not
+    hold one meter throughout — Here Comes The Sun famously drops in 11/8 and
+    15/8 bars, and it was the worst-scoring track in the corpus for exactly that
+    reason, independently of any pickup.
+    """
+    progression = progression or PROGRESSION
+    odd_bars = odd_bars or {}
+
+    # Lay the beats out bar by bar, so a bar can be a different length from its
+    # neighbours without the ones after it losing their downbeat.
+    beats_ms: list[int] = [first_beat_ms + i * ms_per_beat for i in range(pickup_beats)]
+    downbeats_ms: list[int] = []
+    cursor = first_beat_ms + pickup_beats * ms_per_beat
+    for bar in range(bars):
+        downbeats_ms.append(cursor)
+        for _ in range(odd_bars.get(bar, bar_beats)):
+            beats_ms.append(cursor)
+            cursor += ms_per_beat
+    downbeats_ms.append(cursor)
+    beats_ms.append(cursor)
+    beat_count = len(beats_ms)
+
+    chords: list[RawChordSpan] = []
+    truth: list[tuple[int, int, str]] = []
+    for index in range(len(downbeats_ms) - 1):
+        start, end = downbeats_ms[index], downbeats_ms[index + 1]
+        label = progression[index % len(progression)]
+        chords.append(RawChordSpan(start_ms=start, end_ms=end, label=label,
+                                   confidence=confidence))
+        truth.append((start, end, label))
+
+    grid = BeatGrid(
+        beats_ms=beats_ms,
+        downbeats_ms=downbeats_ms,
+        bpm=60_000.0 / ms_per_beat,
+        confidence=confidence,
+        time_signature=f"{bar_beats}/4",
+    )
+    meta = VideoMeta(video_id="dQw4w9WgXcQ", title="Known Song",
+                     duration_s=(beats_ms[-1] + ms_per_beat) / 1000.0,
+                     channel_id="UCtest")
+    return Recording(grid=grid, chords=chords, meta=meta, truth=truth)
 
 
 # --- fakes ------------------------------------------------------------------

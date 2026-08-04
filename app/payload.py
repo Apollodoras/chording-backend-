@@ -244,6 +244,30 @@ class CompositionPayload(BaseModel):
         return json.dumps(self.wire_dict(), ensure_ascii=False, sort_keys=True, indent=2)
 
 
+def section_beats(section: SongSection, bar_beats_: float) -> float:
+    """A section's length in quarter-note beats, mirroring the app's
+    ``SongSection.lengthBeats(barBeats:)``.
+
+    Note the asymmetry, which is the app's and not a mistake here: **bars mode
+    counts whole bars and ignores ``repeats``** (``compileBars`` never sees it),
+    while flat mode multiplies the recipe out.
+
+    Lives here rather than in ``lint.py`` because it is a property of the
+    container's shape, not of the validation — ``sync.py`` needs it to walk the
+    chart, and ``lint.py`` imports ``sync``.
+    """
+    if section.bars is not None:
+        return len(section.bars) * bar_beats_
+    return len(section.chordNames) * max(1, section.beatsPerChord) * max(1, section.repeats)
+
+
+def total_beats(payload: CompositionPayload) -> float:
+    """The whole song's length on the beat axis the sidecar's anchors address."""
+    beats = bar_beats(payload.timeSignature) or 4.0
+    sections = payload.arrangement.sections if payload.arrangement else []
+    return sum(section_beats(s, beats) for s in sections)
+
+
 def section_duration_profile(section: SongSection) -> list[tuple[str, float]]:
     """The section's harmonic rhythm for ONE pass: (chord, beats-held), merging
     consecutive identical chords — representation-independent, so the flat

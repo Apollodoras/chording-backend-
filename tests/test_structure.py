@@ -18,7 +18,7 @@ from app.analysis.structure import (
 )
 from app.analysis.types import GridSpan
 from app.chords import MAJOR, MINOR, NORMAL
-from tests.conftest import known_chords, known_grid
+from tests.conftest import known_axis, known_chords, known_grid
 
 
 def span(start, length, root=0, quality=MAJOR):
@@ -60,7 +60,7 @@ def test_a_trailing_partial_bar_is_dropped():
 
 
 def test_no_bar_ever_overflows_its_meter():
-    spans = process(known_chords(), known_grid(), difficulty=NORMAL)
+    spans = process(known_chords(), known_axis(), difficulty=NORMAL)
     for bar in bars_from_spans(spans, 4):
         for chord in bar:
             assert chord.start_beat + chord.length_beats <= 4 + 1e-9

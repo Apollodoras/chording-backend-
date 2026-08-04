@@ -38,6 +38,10 @@ from .payload import (
     bar_beats,
     new_uuid,
     referenced_pattern_ids,
+    # Defined in payload.py (they describe the container's shape, not the
+    # validation) and re-exported here, where callers have always found them.
+    section_beats,
+    total_beats,
 )
 from .sync import VideoSync
 
@@ -192,26 +196,6 @@ def lint(payload: CompositionPayload) -> list[str]:
 # ---------------------------------------------------------------------------
 # The sidecar's own lint (§13.2) — this service only; Mo has no sidecar
 # ---------------------------------------------------------------------------
-
-def section_beats(section: SongSection, bar_beats_: float) -> float:
-    """A section's length in quarter-note beats, mirroring the app's
-    ``SongSection.lengthBeats(barBeats:)``.
-
-    Note the asymmetry, which is the app's and not a mistake here: **bars mode
-    counts whole bars and ignores ``repeats``** (``compileBars`` never sees it),
-    while flat mode multiplies the recipe out.
-    """
-    if section.bars is not None:
-        return len(section.bars) * bar_beats_
-    return len(section.chordNames) * max(1, section.beatsPerChord) * max(1, section.repeats)
-
-
-def total_beats(payload: CompositionPayload) -> float:
-    """The whole song's length on the beat axis the anchors address."""
-    beats = bar_beats(payload.timeSignature) or 4.0
-    sections = payload.arrangement.sections if payload.arrangement else []
-    return sum(section_beats(s, beats) for s in sections)
-
 
 def lint_sync(payload: CompositionPayload, sync: VideoSync) -> list[str]:
     """Everything that would let the cursor walk off the song (§13.2).

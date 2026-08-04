@@ -34,10 +34,10 @@ bar that plays beats a confident pattern that's wrong.
 from __future__ import annotations
 
 import hashlib
-from bisect import bisect_left
 from dataclasses import dataclass
 
 from ..payload import PATTERN_PREFIX, PatternPayload, Stroke, derived_uuid
+from .axis import position_in
 from .types import Onset
 
 # Subdivisions worth testing: quarters, eighths, triplets, sixteenths (cells per
@@ -78,37 +78,32 @@ class ExtractedPattern:
     is_fallback: bool = False
 
 
-def beat_position(beats_ms: list[int], t_ms: float) -> float:
-    """Where `t_ms` falls on the beat axis, interpolating between beats.
-
-    Fractional by necessity: an onset on the "&" sits halfway between beat 4 and
-    beat 5, and the whole extraction is about where inside a beat things land.
-    """
-    if len(beats_ms) < 2:
-        return 0.0
-    index = bisect_left(beats_ms, t_ms)
-    if index <= 0:
-        span = beats_ms[1] - beats_ms[0]
-        return (t_ms - beats_ms[0]) / span if span > 0 else 0.0
-    if index >= len(beats_ms):
-        span = beats_ms[-1] - beats_ms[-2]
-        return (len(beats_ms) - 1) + ((t_ms - beats_ms[-1]) / span if span > 0 else 0.0)
-    left, right = beats_ms[index - 1], beats_ms[index]
-    span = right - left
-    return (index - 1) + ((t_ms - left) / span if span > 0 else 0.0)
+# Where `t_ms` falls on a beat axis, interpolating. Defined in `axis.py` so the
+# chart, the anchors and the strumming extractor all read one implementation —
+# three private copies of "which beat is this?" is what put the chart out of
+# phase with its own recording in the first place.
+beat_position = position_in
 
 
-def fold_onsets(onsets: list[Onset], beats_ms: list[int], *, bar_beats: float,
+def fold_onsets(onsets: list[Onset], axis, *, bar_beats: float,
                 first_beat: float, last_beat: float) -> list[tuple[float, float]]:
     """Onsets inside a beat range → (bar-local beat position, strength).
 
     "Folding" is the whole trick: every bar of a section is laid on top of every
     other, so a stroke played in all eight bars shows up as eight onsets at the
     same bar-local position and a one-off fill shows up as one.
+
+    `axis` is a `BeatAxis` (a plain list of beat times is also accepted, which is
+    what the unit tests hand it). Passing the axis matters: the bar-local
+    position is taken modulo the bar, so folding against a beat list whose
+    origin differs from the chart's would put every stroke on the wrong side of
+    the beat.
     """
+    locate = axis.position_at if hasattr(axis, "position_at") else \
+        (lambda t: position_in(axis, t))
     folded: list[tuple[float, float]] = []
     for onset in onsets:
-        position = beat_position(beats_ms, onset.t_ms)
+        position = locate(onset.t_ms)
         if position < first_beat - TOLERANCE_BEATS or position >= last_beat:
             continue
         local = (position - first_beat) % bar_beats

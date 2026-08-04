@@ -27,9 +27,9 @@ from app.sync import BeatAnchor, Confidence, EngineVersions, VideoSync, anchors_
 from tests.conftest import (
     BAR_BEATS,
     MS_PER_BEAT,
+    known_axis,
     known_chords,
     known_downbeats,
-    known_grid,
 )
 
 
@@ -50,7 +50,7 @@ def make_sync(**overrides) -> VideoSync:
 
 
 def known_song() -> CompositionPayload:
-    spans = process(known_chords(), known_grid(), difficulty=NORMAL)
+    spans = process(known_chords(), known_axis(), difficulty=NORMAL)
     sections = segment(bars_from_spans(spans, BAR_BEATS))
     patterns = {i: fallback(bar_beats=4, tempo=120, name="Verse strum")
                 for i in range(len(sections))}

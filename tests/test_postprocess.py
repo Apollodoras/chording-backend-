@@ -20,7 +20,7 @@ from app.analysis.postprocess import (
 )
 from app.analysis.types import GridSpan, RawChordSpan
 from app.chords import EASY, HARD, MAJOR, MAJOR7, MINOR, NORMAL
-from tests.conftest import known_chords, known_grid
+from tests.conftest import known_axis, known_chords
 
 
 def span(start, length, root=0, quality=MAJOR, confidence=1.0, exact=True):
@@ -34,32 +34,32 @@ def test_quantize_snaps_boundaries_that_wobble_off_the_beat():
     """A chord change 40 ms early is the same musical event as one on the beat.
     Left unquantized it shows up as a chord that changes *between* two strokes,
     which reads as a glitch rather than as detail."""
-    grid = known_grid()
+    axis = known_axis()
     raw = [
         RawChordSpan(start_ms=0, end_ms=1960, label="C:maj"),      # wants beat 4
         RawChordSpan(start_ms=1960, end_ms=4030, label="G:maj"),   # wants beat 8
     ]
-    out = quantize(raw, grid)
+    out = quantize(raw, axis)
     assert [(s.start_beat, s.length_beats) for s in out] == [(0, 4), (4, 4)]
 
 
 def test_quantize_drops_no_chord_spans_rather_than_emitting_them():
     """There is no rest primitive in the container (§18) — the hole `N` leaves is
     closed later by holding the previous chord."""
-    grid = known_grid()
+    axis = known_axis()
     raw = [
         RawChordSpan(start_ms=0, end_ms=2000, label="C:maj"),
         RawChordSpan(start_ms=2000, end_ms=4000, label="N"),
         RawChordSpan(start_ms=4000, end_ms=6000, label="G:maj"),
     ]
-    out = quantize(raw, grid)
+    out = quantize(raw, axis)
     assert [s.root_pc for s in out] == [0, 7]
 
 
 def test_quantize_discards_spans_too_short_to_own_a_beat():
-    grid = known_grid()
+    axis = known_axis()
     raw = [RawChordSpan(start_ms=0, end_ms=80, label="C:maj")]
-    assert quantize(raw, grid) == []
+    assert quantize(raw, axis) == []
 
 
 # --- merge ------------------------------------------------------------------
@@ -148,9 +148,9 @@ def test_hard_leaves_the_harmony_alone():
 def test_every_tier_covers_the_same_span_of_time():
     """A tier that quietly got shorter would put the sidecar's anchors past the
     end of the song."""
-    grid = known_grid()
+    axis = known_axis()
     lengths = {
-        difficulty: sum(s.length_beats for s in process(known_chords(), grid,
+        difficulty: sum(s.length_beats for s in process(known_chords(), axis,
                                                         difficulty=difficulty))
         for difficulty in (EASY, NORMAL, HARD)
     }
@@ -176,7 +176,7 @@ def test_exact_ratio_reports_how_much_survived_normalization():
 def test_the_known_song_survives_the_chain_unchanged():
     """G–D–Em–C, four beats each, four times. Nothing in §5.4 should touch a
     chart that was already clean."""
-    out = process(known_chords(), known_grid(), difficulty=NORMAL)
+    out = process(known_chords(), known_axis(), difficulty=NORMAL)
     assert len(out) == 16
     assert [s.root_pc for s in out[:4]] == [7, 2, 4, 0]
     assert all(s.length_beats == 4 for s in out)
