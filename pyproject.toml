@@ -56,11 +56,25 @@ engines-btc = [
     "torch>=2.0,<3",
     "librosa>=0.10",
     "pyyaml>=6",
+    # A dependency of the *checkout*, not of anything imported here: BTC's
+    # `utils/mir_eval_modules` (where `idx2voca_chord` lives) imports it. Nothing
+    # in this repo names `mir_eval`, so it is invisible to a grep and to every
+    # local test — and a machine that happens to have it, as any bench run does,
+    # analyzes fine while a clean install fails every job in the chord stage.
+    "mir_eval>=0.7",
 ]
 
 # Beat This! — the beat tracker. Installed from git: there is no PyPI release.
 engines-beat-this = [
     "torch>=2.0,<3",
+    # Named explicitly although `beat-this` already requires it (unpinned), so
+    # that it is installed from whatever index torch came from. On Linux the
+    # default PyPI torchaudio wheel is the CUDA build, which links
+    # `libcudart.so.13` and cannot be imported on a CPU-only machine — and it
+    # fails at `import beat_this.inference`, not at install time. macOS wheels
+    # have no CUDA variant, which is why a Mac never sees this. See the matching
+    # note in modal_app.py, where the deployed image pins both to the CPU index.
+    "torchaudio",
     "einops",
     "soxr",
     "rotary-embedding-torch",

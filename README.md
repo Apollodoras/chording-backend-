@@ -346,10 +346,28 @@ with no error anywhere.
 
 ## Deploying, and what only breaks in the deployed shape
 
+This deploys as its **own Modal app**, `rosetta-dechorder` — not as functions
+added to Mo's `main` app. Same §19.2 argument that splits the two containers
+below, one level up: a bad build, a deploy or a rollback here must not be able to
+take Mo down with it. (Modal app names are `[a-zA-Z0-9-_.]+`, so "Rosetta
+Dechorder" lands as that slug.)
+
 ```bash
 CHORDS_DATABASE_URL="$(the DSN in chords-secrets)" modal deploy modal_app.py
-CHORDS_BASE_URL=https://…modal.run python scripts/smoke.py
+CHORDS_BASE_URL=https://…modal.run python scripts/smoke.py   # the API container
+modal run scripts/worker_check.py                            # the worker image
 ```
+
+**Both halves, because neither can see the other.** `smoke.py` talks HTTP to the
+API container; §4 gives the worker its own image, and the only channel between
+them is a job row — so no HTTP check can tell you whether BTC's weights load.
+`worker_check.py` runs the engines on synthesized audio inside the deployed
+worker image and exits non-zero if a chord engine or beat tracker cannot run.
+
+Real credentials — the service-account key, the DSN, the admin token, i.e. the
+contents of both Modal Secrets — live in `security/`, which is gitignored as a
+whole directory. `security/README.md` says what each file is and how to rotate
+it. Nothing there is needed for the tests or a local run.
 
 `scripts/smoke.py` is the deploy gate. It reads `/healthz` and checks the answers
 against what a *production* deployment must look like, then — given
@@ -413,6 +431,46 @@ two deploys of identical code can't install different models. Beat This!'s
 checkpoint is downloaded at *build* time; left to run time it would be fetched on
 the first request of every cold container, turning a cold start into a dependency
 on someone else's file server inside a job that already has a timeout.
+
+### The three that only the worker image can show you
+
+The same lesson one level in. These are not about the two *containers* but about
+the two *machines*: a laptop and a Debian image resolve different wheels, so an
+engine that runs perfectly here can be dead there. All three shipped through a
+**fully green `smoke.py`**, and all three failed in the chord or beat stage —
+behind `canAnalyze: true`, `engines: {chords: [btc, …]}` and `isReady: true`,
+because registration checks that a dependency and an adapter module *exist*, not
+that the engine *runs*. `scripts/worker_check.py` exists to close exactly this
+gap, and is what found them.
+
+**1. `beat_this` pulled the CUDA `torchaudio`.** It requires torchaudio and does
+not pin it, so resolving it from the default index got the CUDA wheel — which
+links `libcudart.so.13` and cannot import on a CPU image. It surfaced at the
+checkpoint bake, several layers from the line that caused it. torchaudio is now
+named in the *same* `pip_install` as torch, so both resolve from the CPU index as
+the matched pair they have to be. macOS wheels have no CUDA variant, which is why
+no local run can reproduce it.
+
+**2. BTC needs `mir_eval`, and nothing in this repo says so.** Its
+`utils/mir_eval_modules` — where `idx2voca_chord` and the 170-label vocabulary
+come from — imports it. That is a dependency of the *checkout*, invisible to a
+grep of this repo, and present on any machine that has run the bench. The image
+now installs it, and the build **imports BTC and asserts the vocabulary is 170
+labels**, because `test -f` proves the files arrived, not that they load.
+
+**3. PyTorch 2.6 flipped `torch.load(weights_only=)` to `True`.** BTC's 2019
+checkpoint stores its feature mean and std as numpy scalars, which are not on
+torch's default allowlist — so it raises `UnpicklingError` on torch ≥ 2.6 and
+loads fine on anything older. Old torch locally, new torch in the image.
+`adapters/btc.py` now allowlists the numpy types it actually needs rather than
+switching `weights_only` off wholesale: the checkpoint is trusted (a
+commit-pinned clone, baked at build time), but trusted is not a reason to grant a
+pickle arbitrary-code rights.
+
+A note on the build-time gate that came out of #2: prefer failing the *build*
+over failing every job. A missing engine dependency is indistinguishable from a
+healthy deployment until someone analyzes a video, and while YouTube's bot check
+stands, nobody can.
 
 Two Modal Secrets, and the split is §19.2 applied one level further in:
 `chords-secrets` (API — Firebase, admin token, DSN) and

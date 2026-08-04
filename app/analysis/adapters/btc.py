@@ -91,6 +91,56 @@ def _restore_numpy_aliases() -> None:
             setattr(np, alias, builtin)
 
 
+def _load_checkpoint(torch, path: Path):
+    """`torch.load` BTC's weights across PyTorch's 2.6 default change.
+
+    2.6 flipped `weights_only` from False to True. BTC's 2019 checkpoint stores
+    its feature mean and std as **numpy scalars** beside the state dict, and
+    numpy scalars are not on torch's default allowlist — so the load raises
+    `UnpicklingError` on torch >= 2.6 and succeeds on everything older. That is
+    the same local-vs-deployed split as `mir_eval` and CUDA-torchaudio: a laptop
+    pinned to an older torch analyzes perfectly while the image fails every job
+    in the chord stage, behind a health check that is still green.
+
+    Allowlisting the one type it needs is preferred over `weights_only=False`.
+    The checkpoint *is* trusted — a commit-pinned clone, baked in at build time —
+    but trusted is not a reason to grant a pickle arbitrary-code rights when what
+    it actually wants is a numpy scalar. The fallback exists because the
+    allowlist API is itself only present from torch 2.4, and this adapter has to
+    run on the older torch a local checkout may have.
+    """
+    add_safe_globals = getattr(torch.serialization, "add_safe_globals", None)
+    if add_safe_globals is None:          # torch < 2.4 — weights_only is off anyway
+        return torch.load(str(path), map_location="cpu")
+
+    import numpy as np
+
+    allowed = [np.dtype, np.ndarray]
+    # The reconstructor the error names. Its home moved in numpy 2, but the
+    # legacy path stays importable, so try both rather than branching on version.
+    for module, attribute in ((np.core.multiarray, "scalar"),
+                              (getattr(np, "_core", None), "multiarray")):
+        target = getattr(module, attribute, None) if module is not None else None
+        if target is not None:
+            allowed.append(getattr(target, "scalar", target))
+    # Scalar dtypes are pickled by their concrete class (Float64DType, …).
+    allowed.extend(getattr(np.dtypes, name) for name in dir(getattr(np, "dtypes", ()))
+                   if name.endswith("DType"))
+    add_safe_globals([obj for obj in allowed if obj is not None])
+
+    try:
+        return torch.load(str(path), map_location="cpu", weights_only=True)
+    except Exception:
+        # Deliberately broad and deliberately last: a checkpoint that needs a
+        # global we did not anticipate must still load, because the alternative
+        # is a deployment whose only chord engine is dead. Logged at warning so
+        # the weakening is visible rather than silent.
+        log.warning("BTC checkpoint needs an unlisted pickle global; loading with "
+                    "weights_only=False (source is the commit-pinned checkout)",
+                    exc_info=True)
+        return torch.load(str(path), map_location="cpu", weights_only=False)
+
+
 class BtcEngine:
     """`ChordEngine` — BTC large-vocabulary (170 labels).
 
@@ -149,7 +199,7 @@ class BtcEngine:
         config["probs_out"] = True
 
         model = BTC_model(config=config)
-        checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+        checkpoint = _load_checkpoint(torch, checkpoint_path)
         model.load_state_dict(checkpoint["model"])
         model.eval()
 

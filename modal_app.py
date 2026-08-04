@@ -57,7 +57,12 @@ import os
 
 import modal
 
-app = modal.App("chords-rosetta-gp")
+# Its OWN Modal app, not a function bolted onto Mo's `main` (§19.2). A deploy, a
+# rollback, or a bad build here must not be able to take Mo down with it — the
+# blast-radius argument that splits the two containers below applies just as much
+# one level up. Modal app names are `[a-zA-Z0-9-_.]+`, so "Rosetta Dechorder"
+# lands as this; the dashboard shows it at /apps/<workspace>/rosetta-dechorder.
+app = modal.App("rosetta-dechorder")
 
 # --- the single-writer pin --------------------------------------------------
 #
@@ -118,12 +123,30 @@ worker_image = (
         "soundfile>=0.12",
         "librosa>=0.10",
         "pyyaml>=6",
+        # BTC's own `utils/mir_eval_modules` imports this, and that module is
+        # where `idx2voca_chord` — the 170-label vocabulary — comes from. It is
+        # a dependency of the *checkout*, so nothing in this repo's own imports
+        # reveals it, and a machine that happens to have it installed (a bench
+        # run will) analyzes perfectly while the image fails every job.
+        "mir_eval>=0.7",
     )
     # CPU torch explicitly. The default wheel carries the whole CUDA runtime —
     # some two gigabytes of image, per container pull, for hardware this
     # deployment does not have. Both models are small enough that a GPU would
     # mostly buy cold-start latency (§18), and the pipeline is already async.
-    .pip_install("torch>=2.0,<3", index_url="https://download.pytorch.org/whl/cpu")
+    #
+    # **torchaudio belongs in THIS call, not the next one**, and that is what the
+    # first build of this image got wrong. `beat_this` requires torchaudio and
+    # does not pin it, so leaving it to be resolved below pulled the *default*
+    # PyPI wheel — the CUDA build — which links `libcudart.so.13` and cannot be
+    # imported on a CPU image at all. The failure surfaces at the checkpoint bake
+    # further down (`OSError: libcudart.so.13`), several layers away from the
+    # line that caused it. Naming it here resolves torch and torchaudio together,
+    # from one index, as the matched CPU pair they have to be — and because pip
+    # then finds the requirement already satisfied, the install below leaves it
+    # alone. A local run never sees this: macOS wheels have no CUDA variant.
+    .pip_install("torch>=2.0,<3", "torchaudio",
+                 index_url="https://download.pytorch.org/whl/cpu")
     .pip_install(
         "einops", "soxr", "rotary-embedding-torch",
         f"https://github.com/CPJKU/beat_this/archive/{BEAT_THIS_COMMIT}.zip",
@@ -137,6 +160,32 @@ worker_image = (
         # The weights ship in the repo, so a checkout that silently lacks them
         # would produce an image whose first job fails. Fail the build instead.
         f"test -f {BTC_ROOT}/test/btc_model_large_voca.pt",
+        # And the stronger version of the same idea: `test -f` proves the files
+        # arrived, not that they *import*. `utils.mir_eval_modules` pulls in
+        # `mir_eval`, and `btc_model` needs the NumPy aliases 1.24 removed —
+        # neither is visible from a file check, and both fail identically at run
+        # time: every job dying in the chord stage behind a green health check,
+        # which is the one shape of failure this deployment cannot see, because
+        # the fetch stage's bot check stops jobs before they ever get here.
+        # Assert the vocabulary size too — a checkout whose model code and
+        # weights disagree is exactly what pinning BTC_COMMIT exists to prevent.
+        # The alias restoration must be **guarded by hasattr**, exactly as
+        # `adapters/btc.py::_restore_numpy_aliases` does it. NumPy 2.0 brought
+        # `np.bool` back as a real scalar type, so assigning it unconditionally
+        # does not restore a removed alias — it overwrites a live one, and numpy
+        # then fails deep inside itself (`'bool' object has no attribute
+        # 'view'`). Only `np.float` is genuinely absent on 2.x.
+        'python -c "'
+        "import sys; sys.path.insert(0, '" + BTC_ROOT + "'); "
+        "import numpy as np; "
+        "[setattr(np, a, b) for a, b in "
+        "(('float', float), ('int', int), ('bool', bool), ('object', object)) "
+        "if not hasattr(np, a)]; "
+        "from utils.mir_eval_modules import idx2voca_chord; "
+        "from btc_model import BTC_model; "
+        "assert len(idx2voca_chord()) == 170, len(idx2voca_chord()); "
+        "print('BTC imports OK')"
+        '"',
     )
     # Bake Beat This!'s checkpoint into the image. Left to run time it is
     # downloaded on the first request of every cold container — which turns a

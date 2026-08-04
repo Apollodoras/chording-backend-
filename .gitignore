@@ -8,6 +8,12 @@ __pycache__/
 *.sqlite3
 .env
 
+# Real credentials: the Firebase service-account key, the Postgres DSN, the admin
+# token — i.e. the exact contents of the two Modal Secrets. Ignored as a whole
+# directory rather than by filename, so a new file dropped in here is safe by
+# default instead of safe only if someone remembers to add a pattern.
+security/
+
 # Scratch. Nothing decoded should ever reach the working tree (handoff §2.1),
 # but an ignore entry means a mistake is at least never committed.
 scratch/
