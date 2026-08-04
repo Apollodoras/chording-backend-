@@ -10,9 +10,14 @@ all the work: audio never persisted, only the derived map stored, the map never 
 product), and none of it depends on Google's tolerance.
 
 That makes this more than a convenience feature. It is what §3's kill switch
-degrades *to*: with `CHORDS_ANALYSIS_ENABLED=0`, or on the day YouTube's bot
-check stops yielding to cookies, the feature stops working entirely today.
-With this path it keeps working for anyone holding their own audio.
+degrades *to*: with `CHORDS_ANALYSIS_ENABLED=0`, or against YouTube's bot check,
+the feature stops working entirely today. With this path it keeps working for
+anyone holding their own audio.
+
+That day is not hypothetical and cookies were never the thing holding it off:
+the bot check is per egress IP, measured at ~20% of Modal containers, and
+identical with and without cookies. This path is the only fetch route that does
+not depend on YouTube's tolerance at all.
 
 **Nothing here weakens §2.1.** The bytes live in the worker's memory for the
 duration of one job, are written only into the caller's scratch directory (which

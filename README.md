@@ -488,15 +488,20 @@ a **lease** (15 minutes, comfortably above the worker's own timeout). Past it th
 job is presumed dead: failed, so the poller gets an answer and the pruner gets a
 row, and refunded, because the player got nothing for it.
 
-**3. The bot-check escape hatch could not be configured where it was needed.**
+**3. The cookie setting could not be configured where it was needed.**
 `CHORDS_YTDLP_COOKIES` was a *path* — and Modal delivers secrets as environment
 variables, while the worker mounts no Volume, so nothing in that container could
 place a file for it to point at. `CHORDS_YTDLP_COOKIES_CONTENT` takes the file's
 contents instead and materializes it 0600, once per process. The bot check is
 also no longer just another entry in the "video unavailable" list: to the player
 it is the same calm outcome, but to an operator it is the opposite of a private
-video — nothing is wrong with that video, and every video is about to fail the
-same way — so it logs at ERROR level.
+video — nothing is wrong with that video — so it logs at ERROR level.
+
+This was written up at the time as fixing "the bot-check escape hatch". It was
+not one, and [measurement later showed why](#the-bot-check-is-per-ip-and-cookies-do-not-fix-it):
+cookies make no difference to the bot check. The setting is still right to
+support, for age-restricted and members-only video; it is just not the answer to
+the failure this section thought it was.
 
 A fourth, smaller: a dispatch that *fails* (Modal refusing a spawn) charged the
 player for a job nothing would run, and then that stranded row blocked its video
@@ -565,6 +570,69 @@ Keep this deployment's credentials separate from Mo's (§19.2). Same Firebase
 project for identity, different service-account key: Mo never touches a
 recording, and the blast-radius argument says keep it that way.
 
+### The bot check is per-IP, and cookies do not fix it
+
+This is the one place where the obvious mitigation is the wrong one, so it is
+worth stating with the numbers rather than as an opinion.
+
+Cookies were supplied — a real Netscape `cookies.txt` from a signed-in browser,
+in `CHORDS_YTDLP_COOKIES_CONTENT` on the worker secret — and then measured. Ten
+containers, ten distinct Modal egress IPs, three ordinary uploads each:
+
+| | resolved | |
+|---|---|---|
+| without cookies | 6 / 30 | 20% |
+| with cookies | 6 / 30 | 20% |
+
+Identical. Two of the ten IPs resolved everything; the other eight resolved
+nothing. A second sweep some minutes later got 0/15. The check keys on **IP
+reputation, not on the account**, so a session credential buys nothing — and a
+real credential you keep for no benefit is worse than one you never stored. The
+cookies were removed from the secret and the local copy deleted.
+
+Two consequences worth building on:
+
+1. **Retrying is the mitigation.** Each attempt lands on its own container and so
+   its own IP; six independent tries turn a 20% coin toss into ~74%. That is what
+   `scripts/real_song_check.py --attempts N` does, and it is the shape production
+   should copy. A losing attempt returns after `probe`, before any audio is
+   fetched, so it costs seconds and no bandwidth. The real fix is egress: a
+   residential or rotating proxy.
+2. **Label-owned music is a second, separate wall.** Every official Beatles
+   upload in `bench/corpus.json` is refused in every player client. On the one
+   occasion cookies *did* clear the bot check, YouTube answered with storyboard
+   images (`sb0`–`sb3`, mhtml) and no audio format at all — the PO-token/SABR
+   path, which needs a token provider, not a credential. The corpus ids are kept
+   under `--songs isophonics` so the situation stays checkable.
+
+`ytdlp_source` still accepts both cookie settings. They are the right mechanism
+for age-restricted and members-only video, and worth revisiting if egress ever
+stops being a datacentre IP — they are just not an answer to a bot check.
+
+### What real audio actually produced
+
+`scripts/real_song_check.py` is the third gate: `probe` → `gate` → `decode` →
+beats → chords → onsets → `assemble`, on real recordings, in the deployed image.
+
+| | blues-in-e | canon-rock |
+|---|---|---|
+| chords | 112 bars, 164 spans | 23 sections, 221 bars |
+| roots | E:89 B:40 A:35 — **100%** on E/A/B | **100%** within D/A/Bm/F#m/G |
+| tempo | 91 bpm (upload says 90) | 200 bpm, 4/4 |
+| sync sidecar | yes | yes |
+| speed | 302 s audio in 64 s (0.21× realtime) | 321 s in 68 s |
+
+A 12-bar blues came back as exactly E, A and B; Canon Rock's cycle survived a
+distorted band mix. The `Em`/`E` and `Am`/`A` split in the blues is the blue
+third being genuinely ambiguous, not an error.
+
+The gate also surfaced a real limit. **Solo fingerstyle guitar degrades**: no
+percussion, so the beat grid is too weak to align, and the result comes back
+`lowConfidence: true` with `hasSync: false` and a flat two-chord stub instead of
+an arrangement. That is the system reporting its own weakness rather than
+lying — the behaviour we want — but sparse instrumental audio is a real weak
+spot, and §8's numbers come from full-band recordings.
+
 ---
 
 ## What is still owed, and by whom
@@ -618,9 +686,10 @@ or a lawyer — every item below is console work, and none of it is code.
 
 **The two failures to expect first.** YouTube answers datacentre IPs with a bot
 check far more often than residential ones; when it happens the worker logs it at
-ERROR level, distinctly from a video being private, and the fix is a Netscape
-cookies.txt exported from a signed-in browser into
-`CHORDS_YTDLP_COOKIES_CONTENT` on the **worker** secret. And the worker's 300 s
+ERROR level, distinctly from a video being private. Cookies do **not** fix it —
+see [the section below](#the-bot-check-is-per-ip-and-cookies-do-not-fix-it) —
+and the honest mitigation today is retrying on a fresh container, because each
+one is a fresh IP. And the worker's 300 s
 Modal timeout against ~47 s of DSP leaves room for a 10-minute video but not for
 much retrying; if fetches get slow, that budget is the thing to watch — a job
 that blows it is now reaped and refunded rather than left in flight, but it is

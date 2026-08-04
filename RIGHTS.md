@@ -65,8 +65,9 @@ lawsuit, so the mitigations are built for those:
   arise, and question 1's answer is unchanged because every §2 invariant applies
   identically;
 - it is what the kill switch degrades **to**. Before it existed, throwing the
-  switch — or YouTube's bot check hardening past what cookies can solve — took
-  the whole feature offline. Now it takes the YouTube half offline.
+  switch — or YouTube's bot check, which is per egress IP and which cookies were
+  measured not to solve — took the whole feature offline. Now it takes the
+  YouTube half offline.
 
 `/healthz` reports `canAnalyze` and `canAcceptUploads` separately for this
 reason: they are different capabilities with different exposure, and an operator

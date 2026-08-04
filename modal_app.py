@@ -34,16 +34,23 @@ replaces the WHOLE secret and would drop keys):
   CHORDS_REQUIRE_AUTH=1, CHORDS_ADMIN_TOKEN, CHORDS_DATABASE_URL.
 - `chords-worker-secrets` — the worker's. **Its own Firebase-free set**: the
   worker never authenticates anyone, so it gets no auth credentials at all. Only
-  CHORDS_DATABASE_URL, the analysis knobs, and CHORDS_YTDLP_COOKIES_CONTENT.
-  §19.2's "do not let the chord-analysis service inherit Mo's deployment or Mo's
-  blast radius", applied one level further in.
+  CHORDS_DATABASE_URL and the analysis knobs. §19.2's "do not let the
+  chord-analysis service inherit Mo's deployment or Mo's blast radius", applied
+  one level further in.
 
-  CHORDS_YTDLP_COOKIES_CONTENT holds the **contents** of a Netscape cookies.txt,
-  not a path: YouTube answers datacentre IPs with a bot check far more often than
-  residential ones, and this worker has no Volume and no mounted file for a path
-  to point at. Optional — leave it unset until the first bot check, which
-  `ytdlp_source` logs at error level precisely so you can tell that failure from
-  a video simply being private.
+  It deliberately carries **no YouTube cookies**. They were supplied, measured
+  against the bot check and removed: across ten containers on ten distinct Modal
+  egress IPs, three ordinary uploads resolved on two of them — 20%, and byte-for
+  -byte identical with and without cookies (6/30 in both arms). The bot check is
+  per **IP reputation**, not per account, so a session credential buys nothing
+  and a real one is worth not storing. `ytdlp_source` still *accepts*
+  CHORDS_YTDLP_COOKIES_CONTENT for age-restricted or members-only video, and it
+  would be worth revisiting if egress ever stops being a datacentre IP.
+
+  Label-owned music is a second, separate wall: every official Beatles upload in
+  `bench/corpus.json` is refused in every player client, and on the one occasion
+  cookies did clear the bot check YouTube answered with storyboard images and no
+  audio format at all — the PO-token/SABR path, which cookies also do not solve.
 
 CHORDS_DEV_TOKEN must never be set here (CHORDS_REQUIRE_AUTH refuses to start
 with it).
@@ -80,10 +87,25 @@ app = modal.App("rosetta-dechorder")
 _ON_POSTGRES = bool(os.environ.get("CHORDS_DATABASE_URL"))
 MAX_CONTAINERS = None if _ON_POSTGRES else 1
 
+# MUST stay in step with `[project].dependencies` in pyproject.toml. This list is
+# a duplicate of it — Modal images are built from an explicit package list, not
+# from the local project — and `tests/test_deployment.py` asserts the two agree,
+# because the one time they drifted it took the whole API down.
+#
+# The failure mode is worth stating: a dependency added to pyproject and not here
+# is present in every test run and absent from the deployed image, so the suite
+# is green, the deploy *succeeds*, and the container then dies at import. That is
+# not a degraded service — `create_app()` runs at module scope, so the ASGI app
+# never builds and every route 503s, including `/healthz`.
 BASE_PACKAGES = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "pydantic>=2.8",
+    # Required at *import* time by `POST /v1/analyze/upload`: FastAPI raises
+    # while registering any route that declares File()/Form(), not when one is
+    # first called. Omitting it does not disable the upload path, it unbuilds
+    # the application.
+    "python-multipart>=0.0.9",
     "httpx>=0.27",
     "firebase-admin>=6.5",
     "psycopg[binary,pool]>=3.2",

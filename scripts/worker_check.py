@@ -22,8 +22,11 @@ run, each invisible on a laptop and each fatal in the image:
 All three failed **in the chord stage**, behind `canAnalyze: true`,
 `engines: {chords: [btc, ...]}` and `is_ready: true` — because registration
 checks that a dependency and an adapter module exist, not that the engine runs.
-And YouTube's bot check hides all of it, since fetch fails first: you would fix
-cookies, then meet these one at a time.
+And YouTube's bot check hides all of it, since fetch fails first: you would chase
+the fetch stage, get through, and then meet these one at a time. (Chasing it with
+cookies would not even have got you that far — the check is per egress IP and
+cookies made no measurable difference. `scripts/real_song_check.py` is the gate
+that covers fetch, on real audio.)
 
 Synthesized audio, not a recording: this asks "do the engines load and produce a
 grid", not "are they accurate" — the §8 benchmark already answered that, and a
@@ -116,7 +119,15 @@ def check() -> dict:
 
     # The fetch stage's binaries. Never reached while the bot check stands, so
     # nothing else in the deployment would notice them missing.
-    for binary, flag in (("ffmpeg", "-version"), ("yt-dlp", "--version")):
+    #
+    # `ffprobe` is here for the upload path (`app/analysis/file_source.py`),
+    # which calls it to read a file's duration *before* the §3 gate. It ships in
+    # Debian's `ffmpeg` package, so it is present today by luck rather than by
+    # declaration — and `ModalJobRunner.can_accept_uploads()` answers True for
+    # the worker without asking, so nothing else in the deployment would notice
+    # if a future base image split the two.
+    for binary, flag in (("ffmpeg", "-version"), ("ffprobe", "-version"),
+                         ("yt-dlp", "--version")):
         path = shutil.which(binary)
         version = None
         if path:
@@ -149,7 +160,7 @@ def _verdict(report: dict) -> int:
     chords = report.get("chords") or {}
     if chords.get("engine") and not chords.get("count"):
         failures.append("chord engine returned no spans")
-    for binary in ("ffmpeg", "yt-dlp"):
+    for binary in ("ffmpeg", "ffprobe", "yt-dlp"):
         if not (report.get(binary) or {}).get("path"):
             failures.append(f"{binary} missing from the worker image")
 

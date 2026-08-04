@@ -65,9 +65,15 @@ _UNAVAILABLE_MARKERS = (
 # The bot check, kept apart from the family above. To the player it is the same
 # calm "can't have this one" outcome, so it stays refundable and is not dressed
 # up as our crash — but operationally it is the opposite of a video being
-# private: nothing is wrong with the video, and *every* video is about to fail
+# private: nothing is wrong with the video, and the *next* video may well fail
 # the same way. That deserves a log line an operator can alert on, which is why
 # it doesn't just sit in the tuple above being silently indistinguishable.
+#
+# It is **per egress IP, not per account**, which was measured rather than
+# assumed: a fan-out of ten containers over ten distinct Modal IPs resolved the
+# same three ordinary uploads on two of them — 20%, and *identical* with and
+# without cookies (6/30 in both arms). So this is not "all or nothing" across the
+# deployment, and it is not something a credential fixes.
 _BOT_CHECK_MARKERS = (
     "sign in to confirm you're not a bot",
     "sign in to confirm you’re not a bot",
@@ -86,9 +92,11 @@ def _looks_unavailable(stderr: str) -> bool:
     lowered = (stderr or "").lower()
     if any(marker in lowered for marker in _BOT_CHECK_MARKERS):
         log.error(
-            "yt-dlp hit YouTube's bot check — this is a deployment-wide failure, "
-            "not a problem with one video. Supply cookies via "
-            "CHORDS_YTDLP_COOKIES_CONTENT (or CHORDS_YTDLP_COOKIES)."
+            "yt-dlp hit YouTube's bot check — nothing is wrong with this video. "
+            "It is per egress IP, so a retry on a fresh container may well "
+            "succeed; measured hit rate on Modal was ~20%% of IPs. Cookies do "
+            "NOT fix it (measured: identical with and without) — the lever is "
+            "egress, i.e. a residential or rotating proxy."
         )
         return True
     return any(marker in lowered for marker in _UNAVAILABLE_MARKERS)
@@ -116,9 +124,13 @@ class YtDlpSource:
         self._settings = settings
         self._ytdlp = [sys.executable, "-m", "yt_dlp"]
         self._ffmpeg = os.environ.get("CHORDS_FFMPEG", "ffmpeg")
-        # Optional cookies. YouTube increasingly answers datacentre IPs with a
-        # bot check, and this is the supported escape hatch — see `_cookie_file`
-        # for why it is accepted as *content* and not only as a path.
+        # Optional cookies, and deliberately unset in this deployment: measured
+        # against the bot check they made no difference at all (see
+        # `_BOT_CHECK_MARKERS`). Kept because they remain yt-dlp's supported
+        # mechanism for age-restricted and members-only video, and because the
+        # picture changes the moment egress is not a datacentre IP — not because
+        # they are the answer to a bot check. See `_cookie_file` for why this is
+        # accepted as *content* and not only as a path.
         self._cookies_path = os.environ.get("CHORDS_YTDLP_COOKIES") or None
         self._cookies_data = os.environ.get("CHORDS_YTDLP_COOKIES_CONTENT") or None
         self._materialized: str | None = None
@@ -146,9 +158,12 @@ class YtDlpSource:
         delivers secrets as **environment variables**, and the worker mounts no
         Volume by design (§4) — so there is no filesystem anywhere in that
         container that a cookies *file* could have been placed on. Supporting
-        only `CHORDS_YTDLP_COOKIES` meant the documented mitigation for the
-        single most likely production failure could not be configured in
-        production.
+        only `CHORDS_YTDLP_COOKIES` meant this could not be configured in
+        production at all.
+
+        Nothing here is currently set: cookies were tried against the bot check,
+        measured, and removed. This exists for age-restricted and members-only
+        video, and against the day egress stops being a datacentre IP.
 
         Written 0600 into the container's own tmp, once per process. Not into the
         §2.1 scratch root: that directory is destroyed after every job and this

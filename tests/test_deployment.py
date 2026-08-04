@@ -303,3 +303,67 @@ def test_healthz_reports_an_unreachable_store(api_container, monkeypatch):
     body = api_container.get("/healthz").json()
 
     assert body["db"] == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# The image's package list is a duplicate of pyproject's, and duplicates drift
+# ---------------------------------------------------------------------------
+
+def _requirement_names(lines) -> set[str]:
+    """Distribution names from requirement strings, normalised (PEP 503).
+
+    Extras and version specifiers are dropped: `uvicorn[standard]>=0.30` and
+    `uvicorn>=0.31` are the same *dependency*, and this check is about one list
+    forgetting a package the other has, not about pinning.
+    """
+    import re
+
+    names = set()
+    for line in lines:
+        match = re.match(r"^\s*([A-Za-z0-9._-]+)", line)
+        if match:
+            names.add(re.sub(r"[-_.]+", "-", match.group(1)).lower())
+    return names
+
+
+def test_the_modal_image_installs_everything_pyproject_declares():
+    """`modal_app.py`'s BASE_PACKAGES must not fall behind pyproject.
+
+    Modal builds its images from an explicit package list rather than from the
+    local project, so that list is a hand-maintained copy of
+    `[project].dependencies` — and the copy is invisible to every other check
+    here. `modal_app.py` cannot be imported (see the module docstring), so the
+    list is read out of the source.
+
+    This is not hygiene. When `python-multipart` was added to pyproject and not
+    to BASE_PACKAGES, the suite stayed green, `modal deploy` **succeeded**, and
+    the API container then died at import — `create_app()` runs at module scope,
+    so FastAPI's "Form data requires python-multipart" fired while registering
+    `POST /v1/analyze/upload` and the ASGI app never built at all. Not a degraded
+    upload path: no `/healthz`, no cached maps, nothing.
+    """
+    import ast
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+
+    declared = _requirement_names(
+        tomllib.loads((root / "pyproject.toml").read_text())["project"]["dependencies"]
+    )
+
+    tree = ast.parse((root / "modal_app.py").read_text())
+    packages = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "BASE_PACKAGES" for t in node.targets
+        ):
+            packages = [e.value for e in node.value.elts if isinstance(e, ast.Constant)]
+    assert packages is not None, "BASE_PACKAGES not found in modal_app.py"
+
+    missing = declared - _requirement_names(packages)
+    assert not missing, (
+        f"pyproject declares {sorted(missing)} but modal_app.py's BASE_PACKAGES does not — "
+        f"the deployed image would be built without them, and the API container dies at "
+        f"import rather than starting degraded"
+    )
