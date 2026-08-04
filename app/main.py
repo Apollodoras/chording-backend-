@@ -30,7 +30,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -38,6 +38,10 @@ from pydantic import BaseModel, Field
 
 from .analysis import engines
 from .analysis.fetch import build_source, parse_video_id
+# Safe on the API image: `file_source` imports no audio dependency at module
+# level (numpy and ffmpeg are reached inside `decode`), which is what CI's
+# "the API surface cannot touch audio" check asserts.
+from .analysis.file_source import MAX_UPLOAD_BYTES, upload_id
 from .auth import Authenticator, Principal, build_authenticator
 from .chords import DIFFICULTIES, NORMAL
 from .config import Settings, load_settings
@@ -359,6 +363,10 @@ def _install_routes(app: FastAPI) -> None:
             "engines": engines.available(),
             "enginesReady": engines.is_ready(settings),
             "canAnalyze": app.state.runner.can_analyze(),
+            # Reported separately because the two genuinely differ: an upload
+            # needs ffmpeg and the engines but no fetch source, so it survives
+            # a dead YouTube path (see `analysis/file_source.py`).
+            "canAcceptUploads": app.state.runner.can_accept_uploads(),
             "db": _db_health(app.state.store),
             "admin": "configured" if settings.has_admin else "unconfigured",
             "maxVideoSeconds": settings.max_video_seconds,
@@ -454,6 +462,67 @@ def _install_routes(app: FastAPI) -> None:
             store.update_job(job_id, status=STATUS_FAILED, progress=1.0,
                              error_code=CODE_ANALYSIS_FAILED,
                              error_message="That video couldn’t be analyzed.")
+            store.refund_use(principal.uid)
+            raise fail(503, "Chord analysis is busy right now — try again in a moment.",
+                       CODE_FEATURE_DISABLED)
+        return JSONResponse(status_code=202, content={"jobId": job_id, "status": "queued"})
+
+    @app.post("/v1/analyze/upload")
+    async def analyze_upload(request: Request, file: UploadFile = File(...),
+                             difficulty: str | None = Form(default=None),
+                             principal: Principal = Depends(_principal_checked)):
+        """Analyze audio the player supplied, rather than a video we fetched.
+
+        The second input path, and the one with **no YouTube-terms exposure** —
+        see `app/analysis/file_source.py` for why that matters beyond
+        convenience. Everything downstream is identical: the same gate, the same
+        pipeline, the same envelope, the same §2.1 guarantee that the audio is
+        destroyed with the job.
+
+        The id is a **content hash**, so re-uploading the same file is a cache
+        hit and therefore free (§16.4) — the player is charged for analyzing a
+        piece of audio, not for sending it twice.
+
+        The bytes are held in this container's memory for the length of one
+        request and forwarded to the worker. They are never written to a Volume,
+        never stored, and never readable by a later request; §4's isolation is
+        unchanged because this container still never *decodes* anything.
+        """
+        settings: Settings = app.state.settings
+        store: Store = app.state.store
+
+        if not settings.analysis_enabled:
+            raise fail(503, "Chord analysis is unavailable right now.", CODE_FEATURE_DISABLED)
+        if not app.state.runner.can_accept_uploads():
+            raise fail(503, "Uploads aren’t available on this deployment yet.",
+                       CODE_FEATURE_DISABLED)
+
+        tier = _difficulty(difficulty)
+        data = await _read_upload(file, settings)
+        video_id = upload_id(data)
+
+        cached = store.get_map(video_id, tier)
+        if cached is not None:
+            return _result(cached)
+        if store.is_blocked(video_id=video_id):
+            raise fail(403, "That audio isn’t available for chord analysis.", CODE_VIDEO_BLOCKED)
+
+        existing = store.active_job_for(video_id, tier)
+        if existing is not None:
+            return JSONResponse(status_code=202,
+                                content={"jobId": existing.job_id, "status": existing.status})
+
+        _charge(app, principal)
+        job_id = uuid.uuid4().hex
+        store.create_job(job_id=job_id, uid=principal.uid, video_id=video_id, difficulty=tier)
+        try:
+            app.state.runner.submit(job_id=job_id, video_id=video_id, difficulty=tier,
+                                    uid=principal.uid, audio=data, filename=file.filename)
+        except Exception:
+            log.exception("failed to submit upload job %s", job_id)
+            store.update_job(job_id, status=STATUS_FAILED, progress=1.0,
+                             error_code=CODE_ANALYSIS_FAILED,
+                             error_message="That audio couldn’t be analyzed.")
             store.refund_use(principal.uid)
             raise fail(503, "Chord analysis is busy right now — try again in a moment.",
                        CODE_FEATURE_DISABLED)
@@ -580,6 +649,31 @@ def _video_id(body: AnalyzeRequest) -> str:
     if video_id is None:
         raise fail(400, "That doesn’t look like a YouTube video.", CODE_BAD_REQUEST)
     return video_id
+
+
+async def _read_upload(file: UploadFile, settings: Settings) -> bytes:
+    """The uploaded audio, read with a hard ceiling.
+
+    Read in chunks and abandoned the moment the cap is passed, rather than read
+    whole and measured afterwards: `await file.read()` on an unbounded body is
+    how a container with a memory cap dies instead of returning a 400. The cap is
+    generous for a 10-minute song (§18) even lossless.
+    """
+    limit = MAX_UPLOAD_BYTES
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise fail(413, f"That file is larger than {limit // (1024 * 1024)} MB.",
+                       CODE_BAD_REQUEST)
+        chunks.append(chunk)
+    if total == 0:
+        raise fail(400, "That upload was empty.", CODE_BAD_REQUEST)
+    return b"".join(chunks)
 
 
 def _difficulty(value: str | None) -> str:

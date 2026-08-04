@@ -139,9 +139,24 @@ class JobRunner:
         self.store = store
         self.source = source
 
-    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str) -> None:
+    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str,
+               audio: bytes | None = None, filename: str | None = None) -> None:
         run_job(job_id=job_id, video_id=video_id, difficulty=difficulty, uid=uid,
-                settings=self.settings, store=self.store, source=self.source)
+                settings=self.settings, store=self.store,
+                source=self._source_for(audio, filename))
+
+    def _source_for(self, audio: bytes | None, filename: str | None):
+        """The source this job should run against.
+
+        An upload brings its own audio, so it brings its own source — there is
+        nothing to fetch and, per §2.1, nowhere the bytes could have been left
+        for a shared source to pick up later. The YouTube path keeps the
+        long-lived source built at startup.
+        """
+        if audio is None:
+            return self.source
+        from .analysis.file_source import FileSource
+        return FileSource(audio, filename=filename, settings=self.settings)
 
     def can_analyze(self) -> bool:
         """Whether submitting a job here could actually produce a map.
@@ -161,6 +176,12 @@ class JobRunner:
         """
         return self.source is not None and engines.is_ready(self.settings)
 
+    def can_accept_uploads(self) -> bool:
+        """An upload needs ffmpeg and the engines, but no fetch source — that is
+        the whole distinction, so it is asked separately from `can_analyze`."""
+        from .analysis.file_source import available
+        return available() and engines.is_ready(self.settings)
+
 
 class ThreadJobRunner(JobRunner):
     """Background threads in the API process — development and single-container
@@ -171,11 +192,13 @@ class ThreadJobRunner(JobRunner):
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="analysis")
         self._lock = threading.Lock()
 
-    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str) -> None:
+    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str,
+               audio: bytes | None = None, filename: str | None = None) -> None:
         with self._lock:
             self._pool.submit(
                 run_job, job_id=job_id, video_id=video_id, difficulty=difficulty,
-                uid=uid, settings=self.settings, store=self.store, source=self.source,
+                uid=uid, settings=self.settings, store=self.store,
+                source=self._source_for(audio, filename),
             )
 
     def shutdown(self) -> None:
@@ -202,8 +225,20 @@ class RemoteJobRunner(JobRunner):
     and refunded either way (`REFUNDABLE_CODES` includes `feature_disabled`).
     """
 
-    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str) -> None:
+    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str,
+               audio: bytes | None = None, filename: str | None = None) -> None:
         raise NotImplementedError
 
     def can_analyze(self) -> bool:
+        return True
+
+    def can_accept_uploads(self) -> bool:
+        """Whether an upload could be analyzed if one arrived.
+
+        Separate from `can_analyze` because the two can differ: the kill switch
+        and a dead YouTube path both take the fetch route out without touching
+        this one, which is most of the point of having it (see
+        `analysis/file_source.py`). A remote runner answers for its worker, the
+        same way `can_analyze` does.
+        """
         return True

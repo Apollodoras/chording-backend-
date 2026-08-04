@@ -219,21 +219,30 @@ worker_secrets = [modal.Secret.from_name("chords-worker-secrets")]
     max_containers=8,
     retries=0,          # a failed analysis is reported, never silently retried
 )
-def analysis_worker(job_id: str, video_id: str, difficulty: str, uid: str) -> None:
+def analysis_worker(job_id: str, video_id: str, difficulty: str, uid: str,
+                    audio: bytes | None = None, filename: str | None = None) -> None:
     """One analysis, in its own container, with its own image and secret.
 
     Imports happen inside the function so the API image never has to satisfy
     them: `app.analysis.fetch` pulls in yt-dlp, which does not exist over there.
+
+    `audio` carries an upload's bytes (`POST /v1/analyze/upload`). They arrive as
+    a function argument rather than through storage because §2.1 leaves nowhere
+    to put them — the worker mounts no Volume, and a recording parked anywhere
+    durable is the invariant broken. They exist in this container's memory, get
+    written only into the scratch directory, and die with the container.
     """
     from app.config import load_settings
     from app.jobs import run_job
     from app.analysis.fetch import build_source
+    from app.analysis.file_source import FileSource
     from app.analysis.scratch import assert_clean
     from app.store import build_store
 
     settings = load_settings()
     store = build_store(settings)
-    source = build_source(settings)
+    source = (FileSource(audio, filename=filename, settings=settings)
+              if audio is not None else build_source(settings))
 
     try:
         run_job(job_id=job_id, video_id=video_id, difficulty=difficulty, uid=uid,
@@ -277,9 +286,17 @@ def fastapi_app():
         `POST /v1/analyze` answered 503 on a deployment that was working.
         """
 
-        def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str) -> None:
+        def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str,
+                   audio: bytes | None = None, filename: str | None = None) -> None:
             analysis_worker.spawn(job_id=job_id, video_id=video_id,
-                                  difficulty=difficulty, uid=uid)
+                                  difficulty=difficulty, uid=uid,
+                                  audio=audio, filename=filename)
+
+        def can_accept_uploads(self) -> bool:
+            """True for the same reason `can_analyze` is: the *worker* image has
+            ffmpeg and the engines, and this container's job is to delegate, not
+            to decode."""
+            return True
 
     settings = load_settings()
     store = build_store(settings)

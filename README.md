@@ -17,15 +17,23 @@ mirrors deliberately — §16).
 
 ## Status
 
-**Working end to end, and now in the deployed shape too.** A YouTube id goes in;
-a linted `CompositionPayload` v2 and a `videoSync` sidecar come out. 303 tests,
-green, no audio and no network required to run them.
+**Working end to end, in the deployed shape, and now measured on the thing that
+actually matters.** A YouTube id (or an uploaded file) goes in; a linted
+`CompositionPayload` v2 and a `videoSync` sidecar come out. 336 tests, green, no
+audio and no network required to run them.
 
-The qualifier matters, because it was false in exactly one place. Everything
-below ran on this machine in a single process, where the container that answers
-the request is also the container that owns the engines. **On Modal it is not**,
-and three things only break over there — see
-[Deploying, and what only breaks in the deployed shape](#deploying-and-what-only-breaks-in-the-deployed-shape).
+That last clause is new and it was the important one. Every number this repo
+reported until 2026-08-03 described a **component** — BTC's accuracy, beat_this's
+downbeat F, whether the song lints clean. None of them described the
+**deliverable**: *does the app show the right chord at the right moment in the
+recording?* When that was finally measured, with ground truth fed in as both
+engines so any error had to be the pipeline's own, the answer was **0.768** — a
+23-point loss before any engine had made a mistake, on charts that all linted
+clean and all shipped a sidecar. It is **0.939** now. See
+[Measuring the deliverable](#measuring-the-deliverable-not-the-engine).
+
+The rights posture — what is stored, what is not, and which Chordify surfaces are
+deliberately not cloned — is [`RIGHTS.md`](RIGHTS.md).
 
 | | |
 |---|---|
@@ -39,7 +47,8 @@ and three things only break over there — see
 | §13 `videoSync` sidecar | ✅ beat anchors + the §13.2 invariant, enforced by lint |
 | §16 API | ✅ Mo-shaped: Firebase bearer, `{message, code}` errors, job-id + poll |
 | §16.5 contract fixtures | ✅ emitted and byte-stable; the app-side test is a small follow-up (below) |
-| §5.1 fetch + decode | ✅ yt-dlp + ffmpeg, bounded, behind the §4 seam |
+| §5.1 fetch + decode | ✅ yt-dlp + ffmpeg, bounded, behind the §4 seam — **plus an upload path** with no YouTube-terms exposure ([`RIGHTS.md`](RIGHTS.md)) |
+| the beat axis | ✅ one origin for chart, bars and anchors (`axis.py`) — the defect that cost 23 points |
 | §5.2/§5.3 engines | ✅ **BTC + Beat This!**, benchmarked against real recordings (below) |
 | §4 two-container shape | ✅ the API delegates to the worker; `tests/test_deployment.py` covers what `modal_app.py` relies on |
 | CI | ✅ suite, Postgres, fixture stability, and a test that the API image cannot touch audio |
@@ -89,6 +98,67 @@ curl -s localhost:8000/healthz | python3 -m json.tool
 mode, store backend, kill-switch state, whether a fetch source exists, which
 engines are installed. A green health check that hides a dead authenticator is
 the failure the Mo backend learned from.
+
+---
+
+## Measuring the deliverable, not the engine
+
+Every other number in this file scores a *component* against ground truth. This
+one reconstructs **what the player sees** — `videoCurrentTimeMs → songBeat → the
+chord the compiled chart sounds there`, which is exactly the composition the
+client performs every frame (`app/sync.py`: `song_beat_at` →
+`chord_at_song_beat`) — and scores that. It is the `delivered` column in
+`bench/run_bench.py` and the whole of `tests/test_alignment.py`.
+
+Run with **ground truth as both engines**, so every point lost is the pipeline's
+own arithmetic and not BTC mishearing a chord:
+
+| | real corpus |
+|---|---|
+| engine score (raw spans vs truth) | 1.000 |
+| delivered, before | **0.768** |
+| delivered, now | **0.939** |
+
+Three defects, none of which `lint`, `lint_sync` or any prior number could see —
+all three produce a chart that is perfectly self-consistent and wrong:
+
+**The chart and the sidecar used different origins.** `postprocess.quantize`
+indexed into `BeatGrid.beats_ms`, so bar 0 began at the first *beat*;
+`sync.anchors_for` put `songBeat 0` at the first *downbeat*. Nothing reconciled
+them, and `anchors_for` even takes a `first_bar_index` for precisely this and was
+never passed one. Any song with a pickup — most real recordings — was uniformly
+phase-shifted against itself. `Something` scored 0.501, `Here Comes The Sun`
+0.300. The fix is `app/analysis/axis.py`: one `BeatAxis`, built once, where beat
+0 **is** the first downbeat and bar *k* **is** beats `[k·B, (k+1)·B)` by
+construction. Three modules now share one object instead of three assumptions.
+
+**Irregular bars derailed everything after them.** `bars_from_spans` assumed a
+downbeat every `bar_beats` beats. Here Comes The Sun has 11/8 and 15/8 bars
+inside a 4/4 song, so re-indexing alone only took it 0.300 → 0.531. The container
+cannot express a meter change (§13.2 needs one uniform grid), so `BeatAxis`
+resamples an odd bar onto the song's meter: it still starts and ends on the
+tracker's real downbeats — which is what the anchors publish — and the error
+stays inside that one bar instead of accumulating. 0.900.
+
+**Structure substituted chords it hadn't heard.** `_merge_similar` folded a block
+into its neighbour at 0.75 similarity and bumped `repeats`, replaying pass one
+over pass two's bars — and one differing bar in a four-bar unit is *exactly*
+0.75. Merging the section is right (§15 wants it, the player reads the rail);
+merging the harmony is not. Identical blocks still collapse to `repeats`, which
+is lossless; merely-similar ones now keep both passes' bars.
+
+**Why 303 green tests missed all of it:** every fixture in `tests/conftest.py`
+had `downbeats_ms[0] == beats_ms[0] == 0` — the one geometry that needs no
+reconciliation. `conftest.recording(pickup_beats=…, odd_bars=…)` exists now so
+the normal case is reachable, and `tests/test_alignment.py` asserts frame *and*
+downbeat accuracy across it.
+
+The residual ~0.06 is quantization to the beat grid: a chord that changes off the
+beat cannot be said in a container whose unit is a stroke. Chordify quantizes to
+beats too. Note that `delivered` is scored on the **`hard`** tier — `normal`
+deliberately folds diminished and augmented onto their nearest playable triad
+(§5.5), and charging the pipeline for a reduction it was asked to make reads
+Michelle as 0.812 instead of 0.952.
 
 ---
 
@@ -199,7 +269,8 @@ to serve `beat_this` — which won on its own merits anyway.
 ## How it fits together
 
 ```
-POST /v1/analyze ──► cache hit? ──► 200 {song, videoSync}      (free — §16.4)
+POST /v1/analyze          {videoId}  ──┐   cache hit? ──► 200 {song, videoSync}
+POST /v1/analyze/upload   {file}     ──┘        (free — §16.4, id is a content hash)
                  └─► 202 {jobId} ──► worker (its own container, own image)
                                        │
                        probe ──► gate (blocklist · 10-min cap · kill switch)
@@ -207,11 +278,20 @@ POST /v1/analyze ──► cache hit? ──► 200 {song, videoSync}      (free
                        scratch dir ──► decode ──► beats ──► chords ──► onsets
                                        └─► rm -rf audio  (every exit path)
                                        │
+                       build_axis ──► ONE beat axis (chart · bars · anchors)
+                                       │
                        §5.4 post-process ──► §15 sections ──► §14 patterns
                                        │
                        §12 compile ──► lint ──► Postgres: chord_maps
 GET /v1/analyze/{jobId} ──► status / {song, videoSync}
 ```
+
+Two input paths, and the difference is legal rather than technical: `/v1/analyze`
+fetches a YouTube recording (which §2 concedes contravenes the API terms as
+written), `/v1/analyze/upload` takes audio the player already has and carries no
+such exposure. Everything downstream of `decode` is identical, and the upload
+path is what §3's kill switch degrades *to* rather than degrading to nothing.
+See [`RIGHTS.md`](RIGHTS.md).
 
 | Module | What it owns |
 |---|---|
@@ -221,7 +301,9 @@ GET /v1/analyze/{jobId} ──► status / {song, videoSync}
 | `app/sync.py` | the sidecar, anchors, and the client's interpolation in Python |
 | `app/store.py` | maps, jobs, blocklist, audit log, quota, limiter — two backends |
 | `app/analysis/` | the pipeline; `scratch.py` is §2.1 in code |
+| `app/analysis/axis.py` | **one** beat axis — chart, bars and anchors share an origin by construction |
 | `app/analysis/ytdlp_source.py` | the only code that ever holds audio — worker image only |
+| `app/analysis/file_source.py` | the upload path: player-supplied audio, no YouTube-terms exposure |
 | `app/analysis/adapters/` | one file per engine; nothing else imports a model |
 | `app/main.py` | the HTTP surface, shaped like Mo's |
 | `modal_app.py` | two functions, **two images** — that split *is* §4's isolation |

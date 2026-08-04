@@ -16,6 +16,10 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "pydantic>=2.8",
+    # Multipart parsing for `POST /v1/analyze/upload`. FastAPI needs it present
+    # to serve a form body at all, and it is a parser rather than an audio
+    # dependency — the API container still cannot decode anything.
+    "python-multipart>=0.0.9",
     "httpx>=0.27",
     "firebase-admin>=6.5",
     # The Postgres store. Imported lazily in app/store.py, so a SQLite-only run
