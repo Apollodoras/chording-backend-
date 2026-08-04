@@ -108,6 +108,19 @@ def _load_checkpoint(torch, path: Path):
     it actually wants is a numpy scalar. The fallback exists because the
     allowlist API is itself only present from torch 2.4, and this adapter has to
     run on the older torch a local checkout may have.
+
+    **Registering the object alone is not enough, and silently was not.** torch
+    keys its allowlist on `f"{obj.__module__}.{obj.__qualname__}"`, and under
+    numpy 2 `np.core` is a shim whose members report the *new* home: the
+    reconstructor registers as `numpy._core.multiarray.scalar` while the 2019
+    pickle asks for `numpy.core.multiarray.scalar`. The names never match, so
+    every single engine build fell through to the `weights_only=False` fallback
+    below — working, but logging a warning and a traceback each time, and
+    granting exactly the pickle rights this function exists to withhold.
+    Verified in the deployed image: torch 2.13.0+cpu, numpy 2.0.2.
+
+    torch >= 2.7 takes `(callable, "dotted.path")` to register under an explicit
+    name, which is the supported way to say "this object, under the legacy path".
     """
     add_safe_globals = getattr(torch.serialization, "add_safe_globals", None)
     if add_safe_globals is None:          # torch < 2.4 — weights_only is off anyway
@@ -115,18 +128,32 @@ def _load_checkpoint(torch, path: Path):
 
     import numpy as np
 
-    allowed = [np.dtype, np.ndarray]
-    # The reconstructor the error names. Its home moved in numpy 2, but the
-    # legacy path stays importable, so try both rather than branching on version.
-    for module, attribute in ((np.core.multiarray, "scalar"),
-                              (getattr(np, "_core", None), "multiarray")):
-        target = getattr(module, attribute, None) if module is not None else None
-        if target is not None:
-            allowed.append(getattr(target, "scalar", target))
+    allowed: list = [np.dtype, np.ndarray]
     # Scalar dtypes are pickled by their concrete class (Float64DType, …).
     allowed.extend(getattr(np.dtypes, name) for name in dir(getattr(np, "dtypes", ()))
                    if name.endswith("DType"))
-    add_safe_globals([obj for obj in allowed if obj is not None])
+
+    scalar = getattr(getattr(np, "core", None), "multiarray", None)
+    scalar = getattr(scalar, "scalar", None)
+    if scalar is None:
+        scalar = getattr(getattr(np, "_core", None), "multiarray", None)
+        scalar = getattr(scalar, "scalar", None)
+
+    allowed = [obj for obj in allowed if obj is not None]
+    if scalar is not None:
+        allowed.append(scalar)
+
+    add_safe_globals(allowed)
+    if scalar is not None:
+        # Additionally under the name the checkpoint actually pickles. Guarded
+        # because the tuple form is torch >= 2.7; on older torch the plain
+        # registration above is all that is available, and the fallback catches
+        # the rest.
+        try:
+            add_safe_globals([(scalar, "numpy.core.multiarray.scalar")])
+        except (TypeError, ValueError):
+            log.debug("this torch does not accept named safe globals; "
+                      "relying on the weights_only=False fallback if needed")
 
     try:
         return torch.load(str(path), map_location="cpu", weights_only=True)
