@@ -34,9 +34,16 @@ replaces the WHOLE secret and would drop keys):
   CHORDS_REQUIRE_AUTH=1, CHORDS_ADMIN_TOKEN, CHORDS_DATABASE_URL.
 - `chords-worker-secrets` — the worker's. **Its own Firebase-free set**: the
   worker never authenticates anyone, so it gets no auth credentials at all. Only
-  CHORDS_DATABASE_URL and the analysis knobs. §19.2's "do not let the
-  chord-analysis service inherit Mo's deployment or Mo's blast radius", applied
-  one level further in.
+  CHORDS_DATABASE_URL, the analysis knobs, and CHORDS_YTDLP_COOKIES_CONTENT.
+  §19.2's "do not let the chord-analysis service inherit Mo's deployment or Mo's
+  blast radius", applied one level further in.
+
+  CHORDS_YTDLP_COOKIES_CONTENT holds the **contents** of a Netscape cookies.txt,
+  not a path: YouTube answers datacentre IPs with a bot check far more often than
+  residential ones, and this worker has no Volume and no mounted file for a path
+  to point at. Optional — leave it unset until the first bot check, which
+  `ytdlp_source` logs at error level precisely so you can tell that failure from
+  a video simply being private.
 
 CHORDS_DEV_TOKEN must never be set here (CHORDS_REQUIRE_AUTH refuses to start
 with it).
@@ -201,10 +208,11 @@ def analysis_worker(job_id: str, video_id: str, difficulty: str, uid: str) -> No
 @modal.asgi_app()
 def fastapi_app():
     from app.config import load_settings
-    from app.jobs import JobRunner
+    from app.jobs import RemoteJobRunner
     from app.main import create_app
+    from app.store import build_store
 
-    class ModalJobRunner(JobRunner):
+    class ModalJobRunner(RemoteJobRunner):
         """Hand the job to the isolated worker and return immediately.
 
         `.spawn()` rather than `.remote()`: the client is polling `GET
@@ -212,6 +220,12 @@ def fastapi_app():
         for it. The worker writes every status transition to the job row, which
         is the only channel between the two containers — deliberately, since it
         means the API never has to hold a handle to a running worker.
+
+        `RemoteJobRunner` rather than `JobRunner` is what makes this container
+        answer "yes, an analysis can run" despite having no audio stack of its
+        own. Subclassing the inline runner instead published the API image's own
+        (correctly empty) capabilities as the service's, and every uncached
+        `POST /v1/analyze` answered 503 on a deployment that was working.
         """
 
         def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str) -> None:
@@ -219,8 +233,12 @@ def fastapi_app():
                                   difficulty=difficulty, uid=uid)
 
     settings = load_settings()
+    store = build_store(settings)
     # `source=None` is correct and load-bearing here: this container cannot fetch
-    # or decode, and `create_app` would otherwise try to build one.
-    web_app = create_app(settings, source=None)
-    web_app.state.runner = ModalJobRunner(settings, web_app.state.store, None)
-    return web_app
+    # or decode, and `create_app` would otherwise try to build one. The runner is
+    # passed in rather than swapped in afterwards so `create_app` never builds
+    # the default `ThreadJobRunner` — which would start a thread pool this
+    # container must never use, since running an analysis in the API process is
+    # precisely what §4's isolation exists to prevent.
+    return create_app(settings, store=store, runner=ModalJobRunner(settings, store, None),
+                      source=None)

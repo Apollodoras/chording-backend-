@@ -37,6 +37,8 @@ from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
 from typing import Any, Optional
 
+from .errors import CODE_ANALYSIS_FAILED
+
 log = logging.getLogger("chords.store")
 
 RATE_SCOPE_UID = "uid"
@@ -257,6 +259,17 @@ class Store:
             return sql
         return sql.replace("?", "%s")
 
+    def ping(self) -> None:
+        """One round-trip, for `/healthz`. Raises if the store is unreachable.
+
+        Deliberately a real query rather than "is the object constructed": the
+        Postgres store builds its pool lazily, so an unreachable database looks
+        perfectly healthy right up until the first request that needs a row.
+        """
+        with self._cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+
     def _migrate(self) -> None:
         with self._cursor(write=True) as cur:
             for statement in _SCHEMA:
@@ -423,6 +436,88 @@ class Store:
             )
             return cur.rowcount
 
+    # -- the abandoned-job lease ---------------------------------------------
+    #
+    # `run_job` writes a terminal status on every exit path *it* controls. A
+    # container killed from outside controls none of them: Modal's `timeout=`
+    # SIGKILLs the worker, an OOM kill takes it at the memory cap, and a spot
+    # reclaim takes it for nothing at all. In each case the row is left mid-flight
+    # forever, and two things then compound:
+    #
+    #   - the player polls `analyzing` until they give up; nothing ever answers,
+    #   - `active_job_for` keeps handing that dead id to *everyone else* asking
+    #     for the same video, so one killed worker makes one video permanently
+    #     un-analyzable — and `prune_jobs` can't help, since it only deletes rows
+    #     that already reached a terminal status.
+    #
+    # So a non-terminal row carries a lease. Past it, the job is presumed dead:
+    # marked failed (giving the poller a terminal answer and the pruner something
+    # to collect) and refunded, because the player got nothing for it.
+    #
+    # Comfortably above the worker's own 300 s timeout — the lease must expire
+    # only after the container that would have written the row is certainly gone,
+    # including time spent queued waiting for one to start.
+    _JOB_LEASE_S = 900.0
+    _JOB_REAP_INTERVAL_S = 60.0
+    _last_job_reap = 0.0
+
+    def _maybe_reap_stale_jobs(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        if now - self._last_job_reap < self._JOB_REAP_INTERVAL_S:
+            return
+        self._last_job_reap = now
+        try:
+            reaped = self.reap_stale_jobs(older_than_s=self._JOB_LEASE_S, now=now)
+            if reaped:
+                log.warning("reaped %d abandoned job(s) — a worker died without "
+                            "writing a terminal status", reaped)
+        except Exception:  # pragma: no cover - housekeeping, never fatal
+            log.warning("job reap failed (request unaffected)", exc_info=True)
+
+    def reap_stale_jobs(self, older_than_s: float, now: float | None = None) -> int:
+        """Fail every non-terminal job whose lease has expired, and refund it.
+
+        The refund is read-then-write rather than one statement because the uid
+        is needed to credit it back, and `usage` is a different table. A row is
+        claimed by the UPDATE before its refund is issued, so two containers
+        reaping the same job concurrently cannot both refund it.
+        """
+        now = time.time() if now is None else now
+        cutoff = datetime.fromtimestamp(now - older_than_s, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        placeholders = ", ".join("?" for _ in TERMINAL_STATUSES)
+
+        with self._cursor(write=True) as cur:
+            cur.execute(self._sql(
+                f"""
+                SELECT job_id, uid FROM jobs
+                WHERE status NOT IN ({placeholders}) AND updated_at < ?
+                """
+            ), (*sorted(TERMINAL_STATUSES), cutoff))
+            candidates = cur.fetchall()
+
+        reaped = 0
+        for job_id, uid in candidates:
+            with self._cursor(write=True) as cur:
+                # The `status NOT IN (terminal)` repeat is the claim: if the
+                # worker was merely slow and has since finished, this matches
+                # nothing and we neither overwrite its result nor refund a job
+                # that delivered one.
+                cur.execute(self._sql(
+                    f"""
+                    UPDATE jobs
+                    SET status = ?, progress = 1.0, error_code = ?, error_message = ?,
+                        updated_at = ?
+                    WHERE job_id = ? AND status NOT IN ({placeholders})
+                    """
+                ), (STATUS_FAILED, CODE_ANALYSIS_FAILED,
+                    "That analysis stopped unexpectedly — try again.",
+                    _now_iso(), job_id, *sorted(TERMINAL_STATUSES)))
+                claimed = cur.rowcount
+            if claimed:
+                reaped += 1
+                self.refund_use(uid)
+        return reaped
+
     # -- chord maps (the cache) ----------------------------------------------
 
     def put_map(self, *, video_id: str, difficulty: str, song: dict,
@@ -497,6 +592,7 @@ class Store:
 
     def create_job(self, *, job_id: str, uid: str, video_id: str, difficulty: str) -> Job:
         self._maybe_prune_jobs()
+        self._maybe_reap_stale_jobs()
         now = _now_iso()
         with self._cursor(write=True) as cur:
             cur.execute(self._sql(
@@ -529,6 +625,10 @@ class Store:
             cur.execute(self._sql(f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ?"), tuple(params))
 
     def get_job(self, job_id: str) -> Job | None:
+        # The poll path reaps too, so a client watching a job whose worker was
+        # killed reaches a terminal answer even when nobody else is starting
+        # analyses. Interval-guarded, so a 2-second poll is not 2-second sweeps.
+        self._maybe_reap_stale_jobs()
         with self._cursor() as cur:
             cur.execute(self._sql(
                 """
@@ -547,8 +647,19 @@ class Store:
         job, not start two: the second would decode the same recording again for
         an identical result, which is both the expensive thing and the thing §2
         wants to happen as rarely as possible.
+
+        **Only jobs within their lease count.** This is the read that turns one
+        killed worker into a permanently un-analyzable video: without the
+        staleness bound, a row abandoned mid-flight is "in flight" forever and
+        every later request joins a job that will never finish.
         """
+        self._maybe_reap_stale_jobs()
         placeholders = ", ".join("?" for _ in TERMINAL_STATUSES)
+        # Belt and braces with the reaper: that runs on an interval and this must
+        # be right on every call, including the one that arrives between sweeps.
+        fresh_since = datetime.fromtimestamp(
+            time.time() - self._JOB_LEASE_S, tz=timezone.utc
+        ).isoformat().replace("+00:00", "Z")
         with self._cursor() as cur:
             cur.execute(self._sql(
                 f"""
@@ -556,9 +667,10 @@ class Store:
                        error_code, error_message, created_at, updated_at
                 FROM jobs
                 WHERE video_id = ? AND difficulty = ? AND status NOT IN ({placeholders})
+                  AND updated_at >= ?
                 ORDER BY created_at DESC
                 """
-            ), (video_id, difficulty, *sorted(TERMINAL_STATUSES)))
+            ), (video_id, difficulty, *sorted(TERMINAL_STATUSES), fresh_since))
             row = cur.fetchone()
         return Job(*row) if row else None
 

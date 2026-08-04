@@ -17,9 +17,15 @@ mirrors deliberately — §16).
 
 ## Status
 
-**Working end to end.** A YouTube id goes in; a linted `CompositionPayload` v2
-and a `videoSync` sidecar come out. 286 tests, green, no audio and no network
-required to run them.
+**Working end to end, and now in the deployed shape too.** A YouTube id goes in;
+a linted `CompositionPayload` v2 and a `videoSync` sidecar come out. 303 tests,
+green, no audio and no network required to run them.
+
+The qualifier matters, because it was false in exactly one place. Everything
+below ran on this machine in a single process, where the container that answers
+the request is also the container that owns the engines. **On Modal it is not**,
+and three things only break over there — see
+[Deploying, and what only breaks in the deployed shape](#deploying-and-what-only-breaks-in-the-deployed-shape).
 
 | | |
 |---|---|
@@ -35,7 +41,9 @@ required to run them.
 | §16.5 contract fixtures | ✅ emitted and byte-stable; the app-side test is a small follow-up (below) |
 | §5.1 fetch + decode | ✅ yt-dlp + ffmpeg, bounded, behind the §4 seam |
 | §5.2/§5.3 engines | ✅ **BTC + Beat This!**, benchmarked against real recordings (below) |
+| §4 two-container shape | ✅ the API delegates to the worker; `tests/test_deployment.py` covers what `modal_app.py` relies on |
 | CI | ✅ suite, Postgres, fixture stability, and a test that the API image cannot touch audio |
+| Deploy gate | ✅ `scripts/smoke.py` — `/healthz` audit, one real analysis, and a proof that the cache hit is free |
 
 One real analysis, start to finish, on this machine:
 
@@ -56,7 +64,7 @@ scratch root: empty
 ```bash
 python3.11 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 cp .env.example .env
-.venv/bin/python -m pytest              # 286 tests, ~30s, no network, no audio stack
+.venv/bin/python -m pytest              # 303 tests, ~20s, no network, no audio stack
 .venv/bin/uvicorn app.main:app --reload
 ```
 
@@ -218,6 +226,8 @@ GET /v1/analyze/{jobId} ──► status / {song, videoSync}
 | `app/main.py` | the HTTP surface, shaped like Mo's |
 | `modal_app.py` | two functions, **two images** — that split *is* §4's isolation |
 | `bench/fetch_corpus.py` | annotations + recordings → a scoreable corpus |
+| `scripts/smoke.py` | the deploy gate — audits a live `/healthz`, then analyzes one video for real |
+| `scripts/admin.py` | §3's takedown CLI, from a laptop |
 
 ---
 
@@ -334,11 +344,67 @@ with no error anywhere.
 
 ---
 
-## Deploy
+## Deploying, and what only breaks in the deployed shape
 
 ```bash
 CHORDS_DATABASE_URL="$(the DSN in chords-secrets)" modal deploy modal_app.py
+CHORDS_BASE_URL=https://…modal.run python scripts/smoke.py
 ```
+
+`scripts/smoke.py` is the deploy gate. It reads `/healthz` and checks the answers
+against what a *production* deployment must look like, then — given
+`CHORDS_ID_TOKEN` and `--video <id>` — runs one real analysis end to end and asks
+for the same video again, because the only way to know a cache hit is free
+(§16.4, §2.6) is to read the quota before and after. Exit code 0 means all of it
+passed.
+
+### The three that a laptop cannot show you
+
+Local dev runs **one** process: the container that answers the request also owns
+the engines and the audio stack. Modal runs **two**, and that is the whole point
+(§4) — so a question like "can I fetch and decode?" has a different answer on
+each, and code that asks it of the wrong one is correct locally and wrong in
+production. All three of these were live in the first deployable build.
+
+**1. The API container is not the thing that analyzes.** `POST /v1/analyze` chose
+between a 202 and a 503 by asking whether *this* container had a fetch source and
+registered engines. The API image is built with neither, deliberately — so every
+uncached analysis answered `503 feature_disabled` while the worker sat there able
+to do the job, and `/v1/me` reported `analysisEnabled: false`, which is the flag
+the app uses to hide the affordance entirely. The capability now belongs to the
+`JobRunner` (`can_analyze`), because the runner is what actually does the work:
+`RemoteJobRunner` dispatches to a worker and says yes, the inline runner still
+answers for itself. `/healthz` reports both — `fetch`/`engines` describe this
+container, `canAnalyze` describes the service.
+
+**2. `run_job` writes a terminal status on every exit path it controls — and a
+SIGKILL is not one of them.** Modal's `timeout=300`, an OOM at the memory cap, or
+a reclaim leaves the job row mid-flight forever. The player polls `analyzing`
+until they give up, and worse, `active_job_for` keeps handing that dead id to
+*everyone else* asking for the same video: one killed worker made one video
+permanently un-analyzable, and `prune_jobs` could not help, since it only
+collects rows that already reached a terminal status. Non-terminal rows now carry
+a **lease** (15 minutes, comfortably above the worker's own timeout). Past it the
+job is presumed dead: failed, so the poller gets an answer and the pruner gets a
+row, and refunded, because the player got nothing for it.
+
+**3. The bot-check escape hatch could not be configured where it was needed.**
+`CHORDS_YTDLP_COOKIES` was a *path* — and Modal delivers secrets as environment
+variables, while the worker mounts no Volume, so nothing in that container could
+place a file for it to point at. `CHORDS_YTDLP_COOKIES_CONTENT` takes the file's
+contents instead and materializes it 0600, once per process. The bot check is
+also no longer just another entry in the "video unavailable" list: to the player
+it is the same calm outcome, but to an operator it is the opposite of a private
+video — nothing is wrong with that video, and every video is about to fail the
+same way — so it logs at ERROR level.
+
+A fourth, smaller: a dispatch that *fails* (Modal refusing a spawn) charged the
+player for a job nothing would run, and then that stranded row blocked its video
+via the same path as #2. It now fails the job, refunds, and answers 503.
+
+None of this was visible to the test suite, because nothing could import
+`modal_app.py` — `modal` is not a dependency of this package. `tests/test_deployment.py`
+asserts the properties that file relies on, on the classes it uses.
 
 The worker image builds the engines in: CPU torch (explicitly — the default wheel
 carries the whole CUDA runtime for hardware this deployment doesn't have), the
@@ -364,23 +430,61 @@ recording, and the blast-radius argument says keep it that way.
 ## What is still owed, and by whom
 
 Nothing in the backend's own scope is open. What remains needs an account, a key,
-or a lawyer:
+or a lawyer — every item below is console work, and none of it is code.
+
+**To get it deployed:**
+
+1. **Modal account** — `pip install modal && modal setup`.
+2. **A Postgres DSN.** Modal does not host one; any managed provider works (Neon
+   and Supabase both have a free tier that fits this). Nothing needs creating in
+   it — `_migrate()` builds the schema on first connect.
+3. **A Firebase service-account key**, from the **same project as Mo** for
+   identity but a **different key** (§19.2). Mo never touches a recording, and
+   the blast-radius argument says keep it that way.
+4. **An admin token** — any long random string; it is the §3 takedown credential.
+   `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+5. **The two Modal Secrets**, in the dashboard (`modal secret create --force`
+   replaces the *whole* secret and would drop keys):
+   - `chords-secrets` → `FIREBASE_PROJECT_ID`, `FIREBASE_SERVICE_ACCOUNT_JSON`,
+     `CHORDS_REQUIRE_AUTH=1`, `CHORDS_ADMIN_TOKEN`, `CHORDS_DATABASE_URL`,
+     `CHORDS_RATE_LIMIT_IP_PER_MIN` (60 is a reasonable start),
+     `CHORDS_RATE_LIMIT_PER_MIN` (10).
+   - `chords-worker-secrets` → `CHORDS_DATABASE_URL` **and no auth credentials at
+     all**. The worker authenticates nobody.
+   - `CHORDS_DEV_TOKEN` must appear in neither — `CHORDS_REQUIRE_AUTH` refuses to
+     start if it is set.
+6. **Deploy and gate it:**
+   ```bash
+   CHORDS_DATABASE_URL="$(the DSN)" modal deploy modal_app.py
+   CHORDS_BASE_URL=https://…modal.run python scripts/smoke.py
+   ```
+7. **One real analysis**, with a Firebase ID token for a verified account:
+   ```bash
+   CHORDS_ID_TOKEN=… python scripts/smoke.py --video QDYfEBY9NM4
+   ```
+   Expect the bot check here rather than later — see below.
+8. **A daily quota number.** `CHORDS_DAILY_QUOTA` defaults to 10, which is a
+   placeholder, not a recommendation: ~47 s of worker CPU per analysis is what it
+   is spending.
+
+**Not deployment, but still owed:**
 
 | | |
 |---|---|
-| Modal account, Postgres DSN, Firebase service-account key (**separate from Mo's** — §19.2), admin token → the two Modal Secrets | owner |
-| First deploy, then `/healthz` against it | owner (needs the above) |
 | Register a DMCA agent (§18) — blocks public exposure, not development | owner |
 | Media IP lawyer review (§10) | owner |
 | §19.1: whether Phase 2 reverses the "no backing track" canon | owner |
-| `ChordsBackendContractTests` in the app repo (§16.5, below) | app repo |
+| `ChordsBackendContractTests` in the app repo (§16.5, above) | app repo |
 
-Two things a deploy will surface that a laptop cannot. **YouTube answers
-datacentre IPs with a bot check far more often than residential ones** — the
-fetch stage understands `CHORDS_YTDLP_COOKIES` for exactly this, and it is the
-most likely first failure in production. And the worker's 300 s Modal timeout
-against ~47 s of DSP leaves room for a 10-minute video but not for much
-retrying; if fetches get slow, that budget is the thing to watch.
+**The two failures to expect first.** YouTube answers datacentre IPs with a bot
+check far more often than residential ones; when it happens the worker logs it at
+ERROR level, distinctly from a video being private, and the fix is a Netscape
+cookies.txt exported from a signed-in browser into
+`CHORDS_YTDLP_COOKIES_CONTENT` on the **worker** secret. And the worker's 300 s
+Modal timeout against ~47 s of DSP leaves room for a 10-minute video but not for
+much retrying; if fetches get slow, that budget is the thing to watch — a job
+that blows it is now reaped and refunded rather than left in flight, but it is
+still a job the player didn't get.
 
 ## Standing note (§10)
 

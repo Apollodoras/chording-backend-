@@ -60,7 +60,18 @@ _UNAVAILABLE_MARKERS = (
     "sign in to confirm your age", "age-restricted", "members-only",
     "this live event", "has been terminated", "account associated with this video",
     "unable to extract", "no video formats", "requested format is not available",
+)
+
+# The bot check, kept apart from the family above. To the player it is the same
+# calm "can't have this one" outcome, so it stays refundable and is not dressed
+# up as our crash — but operationally it is the opposite of a video being
+# private: nothing is wrong with the video, and *every* video is about to fail
+# the same way. That deserves a log line an operator can alert on, which is why
+# it doesn't just sit in the tuple above being silently indistinguishable.
+_BOT_CHECK_MARKERS = (
     "sign in to confirm you're not a bot",
+    "sign in to confirm you’re not a bot",
+    "confirm you're not a bot",
 )
 
 
@@ -73,6 +84,13 @@ class FetchError(AnalysisError):
 
 def _looks_unavailable(stderr: str) -> bool:
     lowered = (stderr or "").lower()
+    if any(marker in lowered for marker in _BOT_CHECK_MARKERS):
+        log.error(
+            "yt-dlp hit YouTube's bot check — this is a deployment-wide failure, "
+            "not a problem with one video. Supply cookies via "
+            "CHORDS_YTDLP_COOKIES_CONTENT (or CHORDS_YTDLP_COOKIES)."
+        )
+        return True
     return any(marker in lowered for marker in _UNAVAILABLE_MARKERS)
 
 
@@ -98,10 +116,12 @@ class YtDlpSource:
         self._settings = settings
         self._ytdlp = [sys.executable, "-m", "yt_dlp"]
         self._ffmpeg = os.environ.get("CHORDS_FFMPEG", "ffmpeg")
-        # Optional cookies file. YouTube increasingly answers datacentre IPs with
-        # a bot check; this is the supported escape hatch, and it is a path
-        # rather than a baked-in secret so it can be mounted where it is needed.
-        self._cookies = os.environ.get("CHORDS_YTDLP_COOKIES") or None
+        # Optional cookies. YouTube increasingly answers datacentre IPs with a
+        # bot check, and this is the supported escape hatch — see `_cookie_file`
+        # for why it is accepted as *content* and not only as a path.
+        self._cookies_path = os.environ.get("CHORDS_YTDLP_COOKIES") or None
+        self._cookies_data = os.environ.get("CHORDS_YTDLP_COOKIES_CONTENT") or None
+        self._materialized: str | None = None
 
     @property
     def version(self) -> str:
@@ -118,11 +138,44 @@ class YtDlpSource:
             self._version = cached
         return cached
 
+    def _cookie_file(self) -> str | None:
+        """The cookies file to hand yt-dlp, materializing one if we were given
+        content instead of a path.
+
+        A path alone is unusable on the deployment this actually runs on. Modal
+        delivers secrets as **environment variables**, and the worker mounts no
+        Volume by design (§4) — so there is no filesystem anywhere in that
+        container that a cookies *file* could have been placed on. Supporting
+        only `CHORDS_YTDLP_COOKIES` meant the documented mitigation for the
+        single most likely production failure could not be configured in
+        production.
+
+        Written 0600 into the container's own tmp, once per process. Not into the
+        §2.1 scratch root: that directory is destroyed after every job and this
+        is needed by `probe`, which runs before one exists. It is a credential
+        rather than audio, so the invariant it must respect is "never leaves this
+        container" — and a Modal container's filesystem dies with it.
+        """
+        if self._cookies_path:
+            return self._cookies_path
+        if not self._cookies_data:
+            return None
+        if self._materialized is None:
+            import tempfile
+            handle, path = tempfile.mkstemp(prefix="yt-cookies-", suffix=".txt")
+            with os.fdopen(handle, "w") as target:
+                target.write(self._cookies_data)
+            os.chmod(path, 0o600)
+            self._materialized = path
+            log.info("cookies: materialized from CHORDS_YTDLP_COOKIES_CONTENT")
+        return self._materialized
+
     def _common_args(self) -> list[str]:
         args = ["--no-warnings", "--no-playlist", "--socket-timeout", "15",
                 "--retries", "2", "--no-progress"]
-        if self._cookies:
-            args += ["--cookies", self._cookies]
+        cookies = self._cookie_file()
+        if cookies:
+            args += ["--cookies", cookies]
         return args
 
     # -- metadata only ------------------------------------------------------

@@ -42,6 +42,7 @@ from .auth import Authenticator, Principal, build_authenticator
 from .chords import DIFFICULTIES, NORMAL
 from .config import Settings, load_settings
 from .errors import (
+    CODE_ANALYSIS_FAILED,
     CODE_BAD_REQUEST,
     CODE_EMAIL_UNVERIFIED,
     CODE_FEATURE_DISABLED,
@@ -58,6 +59,7 @@ from .store import (
     BLOCK_VIDEO,
     RATE_SCOPE_IP,
     RATE_SCOPE_UID,
+    STATUS_FAILED,
     STATUS_READY,
     Store,
     build_store,
@@ -317,6 +319,24 @@ def _constant_eq(a: str, b: str) -> bool:
     return hmac.compare_digest(a, b)
 
 
+def _db_health(store: Store) -> str:
+    """One round-trip to the database, reported rather than raised.
+
+    Everything this service does past `/healthz` needs the store, so a green
+    health check in front of an unreachable Postgres is the same class of lie as
+    a green one in front of a dead authenticator — the failure §16 says this
+    endpoint exists to prevent. It stays a *field* rather than a non-200 because
+    the probe's other answers (auth mode, kill switch, `canAnalyze`) are exactly
+    what an operator needs while the database is the thing that's broken.
+    """
+    try:
+        store.ping()
+        return "ok"
+    except Exception:
+        log.exception("healthz: store unreachable")
+        return "unavailable"
+
+
 def _install_routes(app: FastAPI) -> None:
 
     @app.get("/healthz")
@@ -331,9 +351,15 @@ def _install_routes(app: FastAPI) -> None:
             # §3's kill switch, visible from outside. A protection that is
             # silently off is worse than one that is visibly off.
             "analysis": "enabled" if settings.analysis_enabled else "disabled",
+            # `fetch`/`engines`/`enginesReady` describe THIS container, which on
+            # the API image is correctly "none of it" (§4). `canAnalyze` is the
+            # one to read for "would a new analysis be accepted" — it asks the
+            # runner, which is what actually does the work.
             "fetch": "configured" if app.state.source is not None else "unconfigured",
             "engines": engines.available(),
             "enginesReady": engines.is_ready(settings),
+            "canAnalyze": app.state.runner.can_analyze(),
+            "db": _db_health(app.state.store),
             "admin": "configured" if settings.has_admin else "unconfigured",
             "maxVideoSeconds": settings.max_video_seconds,
             "rateLimit": {
@@ -364,7 +390,11 @@ def _install_routes(app: FastAPI) -> None:
             },
             "emailVerified": principal.is_verified,
             "signInProvider": principal.sign_in_provider,
-            "analysisEnabled": settings.analysis_enabled and engines.is_ready(settings),
+            # Same question `POST /v1/analyze` answers, asked ahead of time — so
+            # it must be the same test. The app hides the analyze affordance on
+            # a false, and reading the API container's own engine registry here
+            # hid the feature on every healthy Modal deployment.
+            "analysisEnabled": settings.analysis_enabled and app.state.runner.can_analyze(),
         }
 
     @app.post("/v1/analyze")
@@ -394,7 +424,11 @@ def _install_routes(app: FastAPI) -> None:
             raise fail(403, "That video isn’t available for chord analysis.", CODE_VIDEO_BLOCKED)
         if not settings.analysis_enabled:
             raise fail(503, "Chord analysis is unavailable right now.", CODE_FEATURE_DISABLED)
-        if app.state.source is None or not engines.is_ready(settings):
+        # The *runner's* capability, not this container's. On Modal the API image
+        # has no source and no engines by design (§4) and delegates to a worker
+        # that has both; asking `app.state.source is None` here refused every
+        # analysis on a healthy deployment. See `JobRunner.can_analyze`.
+        if not app.state.runner.can_analyze():
             raise fail(503, "Chord analysis isn’t available on this deployment yet.",
                        CODE_FEATURE_DISABLED)
 
@@ -408,8 +442,21 @@ def _install_routes(app: FastAPI) -> None:
         _charge(app, principal)
         job_id = uuid.uuid4().hex
         store.create_job(job_id=job_id, uid=principal.uid, video_id=video_id, difficulty=difficulty)
-        app.state.runner.submit(job_id=job_id, video_id=video_id, difficulty=difficulty,
-                                uid=principal.uid)
+        try:
+            app.state.runner.submit(job_id=job_id, video_id=video_id, difficulty=difficulty,
+                                    uid=principal.uid)
+        except Exception:
+            # The dispatch itself failed — Modal refusing a spawn, the thread
+            # pool shutting down. Without this the caller is charged for a job
+            # row that nothing will ever pick up, and `active_job_for` then hands
+            # that dead id to everyone else who asks for the same video.
+            log.exception("failed to submit job %s (%s)", job_id, video_id)
+            store.update_job(job_id, status=STATUS_FAILED, progress=1.0,
+                             error_code=CODE_ANALYSIS_FAILED,
+                             error_message="That video couldn’t be analyzed.")
+            store.refund_use(principal.uid)
+            raise fail(503, "Chord analysis is busy right now — try again in a moment.",
+                       CODE_FEATURE_DISABLED)
         return JSONResponse(status_code=202, content={"jobId": job_id, "status": "queued"})
 
     @app.get("/v1/analyze/{job_id}")

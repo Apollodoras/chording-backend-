@@ -143,6 +143,24 @@ class JobRunner:
         run_job(job_id=job_id, video_id=video_id, difficulty=difficulty, uid=uid,
                 settings=self.settings, store=self.store, source=self.source)
 
+    def can_analyze(self) -> bool:
+        """Whether submitting a job here could actually produce a map.
+
+        **The capability belongs to the runner, not to the container asking.**
+        An in-process runner analyzes with its own hands, so it needs its own
+        source and its own engines. A runner that dispatches to an isolated
+        worker (`RemoteJobRunner`) has neither and does not need either — which
+        is the whole point of §4, and is exactly what the API container is.
+
+        `app/main.py` asks this before choosing between a 202 and a clean 503.
+        Asking the *container* instead — "do I have a source, are my engines
+        registered" — reads as the same question and is not: on Modal the API
+        image is built without ffmpeg, yt-dlp or an engine deliberately, so that
+        version answers "no" on a perfectly healthy deployment and refuses every
+        analysis it was built to delegate.
+        """
+        return self.source is not None and engines.is_ready(self.settings)
+
 
 class ThreadJobRunner(JobRunner):
     """Background threads in the API process — development and single-container
@@ -162,3 +180,30 @@ class ThreadJobRunner(JobRunner):
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False)
+
+
+class RemoteJobRunner(JobRunner):
+    """Hands the job to a worker in another container, and reports itself capable.
+
+    The base class for `modal_app.py`'s `ModalJobRunner`, and it lives here rather
+    than there so the capability rule above is covered by the audio-free suite —
+    `modal` is not a dependency of this package, so nothing in `modal_app.py` can
+    be imported by a test.
+
+    `can_analyze` is True without consulting `source` or the engine registry
+    because in this deployment shape **neither one is this container's to have**:
+    the worker image installs them, and the deploy fails at build time if it
+    can't (see the `test -f` on BTC's weights in `modal_app.py`). A container
+    that cannot decode audio is the §4 guarantee working, not a degraded state.
+
+    What this can still get wrong is a worker image that built without an engine
+    while the API image came up fine. That surfaces as a job that fails with the
+    engine's own 503 message instead of a refused submission — one poll later,
+    and refunded either way (`REFUNDABLE_CODES` includes `feature_disabled`).
+    """
+
+    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str) -> None:
+        raise NotImplementedError
+
+    def can_analyze(self) -> bool:
+        return True
