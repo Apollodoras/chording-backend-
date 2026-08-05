@@ -86,6 +86,11 @@ def merge(spans: list[GridSpan]) -> list[GridSpan]:
     Also closes gaps *between* chords by extending the earlier one: after
     quantization two adjacent chords can end up a beat apart, and a hole in the
     harmony has no meaning in a container where every stroke sounds a chord.
+
+    And it decides between two *different* chords quantization put on the same
+    beat, which is the one case where this function has to choose rather than
+    rearrange. See the branch itself for why the choice is "more evidence wins"
+    rather than "first one seen".
     """
     if not spans:
         return []
@@ -111,6 +116,16 @@ def merge(spans: list[GridSpan]) -> list[GridSpan]:
             if span.start_beat > last.start_beat:
                 out[-1] = replace(last, length_beats=span.start_beat - last.start_beat)
                 out.append(span)
+            else:
+                # Same start beat, different chords — two engine readings of one
+                # slot rather than two chords, because quantization put them
+                # there: a 300 ms Am inside a bar of C rounds onto C's own
+                # downbeat. Dropping the second silently kept whichever the sort
+                # happened to reach first, so the chart could show the passing
+                # chord and lose the one the bar is in. Keep the one with more
+                # evidence — the longer, and on a tie the more confident.
+                if (span.length_beats, span.confidence) > (last.length_beats, last.confidence):
+                    out[-1] = span
         else:
             if span.start_beat > last.end_beat:
                 # Gap — hold the previous chord across it (§18).
@@ -219,6 +234,11 @@ def exact_ratio(spans: list[GridSpan]) -> float:
     A low ratio is the honest signal that `hard` is not really "the full detected
     quality" on this recording — a jazz track reduced to triads and dominant 7ths
     is a different song, and this is the number that says so.
+
+    Computed on the **reference tier's** spans, in `model.build`, and carried out
+    on the sidecar as `analysis.exactRatio`. It has to be the reference tier: at
+    `easy` every extension is flattened by design, so an exact ratio measured
+    there would describe the tier rather than the recording.
     """
     if not spans:
         return 0.0

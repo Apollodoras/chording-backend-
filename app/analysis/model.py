@@ -40,7 +40,7 @@ pass exists to find the groups; the second to encode them.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..chords import HARD
 from ..errors import AnalysisError
@@ -50,7 +50,7 @@ from .consensus import ConsensusReport
 from .keyfinder import DetectedKey, detect_key
 from .meter import Meter, reconcile
 from .strumming import ExtractedPattern, fallback
-from .structure import BarChord, Section, bars_from_spans
+from .structure import BarChord, Section, bars_from_spans, spans_from_bars
 from .types import BeatGrid, EnergyCurve, Onset, RawChordSpan
 
 log = logging.getLogger("chords.model")
@@ -75,6 +75,10 @@ class SongModel:
     axis: BeatAxis
     key: DetectedKey
     sections: list[Section]
+    # The **encoding** pass's groups: re-found on the corrected bars, which is
+    # what lets identical occurrences collapse with `repeats`. The vote's own
+    # provenance is not on these — it is on `vote_groups` below, and in
+    # aggregate on `consensus`.
     groups: list[form.RepeatGroup]
     # One pattern per repeat group, keyed by rehearsal letter. Two sections of
     # the same group share a groove because they are the same music, which is
@@ -83,6 +87,16 @@ class SongModel:
     consensus: ConsensusReport = field(default_factory=ConsensusReport)
     confidence: float = 0.0
     total_bars: int = 0
+    # How much of the reference tier survived normalization exactly (§5.4) —
+    # `postprocess.exact_ratio`. Low means `hard` is not really "the full
+    # detected quality" on this recording, and the sidecar reports it.
+    exact_ratio: float = 1.0
+    # The groups the vote was taken over: the **first** pass's, whose block
+    # boundaries are the ones `consensus.apply` scored, and which therefore
+    # carry what it did. Voting over `groups` instead would be a different vote,
+    # and a tier render has to reproduce the reference one rather than take its
+    # own — so `render` uses these.
+    vote_groups: list[form.RepeatGroup] = field(default_factory=list)
 
     @property
     def bar_beats(self) -> int:
@@ -113,7 +127,8 @@ def per_bar_energy(curve: EnergyCurve | None, axis: BeatAxis) -> list[float] | N
 
 
 def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
-          energy: EnergyCurve | None = None, vote: bool = True) -> SongModel | None:
+          energy: EnergyCurve | None = None, vote: bool = True,
+          correct_octave: bool = False) -> SongModel | None:
     """Features → the song model. **Pure**, and the half worth testing directly.
 
     Returns None when there is not enough *rhythm* to lay bars over, and raises
@@ -122,7 +137,7 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
     "that track's beat wasn't clear enough" is wrong and confusing on a
     perfectly steady recording the chord engine simply heard as silence.
     """
-    meter = reconcile(grid, raw)
+    meter = reconcile(grid, raw, correct_octave=correct_octave)
     axis = build_axis(meter.grid)
     if axis is None or not axis.is_usable:
         return None
@@ -138,15 +153,27 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
 
     # First pass: find the groups. Fuzzy on purpose — this has to work on the
     # engine's mistakes, since removing them is what it is for.
-    _, groups = form.detect(bars, bar_beats=bar_beats, energy=bar_energy,
-                            tonic_pc=key.tonic_pc)
+    _, vote_groups = form.detect(bars, bar_beats=bar_beats, energy=bar_energy,
+                                 tonic_pc=key.tonic_pc)
 
     report = ConsensusReport()
     if vote:
         bars, report = consensus.apply(
-            bars, groups, bar_beats=bar_beats,
+            bars, vote_groups, bar_beats=bar_beats,
             tonic_pc=key.tonic_pc, mode=key.scale,
         )
+        if report.touched:
+            # The key was detected from the chords the engine reported, and the
+            # vote then used it as its diatonic tie-break — so the key is
+            # upstream of edits made partly on its own authority. Reading it
+            # again off the corrected bars breaks that small circle, and it is
+            # free: the chords are already in hand.
+            #
+            # Only when the vote actually changed a bar. Otherwise the input is
+            # the input to the first detection, and re-running could differ only
+            # in the trailing partial bar `bars_from_spans` drops — a change
+            # with no reason behind it.
+            key = detect_key(spans_from_bars(bars, axis.bar_beats))
 
     # Second pass: encode them. Occurrences the vote brought into line can now
     # collapse with `repeats`, which they could not before.
@@ -165,6 +192,8 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
         patterns=patterns, consensus=report,
         confidence=postprocess.mean_confidence(spans),
         total_bars=sum(s.total_bars for s in sections),
+        exact_ratio=postprocess.exact_ratio(spans),
+        vote_groups=vote_groups,
     )
 
 
@@ -176,6 +205,14 @@ def render(model: SongModel, raw: list[RawChordSpan], difficulty: str) -> list[S
     renaming qualities in place — but the *boundaries* come from the model, so
     every tier tiles the song the same way and the one sidecar addresses all of
     them.
+
+    The vote is replayed over the model's **`vote_groups`**, and told not to
+    record what it did. Both halves matter and neither is cosmetic: voting over
+    `model.groups` (the encoding pass) meant the reference tier's render took a
+    subtly different vote from the one `build` took, so "hard is the model" held
+    by luck; and recording would leave the model's groups carrying whichever tier
+    compiled last instead of the reference vote, which is what the benchmark and
+    the logs read.
     """
     spans = postprocess.process(raw, model.axis, difficulty=difficulty)
     if not spans:
@@ -185,8 +222,9 @@ def render(model: SongModel, raw: list[RawChordSpan], difficulty: str) -> list[S
         return []
     if model.consensus.touched:
         bars, _ = consensus.apply(
-            bars, model.groups, bar_beats=float(model.axis.bar_beats),
+            bars, model.vote_groups, bar_beats=float(model.axis.bar_beats),
             tonic_pc=model.key.tonic_pc, mode=model.key.scale,
+            record=False,
         )
     return impose(model.sections, bars)
 
@@ -254,4 +292,39 @@ def _patterns(groups: list[form.RepeatGroup], sections: list[Section], *,
             group, onsets=onsets, axis=axis, bar_beats=bar_beats, tempo=tempo,
             name=name, time_signature=time_signature,
         )
+    return _rename_shared_grooves(out, names)
+
+
+def _rename_shared_grooves(patterns: dict[str, ExtractedPattern],
+                           names: dict[str, str]) -> dict[str, ExtractedPattern]:
+    """Give a groove two groups both play a name that is true of both.
+
+    A pattern's id is **content-addressed** — meter plus strokes, and
+    deliberately not the name (§12.5, so an unchanged groove keeps its id). Two
+    groups that strum the same way therefore hash to the same id and compile to
+    **one** embedded `PatternPayload`, which is the right encoding and the whole
+    reason the id is a hash. What was wrong is the name that object ended up
+    with: `compile` writes them into a dict keyed by id, so the last group
+    written won, and the player saw "Verse strum" on the pattern the chorus
+    section points at. Nothing plays wrong; the label is simply not this song's.
+
+    Renaming is safe precisely because the name is not in the hash: the id, and
+    so the wire, is unchanged. Two sharers are named for both; beyond two the
+    groove is the song's rather than any section's, and a list of names has
+    stopped being a name.
+    """
+    sharers: dict[str, list[str]] = {}
+    for label, extracted in patterns.items():
+        sharers.setdefault(extracted.pattern.id, []).append(label)
+
+    out: dict[str, ExtractedPattern] = {}
+    for label, extracted in patterns.items():
+        group_labels = sharers[extracted.pattern.id]
+        if len(group_labels) < 2:
+            out[label] = extracted
+            continue
+        distinct = list(dict.fromkeys(names.get(g, g) for g in group_labels))
+        shared = f"{' & '.join(distinct)} strum" if len(distinct) <= 2 else "Strum"
+        out[label] = replace(extracted,
+                             pattern=extracted.pattern.model_copy(update={"name": shared}))
     return out

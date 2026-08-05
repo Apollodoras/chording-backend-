@@ -98,6 +98,64 @@ def test_a_rotation_moves_only_the_downbeats():
     assert meter.grid.downbeats_ms != original.downbeats_ms
 
 
+def irregular_song(*, early_beats: int = 2, bars: int = 16, long_bar: int = 6):
+    """A 4/4 song with one 5-beat bar, tracked by a tracker that found the bars
+    and put the "one" `early_beats` too early in each of them.
+
+    The irregular bar is the whole point. `axis.py` records that Here Comes The
+    Sun has 11/8 and 15/8 bars inside a 4/4 song, and a downbeat-aware tracker
+    survives that — it reports the bar starts it heard, whatever is between them.
+    Re-deriving the grid from a fixed origin does not: after one inserted beat
+    every later "downbeat" is a beat out.
+
+    Returns the tracker's grid, the chord changes (on the *real* barlines), and
+    the real barlines.
+    """
+    lengths = [4] * bars
+    lengths[long_bar] = 5
+    starts: list[int] = []
+    cursor = 0
+    for length in lengths:
+        starts.append(cursor)
+        cursor += length
+    all_beats = [i * BEAT_MS for i in range(cursor + 1)]
+
+    tracked = [all_beats[s - early_beats] for s in starts if s - early_beats >= 0]
+    tracker = BeatGrid(beats_ms=all_beats, downbeats_ms=tracked,
+                       bpm=120.0, confidence=0.9, time_signature="4/4")
+
+    names = ["C", "G", "Am", "F"]
+    changes = [
+        RawChordSpan(start_ms=all_beats[start], end_ms=all_beats[start] + lengths[i] * BEAT_MS,
+                     label=names[i % len(names)], confidence=0.9)
+        for i, start in enumerate(starts)
+    ]
+    return tracker, changes, [all_beats[s] for s in starts]
+
+
+def test_a_rotation_survives_an_irregular_bar():
+    """Every downbeat moves relative to *itself*, not to a re-derived grid.
+
+    `beats[start::bar_beats]` assumes a metrically uniform beat list. One 5-beat
+    bar and every later bar line lands a beat off the music — the tail of the
+    song silently corrupted by a correction that was right about the phase.
+    """
+    tracker, changes, real_barlines = irregular_song()
+    meter = reconcile(tracker, changes)
+    assert meter.phase_shift == 2
+    assert meter.grid.downbeats_ms == real_barlines
+
+
+def test_a_rotation_still_covers_the_music_before_the_first_bar_it_moved():
+    """Rotating forward leaves the head of the recording in no bar at all, so
+    bars are extended back over it — the coverage the old fixed-origin grid had,
+    kept without the assumption that produced it."""
+    original = grid(2)
+    meter = reconcile(original, changes_on_barlines(0))
+    assert meter.grid.downbeats_ms[0] == 0
+    assert meter.grid.downbeats_ms == beats()[0::4][:len(meter.grid.downbeats_ms)]
+
+
 # --- meter and tempo ---------------------------------------------------------
 
 def test_the_meter_is_only_arbitrated_when_the_tracker_is_unsure():
@@ -118,10 +176,19 @@ def test_a_meter_the_axis_cannot_use_is_passed_through_untouched():
     assert meter.phase_shift == 0
 
 
+def steady(bpm: float, count: int = 64) -> BeatGrid:
+    """A steady grid at `bpm`, 4/4, downbeats every fourth beat."""
+    spacing = int(round(60_000 / bpm))
+    all_beats = [i * spacing for i in range(count)]
+    return BeatGrid(beats_ms=all_beats, downbeats_ms=all_beats[::4],
+                    bpm=bpm, confidence=0.9, time_signature="4/4")
+
+
 def test_an_implausible_tempo_is_reported_and_never_corrected():
     """A tempo octave error rewrites what a beat *is*, and there is no clean
-    harmonic evidence for it the way there is for the phase. So it is flagged
-    for the sidecar and left alone."""
+    harmonic evidence for it the way there is for the phase. So by default it is
+    flagged for the sidecar and left alone — the pipeline degrades on the flag
+    rather than this module acting on it."""
     fast = BeatGrid(beats_ms=[i * 130 for i in range(64)],
                     downbeats_ms=[i * 130 for i in range(0, 64, 4)],
                     bpm=460.0, confidence=0.9, time_signature="4/4")
@@ -129,10 +196,57 @@ def test_an_implausible_tempo_is_reported_and_never_corrected():
     assert meter.tempo_octave_suspect
     assert meter.tempo == 460
     assert meter.grid.beats_ms == fast.beats_ms
+    assert meter.tempo_octave_shift == 0
 
 
 def test_a_normal_tempo_is_not_flagged():
     assert not reconcile(grid(0), changes_on_barlines(0)).tempo_octave_suspect
+
+
+def test_a_doubled_tempo_is_halved_when_the_correction_is_asked_for():
+    """230 bpm is the tracker counting the eighths of a 115 bpm song. Halving it
+    is not a slower tempo, it is a different bar: two of the tracker's bars are
+    one, so the downbeats thin out with the beats."""
+    fast = steady(230.0)
+    meter = reconcile(fast, [], correct_octave=True)
+    assert meter.tempo == 115
+    assert meter.tempo_octave_shift == -1
+    assert not meter.tempo_octave_suspect
+    assert meter.grid.beats_ms == fast.beats_ms[::2]
+    assert meter.grid.downbeats_ms == fast.beats_ms[::8]
+
+
+def test_a_halved_tempo_is_doubled_when_the_correction_is_asked_for():
+    """The same operation backwards: a beat between every pair of beats, and a
+    bar line in the middle of every bar, because one of them is now two."""
+    slow = steady(45.0)
+    meter = reconcile(slow, [], correct_octave=True)
+    assert meter.tempo == 90
+    assert meter.tempo_octave_shift == 1
+    assert not meter.tempo_octave_suspect
+    assert meter.grid.beats_ms[::2] == slow.beats_ms
+    assert slow.downbeats_ms[1] in meter.grid.downbeats_ms
+    # A new bar line halfway through each of the tracker's bars.
+    assert len(meter.grid.downbeats_ms) == 2 * len(slow.downbeats_ms) - 1
+
+
+def test_a_tempo_more_than_an_octave_out_is_left_alone_even_then():
+    """460 bpm halves to 230, which is still not a tempo. That is not an octave
+    error, it is a tracker that failed, and quartering a beat grid on the
+    strength of it is exactly the confident mistake this layer avoids."""
+    wild = steady(460.0)
+    meter = reconcile(wild, [], correct_octave=True)
+    assert meter.tempo == 460
+    assert meter.tempo_octave_shift == 0
+    assert meter.tempo_octave_suspect
+    assert meter.grid.beats_ms == wild.beats_ms
+
+
+def test_a_plausible_tempo_is_never_rescaled():
+    meter = reconcile(grid(0), changes_on_barlines(0), correct_octave=True)
+    assert meter.tempo == 120
+    assert meter.tempo_octave_shift == 0
+    assert meter.grid.downbeats_ms == grid(0).downbeats_ms
 
 
 def test_repeats_of_one_chord_do_not_vote():

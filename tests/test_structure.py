@@ -15,6 +15,7 @@ from app.analysis.structure import (
     MIN_SECTION_BARS,
     BarChord,
     bars_from_spans,
+    spans_from_bars,
 )
 from app.analysis.types import GridSpan
 from app.chords import MAJOR, MINOR, NORMAL
@@ -64,6 +65,31 @@ def test_no_bar_ever_overflows_its_meter():
     for bar in bars_from_spans(spans, 4):
         for chord in bar:
             assert chord.start_beat + chord.length_beats <= 4 + 1e-9
+
+
+# --- back out of bars -------------------------------------------------------
+
+def test_bars_become_a_chord_timeline_again():
+    """The model re-reads the key after the consensus vote, by which point the
+    chords live in bars rather than in spans."""
+    spans = [span(0, 4, root=7), span(4, 2, root=2), span(6, 2, root=4, quality=MINOR)]
+    assert spans_from_bars(bars_from_spans(spans, 4), 4) == spans
+
+
+def test_a_chord_split_across_a_barline_comes_back_as_one_chord():
+    """Not cosmetic: `keyfinder` weights its evidence by duration, so a chord
+    held for two bars has to come back as eight beats of evidence rather than as
+    two four-beat chords with the endpoint bonus counted at the wrong length."""
+    spans = spans_from_bars(bars_from_spans([span(0, 8, root=7)], 4), 4)
+    assert [(s.start_beat, s.length_beats) for s in spans] == [(0, 8)]
+
+
+def test_the_round_trip_keeps_the_least_believed_reading_of_a_held_chord():
+    bars = [[BarChord(root_pc=7, quality=MAJOR, start_beat=0.0, length_beats=4.0,
+                      confidence=0.9)],
+            [BarChord(root_pc=7, quality=MAJOR, start_beat=0.0, length_beats=4.0,
+                      confidence=0.3)]]
+    assert [s.confidence for s in spans_from_bars(bars, 4)] == [0.3]
 
 
 # --- sections ---------------------------------------------------------------

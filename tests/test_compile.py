@@ -10,6 +10,8 @@ each stroke sound whichever chord is active) the only correct encoding for it.
 
 from __future__ import annotations
 
+import pytest
+
 from app.analysis.compile import compile_song
 from app.analysis.keyfinder import DetectedKey
 from app.analysis.strumming import fallback
@@ -135,6 +137,29 @@ def test_every_referenced_pattern_is_embedded():
     embedded = {p.id for p in payload.patterns}
     for section in payload.arrangement.sections:
         assert section.patternID in embedded
+
+
+def test_a_section_whose_group_has_no_pattern_is_a_bug_and_not_a_shorter_song():
+    """It used to `continue`, which compiles a song that is quietly *short*.
+
+    Nothing catches that: the bars go missing, the sidecar's anchors still
+    address them, and both lints check the song against itself — a song with a
+    section missing is perfectly self-consistent. Every group gets a pattern
+    today (the fallback covers "nothing to extract"), so this is unreachable,
+    which is exactly the argument for raising: a future regression upstream
+    should stop here rather than ship a truncated chart.
+    """
+    sections = [
+        Section(kind="verse", group="A", bars=[bar(whole(7)), bar(whole(2)),
+                                               bar(whole(4, MINOR)), bar(whole(0))]),
+        Section(kind="chorus", group="B", bars=[bar(whole(0)), bar(whole(0)),
+                                                bar(whole(7)), bar(whole(7))]),
+    ]
+    patterns = {"A": fallback(bar_beats=4, tempo=120, name="Verse strum")}
+    with pytest.raises(ValueError, match="'B'"):
+        compile_song(video_id="dQw4w9WgXcQ", title="Known Song", sections=sections,
+                     patterns=patterns, key=DetectedKey("G", "major", 0.9),
+                     tempo=120, time_signature="4/4")
 
 
 def test_a_synced_song_never_carries_a_tempo_or_meter_override():

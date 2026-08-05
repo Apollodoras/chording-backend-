@@ -205,6 +205,31 @@ def test_empty_anchors_are_refused():
     assert any("beatAnchors is empty" in p for p in lint_sync(payload, make_sync(beatAnchors=[])))
 
 
+def test_anchors_that_run_past_the_end_of_the_song_are_refused():
+    """The other half of the coverage rule, and the one that was missing.
+
+    Short coverage means the tail runs on an assumed tempo; *long* coverage means
+    the map claims chart where the chart has run out, and the cursor walks off
+    the end of it. This is the shape a silently dropped section takes on the
+    wire — the anchors are built from the model's bar count, so a song compiled
+    short keeps the anchors for the bars it lost — which is why `compile_song`
+    now raises instead of skipping one.
+    """
+    payload = known_song()
+    payload.arrangement.sections[0].repeats = 3      # 48 beats of song, 64 of anchors
+    problems = lint_sync(payload, make_sync())
+    assert any("do not exist" in p for p in problems)
+
+
+def test_an_anchor_on_the_songs_final_barline_is_not_past_the_end():
+    """A song of N bars ships N+1 anchors: the last one marks where bar N-1
+    ends. Off-by-one here would withhold the sidecar from every song."""
+    payload = known_song()
+    sync = make_sync()
+    assert sync.beatAnchors[-1].songBeat == total_beats(payload)
+    assert lint_sync(payload, sync) == []
+
+
 def test_anchors_that_stop_short_of_the_song_are_refused():
     """Short coverage isn't fatal — the client extrapolates — but it means the
     tail runs on an assumed tempo, which is exactly what anchors exist to

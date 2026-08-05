@@ -12,8 +12,15 @@ lint never fails on something that was only ever a missing UUID.
 
 from __future__ import annotations
 
+from app.analysis import meter
 from app.lint import lint, repair
 from app.payload import (
+    PATTERN_TEMPO_MAX,
+    PATTERN_TEMPO_MIN,
+    PLAUSIBLE_TEMPO_MAX,
+    PLAUSIBLE_TEMPO_MIN,
+    TEMPO_MAX,
+    TEMPO_MIN,
     Arrangement,
     Bar,
     BarRhythm,
@@ -127,6 +134,30 @@ def test_an_unknown_section_kind_is_caught():
 
 def test_an_absurd_tempo_is_caught():
     assert any("outside the sane" in p for p in lint(song(tempo=400)))
+
+
+def test_the_three_tempo_ranges_nest():
+    """Three ranges in three files, answering three questions, with nothing
+    tying them together — and the combination refused songs: the analysis called
+    230 bpm suspect and left it alone, and this lint then killed the song for it.
+
+    The ordering is the contract. A tempo the analysis is happy with must be one
+    the container accepts, and a song tempo the container accepts must be legal
+    on the pattern that carries it — patterns take the song's own tempo, so an
+    inversion here is a song that lints clean and a pattern that does not.
+    """
+    assert PATTERN_TEMPO_MIN <= TEMPO_MIN <= PLAUSIBLE_TEMPO_MIN
+    assert PLAUSIBLE_TEMPO_MAX <= TEMPO_MAX <= PATTERN_TEMPO_MAX
+    assert (meter.TEMPO_MIN, meter.TEMPO_MAX) == (PLAUSIBLE_TEMPO_MIN, PLAUSIBLE_TEMPO_MAX)
+
+
+def test_a_song_at_the_edge_of_the_container_range_carries_a_legal_pattern():
+    """The nesting, exercised rather than asserted: the pattern is emitted at the
+    song's tempo, so the widest range has to cover the one lint enforces."""
+    for tempo in (TEMPO_MIN, TEMPO_MAX):
+        payload = song(tempo=tempo, patterns=[pattern()])
+        payload.patterns[0].tempo = tempo
+        assert lint(payload) == []
 
 
 def test_duplicate_pattern_ids_are_caught():

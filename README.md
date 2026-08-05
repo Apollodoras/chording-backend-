@@ -19,7 +19,7 @@ mirrors deliberately — §16).
 
 **Working end to end, in the deployed shape, and now measured on the thing that
 actually matters.** A YouTube id (or an uploaded file) goes in; a linted
-`CompositionPayload` v2 and a `videoSync` sidecar come out. 414 tests, green, no
+`CompositionPayload` v2 and a `videoSync` sidecar come out. 458 tests, green, no
 audio and no network required to run them.
 
 That last clause is new and it was the important one. Every number this repo
@@ -77,7 +77,7 @@ scratch root: empty
 ```bash
 python3.11 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 cp .env.example .env
-.venv/bin/python -m pytest              # 414 tests, ~14s, no network, no audio stack
+.venv/bin/python -m pytest              # 458 tests, ~14s, no network, no audio stack
 .venv/bin/uvicorn app.main:app --reload
 ```
 
@@ -211,6 +211,15 @@ Read honestly, because the temptation is to read it the other way:
 - **Key detection is a wash**: 5/9 exact tonics before and after. The modal fix
   is still right on its own terms (`G F C G` was called *A minor*; it is G
   mixolydian), and so is capping the tonic-endpoint bonus.
+
+There is a second flag beside it, off by default: **`CHORDS_THEORY_TEMPO_OCTAVE`**
+lets §20.2 halve or double a beat grid whose tempo reads an octave out, instead
+of only reporting it. It is off for the opposite reason to consensus — not
+measured-and-marginal but **unmeasured**, because no track in the corpus triggers
+it. With it off a suspect tempo the container can still carry ships
+`lowConfidence`, and one it cannot fails with a message that names the reading
+rather than the generic "didn't produce a song we could play"
+([`PIPELINE-AUDIT.md`](PIPELINE-AUDIT.md) D1).
 
 Anyone extending this should assume the remaining accuracy is in the engines,
 and in §20.2's downbeat-phase check on tracks where the tracker is genuinely

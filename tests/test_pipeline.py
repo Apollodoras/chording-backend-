@@ -8,13 +8,21 @@ played four times") rather than structural.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
-from app.analysis.pipeline import analyze, assemble
+from app.analysis.pipeline import LintFailure, analyze, assemble
 from app.analysis.scratch import assert_clean
 from app.analysis.types import BeatGrid, EngineInfo, RawChordSpan, VideoMeta
 from app.chords import EASY, HARD, NORMAL
-from app.errors import AnalysisError, VideoBlocked, VideoTooLong
+from app.errors import (
+    CODE_TEMPO_UNREADABLE,
+    AnalysisError,
+    TempoUnreadable,
+    VideoBlocked,
+    VideoTooLong,
+)
 from app.lint import lint, lint_sync
 from app.payload import CompositionPayload
 from app.store import BLOCK_CHANNEL, BLOCK_VIDEO
@@ -27,7 +35,17 @@ from tests.conftest import (
     known_grid,
     known_meta,
     known_onsets,
+    recording,
 )
+
+
+def _assemble(rec, settings):
+    """The pure half, on a `conftest.recording` — for the cases that are about
+    what the *features* say rather than about the job around them."""
+    return assemble(meta=rec.meta, grid=rec.grid, raw=rec.chords, onsets=[],
+                    settings=settings,
+                    chords_engine=EngineInfo("fake-chords", "1.0"),
+                    beats_engine=EngineInfo("fake-beats", "1.0"))
 
 
 def run(settings, store, **overrides):
@@ -98,6 +116,24 @@ def test_the_easy_tier_has_no_more_chord_changes_than_the_hard_one(settings, sto
     easy = CompositionPayload.model_validate(outcome.songs[EASY])
     hard = CompositionPayload.model_validate(outcome.songs[HARD])
     assert len(easy.arrangement.sections) <= len(hard.arrangement.sections)
+
+
+def test_the_sidecar_says_how_much_of_the_hard_tier_is_really_there(settings, store):
+    """`hard` promises "the full detected quality", and on a track the container
+    cannot spell it is quietly a fiction: `Gmaj9` ships as `Gmaj7`, plays fine,
+    lints clean and reports high confidence. `postprocess.exact_ratio` was
+    written for exactly that and then computed nowhere in production — so the one
+    signal that could say so said nothing.
+    """
+    outcome = run(settings, store)
+    assert outcome.theory.exactRatio == 1.0
+    assert outcome.sync.analysis.exactRatio == 1.0
+
+    ninths = [replace(span, label=span.label.replace(":maj", ":maj9"))
+              for span in known_chords()]
+    reduced = run(settings, store, chord_engine=FakeChordEngine(spans=ninths))
+    assert reduced.theory.exactRatio == 0.25, "only the one chord that wasn't a 9th"
+    assert lint(CompositionPayload.model_validate(reduced.songs[HARD])) == []
 
 
 # --- §2.1 ------------------------------------------------------------------
@@ -177,6 +213,45 @@ def test_low_chord_confidence_also_withholds_the_sidecar(settings, store):
     engine = FakeChordEngine(spans=known_chords(confidence=0.1))
     outcome = run(settings, store, chord_engine=engine)
     assert outcome.sync is None and outcome.low_confidence
+
+
+def test_a_suspect_tempo_the_container_can_still_carry_ships_low_confidence(settings, store):
+    """206 bpm is outside what this repertoire plausibly is and inside what the
+    container accepts. So the song ships — but the axis it plays on is the thing
+    in doubt, and the sidecar is what would put a cursor on that axis."""
+    fast = recording(ms_per_beat=291)   # 206.2 bpm
+    outcome = _assemble(fast, settings)
+    assert outcome.songs, "the song still lands in the Library"
+    assert outcome.low_confidence
+    assert outcome.sync is None
+    assert outcome.theory.tempoOctaveSuspect
+    assert outcome.theory.tempoOctaveShift == 0
+
+
+def test_a_tempo_the_container_cannot_carry_says_so_instead_of_failing_the_lint(settings, store):
+    """The defect this replaces: `meter` flagged the octave, `lint` refused the
+    tempo, and the player was told "that video didn't produce a song we could
+    play" — the one sentence that names none of what the pipeline had already
+    worked out."""
+    too_fast = recording(ms_per_beat=255)   # 235.3 bpm
+    with pytest.raises(TempoUnreadable) as caught:
+        _assemble(too_fast, settings)
+    assert "235" in caught.value.message
+    assert caught.value.code == CODE_TEMPO_UNREADABLE
+    assert not isinstance(caught.value, LintFailure)
+
+
+def test_the_octave_correction_is_off_until_it_is_asked_for(settings, store):
+    """It rewrites every bar line in the song and the corpus has no track that
+    triggers it, so there is no measurement to turn it on with. With it on, the
+    same recording that had no song at all is a song at half the tempo."""
+    too_fast = recording(ms_per_beat=255)
+    outcome = _assemble(too_fast, replace(settings, theory_tempo_octave=True))
+    payload = CompositionPayload.model_validate(outcome.songs[HARD])
+    assert payload.tempo == 118            # 235.3 / 2
+    assert outcome.theory.tempoOctaveShift == -1
+    assert not outcome.theory.tempoOctaveSuspect
+    assert lint(payload) == []
 
 
 def test_an_unusable_grid_fails_with_something_the_player_can_read(settings, store):

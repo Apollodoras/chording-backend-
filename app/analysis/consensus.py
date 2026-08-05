@@ -95,11 +95,19 @@ class ConsensusReport:
 
 def apply(bars: list[list[BarChord]], groups: list[RepeatGroup], *,
           bar_beats: float, tonic_pc: int = 0, mode: str = "ionian",
-          ) -> tuple[list[list[BarChord]], ConsensusReport]:
+          record: bool = True) -> tuple[list[list[BarChord]], ConsensusReport]:
     """Vote each repeat group's occurrences into agreement, where allowed.
 
     Returns a **new** bar list; the input is not mutated, so a caller can always
     compare the two — which is what the benchmark does to count what changed.
+
+    `record` is the exception to "not mutated": what the vote did is written back
+    onto each `RepeatGroup` (`rewritten_bars`, `contested_bars`, `canonical`) so
+    the provenance travels with the group it describes. Those objects are
+    **shared** — `model.render` votes over the same groups once per difficulty
+    tier — and a tier's vote is a render of the reference one, not a new finding
+    about the song. So renders pass `record=False` and the numbers on the groups
+    keep describing the reference vote rather than whichever tier compiled last.
     """
     out = [list(bar) for bar in bars]
     rewritten = contested = voted = 0
@@ -128,17 +136,18 @@ def apply(bars: list[list[BarChord]], groups: list[RepeatGroup], *,
                 group_rewritten += 1
                 rewritten += 1
 
-        group.rewritten_bars = group_rewritten
-        group.contested_bars = tuple(group_contested)
-        # The canonical pass is read back out *after* voting, so it is the
-        # progression the song settled on rather than whichever occurrence
-        # happened to come first.
-        first = group.occurrences[0]
-        group.canonical = [list(out[first + i]) for i in range(group.length_bars)
-                           if first + i < len(out)]
-        if group_rewritten or group_contested:
-            log.info("group %s: %d bar(s) voted into line, %d contested",
-                     group.label, group_rewritten, len(group_contested))
+        if record:
+            group.rewritten_bars = group_rewritten
+            group.contested_bars = tuple(group_contested)
+            # The canonical pass is read back out *after* voting, so it is the
+            # progression the song settled on rather than whichever occurrence
+            # happened to come first.
+            first = group.occurrences[0]
+            group.canonical = [list(out[first + i]) for i in range(group.length_bars)
+                               if first + i < len(out)]
+            if group_rewritten or group_contested:
+                log.info("group %s: %d bar(s) voted into line, %d contested",
+                         group.label, group_rewritten, len(group_contested))
 
     return out, ConsensusReport(groups_voted=voted, rewritten_bars=rewritten,
                                 contested_bars=contested)

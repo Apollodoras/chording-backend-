@@ -19,7 +19,7 @@ way three private copies of "which beat is this?" once did (see `axis.py`).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .types import GridSpan
 
@@ -115,3 +115,39 @@ def bars_from_spans(spans: list[GridSpan], bar_beats: int) -> list[list[BarChord
                 confidence=span.confidence,
             ))
     return [bar for bar in bars if bar]
+
+
+def spans_from_bars(bars: list[list[BarChord]], bar_beats: int) -> list[GridSpan]:
+    """Bars → a chord timeline again — `bars_from_spans` read backwards.
+
+    Exists for one caller: the model re-detects the key *after* the consensus
+    vote, and by then the chords live in bars rather than in spans. A chord the
+    slicing split across a barline is rejoined here, so what comes back is how
+    long the chord is really held rather than how many bars it touches — which
+    matters, because `keyfinder` weights its evidence by duration.
+
+    The round trip is faithful in root, quality, duration and confidence, and
+    lossy in exactly one field: `exact` is not carried on a `BarChord`, so every
+    span comes back claiming to be exact. Nothing may read `exact` off these —
+    `postprocess.exact_ratio` is computed on the real spans, upstream.
+    """
+    if not bars or bar_beats <= 0:
+        return []
+    out: list[GridSpan] = []
+    for index, bar in enumerate(bars):
+        origin = index * bar_beats
+        for chord in bar:
+            start = int(round(origin + chord.start_beat))
+            length = int(round(chord.length_beats))
+            if length <= 0:
+                continue
+            last = out[-1] if out else None
+            if (last is not None and last.root_pc == chord.root_pc
+                    and last.quality == chord.quality and last.end_beat == start):
+                out[-1] = replace(last, length_beats=last.length_beats + length,
+                                  confidence=min(last.confidence, chord.confidence))
+            else:
+                out.append(GridSpan(start_beat=start, length_beats=length,
+                                    root_pc=chord.root_pc, quality=chord.quality,
+                                    confidence=chord.confidence))
+    return out

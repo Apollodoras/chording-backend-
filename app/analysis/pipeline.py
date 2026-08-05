@@ -32,8 +32,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from ..chords import DIFFICULTIES
-from ..errors import AnalysisError, FeatureDisabled, VideoBlocked, VideoTooLong
-from ..lint import lint, lint_sync, repair
+from ..errors import (
+    AnalysisError,
+    FeatureDisabled,
+    TempoUnreadable,
+    VideoBlocked,
+    VideoTooLong,
+)
+from ..lint import TEMPO_MAX, TEMPO_MIN, lint, lint_sync, repair
 from ..payload import CompositionPayload
 from ..sync import TheoryReport, VideoSync
 from . import model as song_model
@@ -184,6 +190,7 @@ def assemble(
     model = song_model.build(
         grid=grid, raw=raw, onsets=onsets, energy=energy,
         vote=getattr(settings, "theory_consensus", True),
+        correct_octave=getattr(settings, "theory_tempo_octave", False),
     )
     if model is None or not grid.is_usable:
         raise AnalysisError(
@@ -196,8 +203,27 @@ def assemble(
     key = model.key
     time_signature = model.meter.time_signature
 
+    # §13.3, on the one diagnosis the analysis makes and used to swallow. A tempo
+    # the analysis calls implausible is an octave error far more often than it is
+    # a real reading, and the two ways that lands are worth telling apart:
+    #
+    #   outside the container's range   there is no song to ship. Say what was
+    #                                   read, rather than the generic "that video
+    #                                   didn't produce a song we could play" the
+    #                                   lint would have raised three lines later.
+    #   inside it, still implausible    the song plays, but the axis it plays on
+    #                                   is the thing in doubt — so it ships
+    #                                   low-confidence, which withholds the
+    #                                   sidecar and tells the player.
+    if not (TEMPO_MIN <= tempo <= TEMPO_MAX):
+        log.warning("tempo %d bpm is outside %d–%d for %s (octave suspect: %s)",
+                    tempo, TEMPO_MIN, TEMPO_MAX, meta.video_id,
+                    model.meter.tempo_octave_suspect)
+        raise TempoUnreadable(tempo, TEMPO_MIN, TEMPO_MAX)
+
     low_confidence = (model.confidence < settings.confidence_floor
-                      or grid.confidence < settings.confidence_floor)
+                      or grid.confidence < settings.confidence_floor
+                      or model.meter.tempo_octave_suspect)
     pattern_confidence: float | None = model.pattern_confidence
     total_bars = model.total_bars
     theory = TheoryReport(
@@ -209,6 +235,8 @@ def assemble(
         phaseShift=model.meter.phase_shift,
         meterSource=model.meter.meter_source,
         tempoOctaveSuspect=model.meter.tempo_octave_suspect,
+        tempoOctaveShift=model.meter.tempo_octave_shift,
+        exactRatio=round(model.exact_ratio, 3),
     )
 
     songs: dict[str, dict] = {}

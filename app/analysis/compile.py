@@ -88,7 +88,21 @@ def compile_song(
     for index, section in enumerate(sections):
         extracted = patterns.get(section.group)
         if extracted is None:
-            continue
+            # Unreachable: `model._patterns` emits one pattern per repeat group
+            # and every section carries a group, with the quarter-note fallback
+            # covering the case where there is nothing to extract from. Which is
+            # exactly why it raises. Skipping the section instead — what this did
+            # — compiles a song that is *short*: bars silently missing, `repeats`
+            # still claiming the full count, the sidecar's anchors addressing
+            # bars that no longer exist, and nothing anywhere to say so, because
+            # both lints check the song against itself and a shorter song is
+            # perfectly self-consistent. A future regression upstream should
+            # break loudly here rather than ship a truncated chart.
+            raise ValueError(
+                f"section {index} belongs to repeat group {section.group!r}, "
+                f"which has no pattern (have: {sorted(patterns)}) — every group "
+                f"must carry one, including the fallback"
+            )
         pattern = extracted.pattern
         embedded[pattern.id] = pattern
         payload_sections.append(

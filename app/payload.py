@@ -43,6 +43,31 @@ SECTION_KINDS = {"intro", "verse", "preChorus", "chorus", "bridge", "solo", "out
 STROKE_DIRECTIONS = {"down", "up", "bass", "mute"}
 MODES = {"major", "minor"}
 
+# --- The three tempo ranges, in one place because they have to nest ----------
+#
+# They were written in three files with nothing tying them together, and the
+# combination hard-killed songs: `meter.py` called 230 bpm a suspect octave and
+# left it alone, `lint.py` refused it, and the player got "that video didn't
+# produce a song we could play". Three ranges is right — they answer three
+# different questions — but the ordering between them is a contract:
+#
+#   PLAUSIBLE  55–200   what this repertoire actually occupies. Outside it a
+#                       reading is more likely an octave error than a tempo, and
+#                       `analysis/meter.py` says so.
+#   TEMPO      40–220   what the container accepts. Outside it `lint` refuses
+#                       the song, so this is the range that decides whether a
+#                       song exists at all.
+#   PATTERN    30–300   a pattern's *suggested* tempo, which is advisory — the
+#                       pattern plays at the song's tempo, whatever it says.
+#
+# PATTERN ⊇ TEMPO ⊇ PLAUSIBLE, and every step matters: a tempo the analysis is
+# happy with must be one lint accepts, and a song tempo lint accepts must be
+# legal on the pattern that carries it (patterns take the song's own tempo).
+# `tests/test_lint.py` pins the nesting.
+PLAUSIBLE_TEMPO_MIN, PLAUSIBLE_TEMPO_MAX = 55, 200
+TEMPO_MIN, TEMPO_MAX = 40, 220
+PATTERN_TEMPO_MIN, PATTERN_TEMPO_MAX = 30, 300
+
 # Id namespace (handoff §12.3/§12.5). Mo uses "mo:"; this service uses "yt:", so
 # the two backends can never mint the same Library id — `import` upserts on it.
 SONG_PREFIX = "yt:"

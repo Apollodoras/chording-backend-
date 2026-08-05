@@ -80,6 +80,15 @@ class Settings:
     # reconciliation, the form detection, the pooled patterns — only ever
     # rearranges or re-derives; this one overwrites.
     theory_consensus: bool = True
+    # §20.2 — let a tempo that reads an octave out be halved (or doubled) instead
+    # of only reported. **Off** by default, and for the opposite reason to
+    # `theory_consensus`: this one is unmeasured. Correcting the octave rewrites
+    # the beat grid, so every bar line and every anchor in the song moves, and
+    # the corpus has no track that triggers it — so there is no benchmark verdict
+    # to turn it on with. With it off, a suspect tempo the container can still
+    # carry ships low-confidence, and one it cannot fails with a message that
+    # names the tempo (`analysis/meter.py`, `pipeline.assemble`).
+    theory_tempo_octave: bool = False
     # Which chord engine / beat tracker to use. Chosen by the §8-step-2
     # benchmark (`bench/run_bench.py`, results in README):
     #
@@ -126,6 +135,7 @@ def load_settings() -> Settings:
         scratch_root=os.environ.get("CHORDS_SCRATCH_ROOT", "/tmp/chords-scratch"),
         confidence_floor=float(os.environ.get("CHORDS_CONFIDENCE_FLOOR", "0.5")),
         theory_consensus=_bool("CHORDS_THEORY_CONSENSUS", True),
+        theory_tempo_octave=_bool("CHORDS_THEORY_TEMPO_OCTAVE", False),
         chord_engine=os.environ.get("CHORDS_CHORD_ENGINE") or "btc",
         beat_tracker=os.environ.get("CHORDS_BEAT_TRACKER") or "beat_this",
         cors_allow_origins=os.environ.get("CHORDS_CORS_ORIGINS", ""),

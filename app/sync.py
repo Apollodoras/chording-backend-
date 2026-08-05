@@ -100,6 +100,14 @@ class TheoryReport(BaseModel):
     ``scale`` is the modal answer the container has no field for: a song the
     payload calls "G major" may really be G mixolydian (§20.5), and this is
     where that survives.
+
+    ``exactRatio`` is the other one worth watching, and it says something no
+    other number here does: how much of the track survived §5.4's normalization
+    without losing information. A low value means the ``hard`` tier is a
+    *fiction* on this recording — a jazz standard reduced to triads and dominant
+    sevenths is a different song, and it is a different song that lints clean,
+    plays fine and reports high confidence. This is the only field that can say
+    so.
     """
 
     scale: str = "ionian"
@@ -112,7 +120,19 @@ class TheoryReport(BaseModel):
     # the bar started, and the harmony won.
     phaseShift: int = 0
     meterSource: str = "tracker"
+    # The tempo is outside the range this repertoire plausibly occupies, *after*
+    # any correction — so a song reporting it is one whose beat grid may be an
+    # octave out, and it is flagged `lowConfidence` for that reason alone.
     tempoOctaveSuspect: bool = False
+    # Octaves the beat grid was moved by to get there: -1 halved, +1 doubled.
+    # Always 0 unless `CHORDS_THEORY_TEMPO_OCTAVE` is on.
+    tempoOctaveShift: int = 0
+    # Share of the reference tier, by duration, whose chord quality reached the
+    # container intact. **Optional and defaulting to None**, which reads as "not
+    # measured" — the honest answer for every sidecar written before this field
+    # existed, and one that neither 1.0 ("all exact") nor 0.0 ("none of it") can
+    # tell the truth about.
+    exactRatio: Optional[float] = None
 
 
 class VideoSync(BaseModel):

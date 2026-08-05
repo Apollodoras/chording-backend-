@@ -32,7 +32,21 @@ many beats are in a bar, and a tempo octave correction changes what a beat *is*;
 both rewrite the axis wholesale, and neither has the clean "chord changes are on
 barlines" evidence the phase check has. So the meter is arbitrated only when the
 tracker itself reports low confidence, and the tempo octave is **reported and
-never rewritten** — see `Meter.tempo_octave_suspect`.
+not rewritten unless it is asked for** — see `Meter.tempo_octave_suspect` and
+`correct_octave` below.
+
+**Why the octave correction is opt-in.** Reporting-and-not-correcting was not
+actually neutral, which is what the audit found: a tracker reading 230 bpm for a
+115 bpm song is outside the range `lint` accepts, so the song was refused
+outright and the player was told nothing useful — while this module was holding
+the diagnosis. The correction that fixes that halves (or doubles) the whole beat
+grid, which moves every bar line and every anchor in the song, and there is no
+way to know from here whether that trades a refused song for a wrong one. So it
+ships behind `Settings.theory_tempo_octave`, off by default, the same way
+`theory_consensus` gates the only other stage that overwrites rather than
+re-derives. What is *not* optional is the honest degradation: `pipeline.assemble`
+now reads `tempo_octave_suspect` and either flags the song low-confidence or
+fails it with a message that names the tempo.
 """
 
 from __future__ import annotations
@@ -42,6 +56,7 @@ from bisect import bisect_left
 from dataclasses import dataclass
 
 from ..chords import normalize
+from ..payload import PLAUSIBLE_TEMPO_MAX, PLAUSIBLE_TEMPO_MIN
 from ..payload import bar_beats as parse_bar_beats
 from .types import BeatGrid, RawChordSpan
 
@@ -61,8 +76,11 @@ PHASE_FLOOR = 0.45
 PHASE_MARGIN = 0.15
 
 # Below/above these the reported tempo is more likely an octave error than a
-# real reading, for the folk/pop material this service accepts. Reported only.
-TEMPO_MIN, TEMPO_MAX = 55.0, 200.0
+# real reading, for the folk/pop material this service accepts. Defined in
+# `payload.py` beside the container's own range and the pattern's, because the
+# three have to nest — this one is the innermost, so anything this module calls
+# plausible is something `lint` will accept.
+TEMPO_MIN, TEMPO_MAX = float(PLAUSIBLE_TEMPO_MIN), float(PLAUSIBLE_TEMPO_MAX)
 
 # Meters worth arbitrating between when the tracker is unsure. Not a general
 # meter finder: these are the two that cover almost everything here, and a wrong
@@ -85,19 +103,28 @@ class Meter:
     # the number that says how well the harmony and the pulse agree, and it is
     # worth logging even when nothing was changed.
     phase_evidence: float = 0.0
-    # True when the tempo is outside the range this material plausibly occupies.
-    # Never acted on — see the module docstring.
+    # True when the tempo is outside the range this material plausibly occupies,
+    # *after* any correction — so it means "still suspect", and a song carrying
+    # it is one the pipeline degrades honestly rather than one it fixed.
     tempo_octave_suspect: bool = False
+    # Octaves the beat grid was moved by: -1 halved, +1 doubled, 0 untouched
+    # (the default, and the only value reachable without `correct_octave`).
+    tempo_octave_shift: int = 0
     meter_source: str = "tracker"
 
 
-def reconcile(grid: BeatGrid, raw: list[RawChordSpan]) -> Meter:
+def reconcile(grid: BeatGrid, raw: list[RawChordSpan], *,
+              correct_octave: bool = False) -> Meter:
     """A tracker's `BeatGrid` → the timing the rest of the model is built on.
 
     Returns the grid unchanged in every case where the evidence does not clearly
     say otherwise. `build_axis` is called on `Meter.grid`, not on the tracker's,
     so a correction here reaches the chart, the bars and the anchors together —
     there is still exactly one origin.
+
+    `correct_octave` opts into rewriting a tempo that reads an octave out. Off by
+    default: it is the one thing in here that changes what a beat *is*, and the
+    diagnosis is worth reporting whether or not it is acted on.
     """
     beats = parse_bar_beats(grid.time_signature)
     bar_beats = int(round(beats)) if beats else 4
@@ -119,10 +146,23 @@ def reconcile(grid: BeatGrid, raw: list[RawChordSpan]) -> Meter:
             time_signature = f"{arbitrated}/4"
             source = "harmony"
 
-    shift, evidence = _phase(grid, raw, bar_beats)
-    corrected = grid
+    # The octave first, because it decides which beats exist: halving the grid
+    # removes every other beat, and the phase vote counts residues over the beats
+    # that are left. Rotating first and rescaling after would rotate a grid that
+    # is about to stop being the grid.
+    working = grid
+    octave_shift = 0
+    if correct_octave:
+        rescaled = _octave(grid, bar_beats)
+        if rescaled is not None:
+            working, octave_shift = rescaled
+            log.info("tempo octave corrected: %.1f → %.1f bpm (%s)", grid.bpm, working.bpm,
+                     "halved" if octave_shift < 0 else "doubled")
+
+    shift, evidence = _phase(working, raw, bar_beats)
+    corrected = working
     if shift:
-        rotated = _rotate(grid, bar_beats, shift)
+        rotated = _rotate(working, bar_beats, shift)
         if rotated is not None:
             log.info("downbeat phase rotated by %d beat(s); chord changes on barlines %.2f",
                      shift, evidence)
@@ -139,8 +179,9 @@ def reconcile(grid: BeatGrid, raw: list[RawChordSpan]) -> Meter:
 
     suspect = bool(corrected.bpm) and not (TEMPO_MIN <= corrected.bpm <= TEMPO_MAX)
     if suspect:
-        log.warning("tempo %.1f bpm is outside %.0f–%.0f — possible octave error, not corrected",
-                    corrected.bpm, TEMPO_MIN, TEMPO_MAX)
+        log.warning("tempo %.1f bpm is outside %.0f–%.0f — possible octave error, %s",
+                    corrected.bpm, TEMPO_MIN, TEMPO_MAX,
+                    "correction declined" if correct_octave else "not corrected")
 
     return Meter(
         grid=corrected,
@@ -150,6 +191,7 @@ def reconcile(grid: BeatGrid, raw: list[RawChordSpan]) -> Meter:
         phase_shift=shift,
         phase_evidence=round(evidence, 3),
         tempo_octave_suspect=suspect,
+        tempo_octave_shift=octave_shift,
         meter_source=source,
     )
 
@@ -176,22 +218,28 @@ def _changes_ms(raw: list[RawChordSpan]) -> list[int]:
     return changes
 
 
-def _residues(beats: list[int], changes: list[int], bar_beats: int) -> list[int]:
-    """Each chord change → which beat of the bar it landed on, or dropped.
+def _nearest_beat(beats: list[int], t: int) -> int | None:
+    """Index of the beat `t` sits on, or None when it sits on none of them.
 
-    Dropped when it is not close to any beat at all: a change that happens
+    "Sits on" is `SNAP_TOLERANCE_MS`, not "is nearest to": a time that falls
     between beats is evidence about nothing, and letting it snap to a neighbour
-    would let syncopation vote on the downbeat.
+    anyway would let syncopation vote on where the bar starts.
     """
+    index = bisect_left(beats, t)
+    candidates = [i for i in (index - 1, index) if 0 <= i < len(beats)]
+    if not candidates:
+        return None
+    nearest = min(candidates, key=lambda i: abs(beats[i] - t))
+    return nearest if abs(beats[nearest] - t) <= SNAP_TOLERANCE_MS else None
+
+
+def _residues(beats: list[int], changes: list[int], bar_beats: int) -> list[int]:
+    """Each chord change → which beat of the bar it landed on, or dropped."""
     out: list[int] = []
     for t in changes:
-        index = bisect_left(beats, t)
-        candidates = [i for i in (index - 1, index) if 0 <= i < len(beats)]
-        if not candidates:
-            continue
-        nearest = min(candidates, key=lambda i: abs(beats[i] - t))
-        if abs(beats[nearest] - t) <= SNAP_TOLERANCE_MS:
-            out.append(nearest % bar_beats)
+        index = _nearest_beat(beats, t)
+        if index is not None:
+            out.append(index % bar_beats)
     return out
 
 
@@ -204,13 +252,9 @@ def _tracker_residue(beats: list[int], downbeats: list[int], bar_beats: int) -> 
     """
     counts: dict[int, int] = {}
     for t in downbeats:
-        index = bisect_left(beats, t)
-        candidates = [i for i in (index - 1, index) if 0 <= i < len(beats)]
-        if not candidates:
-            continue
-        nearest = min(candidates, key=lambda i: abs(beats[i] - t))
-        if abs(beats[nearest] - t) <= SNAP_TOLERANCE_MS:
-            counts[nearest % bar_beats] = counts.get(nearest % bar_beats, 0) + 1
+        index = _nearest_beat(beats, t)
+        if index is not None:
+            counts[index % bar_beats] = counts.get(index % bar_beats, 0) + 1
     if not counts:
         return None
     best = max(counts.values())
@@ -247,24 +291,135 @@ def _phase(grid: BeatGrid, raw: list[RawChordSpan], bar_beats: int) -> tuple[int
 
 
 def _rotate(grid: BeatGrid, bar_beats: int, shift: int) -> BeatGrid | None:
-    """Re-derive the downbeats `shift` beats later in the tracker's beat list.
+    """Move each of the tracker's downbeats `shift` beats later in its beat list.
 
     The beats themselves are untouched — only which of them are called bar
     starts. Returns None if the rotation would not leave enough bars to build an
     axis on, in which case the caller keeps the tracker's answer.
+
+    **Each downbeat is moved relative to itself**, which is the whole point.
+    Re-deriving the grid as `beats[start::bar_beats]` instead assumes the beat
+    list is metrically uniform, and a real one is not: one inserted or dropped
+    beat — Here Comes The Sun has 11/8 and 15/8 bars inside a 4/4 song — shifts
+    every later downbeat by one, throwing away exactly what a downbeat-aware
+    tracker is for. Rotating in place keeps the tracker's bar structure and
+    changes only its phase.
+
+    The head is the one place the tracker's own answer runs out: rotating forward
+    means the music before the first rotated downbeat belongs to no bar. Bars are
+    extended back over it while there are whole bars' worth of beats to cover,
+    which is the same coverage the old slice produced on a uniform grid, bounded
+    to the run of beats before the first bar the tracker actually found.
     """
     beats = sorted(set(int(t) for t in grid.beats_ms))
     downbeats = sorted(set(int(t) for t in grid.downbeats_ms))
-    first = _tracker_residue(beats, downbeats, bar_beats)
-    if first is None:
+
+    rotated_indices: list[int] = []
+    for t in downbeats:
+        index = _nearest_beat(beats, t)
+        if index is None:
+            continue
+        if index + shift < len(beats):
+            rotated_indices.append(index + shift)
+    if not rotated_indices:
         return None
-    start = (first + shift) % bar_beats
-    rotated = beats[start::bar_beats]
+
+    head = rotated_indices[0] - bar_beats
+    while head >= 0:
+        rotated_indices.insert(0, head)
+        head -= bar_beats
+
+    rotated = sorted({beats[i] for i in rotated_indices})
     if len(rotated) < 3:
         return None
     return BeatGrid(
         beats_ms=grid.beats_ms, downbeats_ms=rotated, bpm=grid.bpm,
         confidence=grid.confidence, time_signature=grid.time_signature,
+    )
+
+
+# --- the tempo octave -------------------------------------------------------
+
+def _octave(grid: BeatGrid, bar_beats: int) -> tuple[BeatGrid, int] | None:
+    """Halve or double the beat grid when the tempo reads an octave out.
+
+    Returns None — change nothing — unless a **single** octave lands the tempo
+    inside the plausible band. More than an octave out is not an octave error,
+    it is a tracker that failed, and quartering a beat grid on the strength of a
+    number no music has is the confident mistake this module exists to avoid.
+
+    A halved grid is a different song structurally, not just a slower one: two of
+    the tracker's bars become one, so the downbeats are thinned with the beats
+    and each surviving bar keeps `bar_beats` of them. Doubling is the same
+    operation backwards — a beat between every pair of beats, and a downbeat in
+    the middle of every bar, because an old bar is now two.
+    """
+    bpm = grid.bpm
+    if not bpm:
+        return None
+    if bpm > TEMPO_MAX and TEMPO_MIN <= bpm / 2 <= TEMPO_MAX:
+        rescaled = _halve(grid, bar_beats)
+        return (rescaled, -1) if rescaled is not None else None
+    if bpm < TEMPO_MIN and TEMPO_MIN <= bpm * 2 <= TEMPO_MAX:
+        rescaled = _double(grid, bar_beats)
+        return (rescaled, 1) if rescaled is not None else None
+    return None
+
+
+def _halve(grid: BeatGrid, bar_beats: int) -> BeatGrid | None:
+    """Every other beat, and every other bar line.
+
+    Walked bar by bar rather than sliced, for the same reason `_rotate` is: the
+    tracker's bars are not all the same length, and a slice off a fixed origin
+    would drift out of phase with them at the first irregular one.
+    """
+    beats = sorted(set(int(t) for t in grid.beats_ms))
+    downbeats = sorted(set(int(t) for t in grid.downbeats_ms))
+    kept_downbeats = downbeats[::2]
+    if len(kept_downbeats) < 3:
+        return None
+
+    kept_beats: list[int] = []
+    for start, end in zip(kept_downbeats, kept_downbeats[1:]):
+        inside = [t for t in beats if start <= t < end]
+        kept_beats.extend(inside[::2])
+    tail = [t for t in beats if t >= kept_downbeats[-1]]
+    kept_beats.extend(tail[::2])
+    if len(kept_beats) < bar_beats * 2:
+        return None
+
+    return BeatGrid(
+        beats_ms=sorted(set(kept_beats)), downbeats_ms=kept_downbeats,
+        bpm=grid.bpm / 2, confidence=grid.confidence,
+        time_signature=grid.time_signature,
+    )
+
+
+def _double(grid: BeatGrid, bar_beats: int) -> BeatGrid | None:
+    """A beat between every pair of beats, and a bar line every `bar_beats` of
+    the beats that result — so each of the tracker's bars becomes two."""
+    beats = sorted(set(int(t) for t in grid.beats_ms))
+    downbeats = sorted(set(int(t) for t in grid.downbeats_ms))
+    if len(beats) < 2 or len(downbeats) < 2:
+        return None
+
+    dense: list[int] = []
+    for left, right in zip(beats, beats[1:]):
+        dense.extend((left, (left + right) // 2))
+    dense.append(beats[-1])
+
+    new_downbeats: list[int] = []
+    for start, end in zip(downbeats, downbeats[1:]):
+        inside = [t for t in dense if start <= t < end]
+        new_downbeats.extend(inside[::bar_beats])
+    new_downbeats.append(downbeats[-1])
+    if len(new_downbeats) < 3:
+        return None
+
+    return BeatGrid(
+        beats_ms=dense, downbeats_ms=sorted(set(new_downbeats)),
+        bpm=grid.bpm * 2, confidence=grid.confidence,
+        time_signature=grid.time_signature,
     )
 
 

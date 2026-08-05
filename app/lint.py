@@ -27,10 +27,14 @@ from .chords import is_valid_chord, pitch_class
 from .payload import (
     MODES,
     PATTERN_PREFIX,
+    PATTERN_TEMPO_MAX,
+    PATTERN_TEMPO_MIN,
     PROGRESSION_PREFIX,
     SECTION_KINDS,
     SONG_PREFIX,
     STROKE_DIRECTIONS,
+    TEMPO_MAX,
+    TEMPO_MIN,
     CompositionPayload,
     PatternPayload,
     SongSection,
@@ -47,7 +51,9 @@ from .sync import VideoSync
 
 _EPS = 1e-6
 
-TEMPO_MIN, TEMPO_MAX = 40, 220
+# `TEMPO_MIN`/`TEMPO_MAX` are imported above rather than defined here — callers
+# still find them on this module, but the number now lives next to the two other
+# tempo ranges it has to nest with (see `payload.py`).
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +305,21 @@ def lint_sync(payload: CompositionPayload, sync: VideoSync) -> list[str]:
             f"videoSync: anchors stop at songBeat {anchors[-1].songBeat:g} but the song is "
             f"{song_length:g} beats — the tail would run on extrapolated tempo"
         )
+    # And the other end of the same rule, which was missing. An anchor past the
+    # song's last beat addresses a bar that does not exist: the map claims the
+    # recording is still playing chart at a point where the chart has run out,
+    # and the cursor walks off the end of it. `song_length` itself is fine and
+    # expected — that anchor marks the *end* boundary of the final bar, which is
+    # why a song of N bars ships N+1 anchors.
+    #
+    # This is the check a dropped section would have tripped: the anchors are
+    # built from the model's bar count, so a song compiled short (see
+    # `compile_song`) keeps anchors for the bars it lost.
+    if song_length > 0 and anchors[-1].songBeat > song_length + _EPS:
+        add(
+            f"videoSync: anchors run to songBeat {anchors[-1].songBeat:g} but the song ends at "
+            f"{song_length:g} beats — those anchors address bars that do not exist"
+        )
 
     if not (0.0 <= sync.tempo.confidence <= 1.0):
         add(f"videoSync: tempo confidence {sync.tempo.confidence} must be between 0 and 1")
@@ -386,8 +407,9 @@ def _lint_pattern(pattern: PatternPayload, add) -> None:
         add(f'{label}: timeSignature "{pattern.timeSignature}" is not an "n/d" meter string')
     if not pattern.strokes:
         add(f"{label}: has no strokes — a pattern is one bar of strokes")
-    if not (30 <= pattern.tempo <= 300):
-        add(f"{label}: suggested tempo {pattern.tempo} looks wrong (expected 30–300 BPM)")
+    if not (PATTERN_TEMPO_MIN <= pattern.tempo <= PATTERN_TEMPO_MAX):
+        add(f"{label}: suggested tempo {pattern.tempo} looks wrong "
+            f"(expected {PATTERN_TEMPO_MIN}–{PATTERN_TEMPO_MAX} BPM)")
     _lint_strokes(label, pattern.strokes, beats, add)
 
 

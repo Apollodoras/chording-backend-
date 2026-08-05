@@ -35,6 +35,11 @@ CODE_FEATURE_DISABLED = "feature_disabled"
 CODE_BAD_REQUEST = "bad_request"
 CODE_NOT_FOUND = "not_found"
 
+# Also not in §16.3: a narrowing of `analysis_failed`, for the one analysis
+# failure the pipeline can actually diagnose. A client that doesn't know it
+# renders `message` and behaves exactly as it does today.
+CODE_TEMPO_UNREADABLE = "tempo_unreadable"
+
 
 def fail(status: int, message: str, code: str | None = None, **kwargs) -> HTTPException:
     """Build the {"message", "code"} HTTPException the error handler reshapes.
@@ -89,6 +94,29 @@ class EgressBlocked(VideoUnavailable):
 
     def __init__(self) -> None:
         super().__init__()
+
+
+class TempoUnreadable(AnalysisError):
+    """The beat tracker's tempo is one the container cannot carry.
+
+    Almost always an octave error — the tracker counted the eighths, or the
+    half-notes — and the analysis knows that (`meter.tempo_octave_suspect`). It
+    used to arrive as a `LintFailure`, i.e. as "that video didn't produce a song
+    we could play", which is both true and useless: it names none of what the
+    pipeline had already diagnosed, and it reads like a fault in the video rather
+    than in the reading of it. §13.3 is "degrade honestly", so it says what it
+    saw.
+    """
+
+    def __init__(self, tempo: int, low: int, high: int):
+        super().__init__(
+            f"That track’s beat came out at {tempo} BPM, which is outside the "
+            f"{low}–{high} BPM a song can be played at — usually it means the beat was "
+            f"counted at double or half speed. Try a video with a steadier beat.",
+            CODE_TEMPO_UNREADABLE,
+            status=422,
+        )
+        self.tempo = tempo
 
 
 class VideoTooLong(AnalysisError):

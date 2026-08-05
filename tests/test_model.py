@@ -13,6 +13,8 @@ thing it could never establish: that the tiers agree **by construction**.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from app.analysis import model as song_model
@@ -193,6 +195,151 @@ def test_the_hop_is_a_real_duration_and_not_a_whole_millisecond():
     assert honest.mean_between(four_minutes_ms, four_minutes_ms + 1000) > 0.9
     assert rounded.mean_between(four_minutes_ms, four_minutes_ms + 1000) < 0.1, \
         "the rounded hop reads a window two seconds away and finds silence"
+
+
+# --- a render is a read of the model, not a write to it ----------------------
+
+def _sevenths(last: str = "Cmaj7") -> list[RawChordSpan]:
+    """Gmaj7 D7 Em7 Cmaj7 ×4, with the final bar heard as `last`.
+
+    Sevenths because that is what makes a tier render *visible* in the model: at
+    `easy` every one of them flattens to a triad, so a render that wrote back to
+    the model would leave the reference structure carrying easy's chords.
+    """
+    labels = ["G:maj7", "D:7", "E:min7", "C:maj7"] * 4
+    labels[-1] = last
+    return [RawChordSpan(start_ms=i * BAR_MS, end_ms=(i + 1) * BAR_MS, label=label,
+                         confidence=0.2 if i == 15 and last != "Cmaj7" else 0.9)
+            for i, label in enumerate(labels)]
+
+
+def _voted_model():
+    """A model whose vote actually fired — the last bar of verse 4 misheard as
+    Am7, doubtfully, which is the case `consensus` exists for."""
+    raw = _sevenths(last="A:min7")
+    model = song_model.build(grid=_grid(), raw=raw, onsets=[])
+    assert model.consensus.rewritten_bars == 1, "the fixture has to reach the vote"
+    return model, raw
+
+
+def _provenance(groups):
+    return [(g.label, g.rewritten_bars, g.contested_bars,
+             [[(c.root_pc, c.quality) for c in bar] for bar in g.canonical])
+            for g in groups]
+
+
+def test_rendering_a_tier_does_not_edit_the_model_it_renders():
+    """`render` replays the vote per tier, and the vote writes its provenance
+    onto the `RepeatGroup` objects — which are the model's own. So after
+    compiling three tiers the model described whichever one compiled last: at
+    `easy`, a canonical progression of plain triads for a song whose reference
+    tier is all sevenths. The wire never saw it (the sidecar snapshots earlier),
+    the benchmark and the logs did."""
+    model, raw = _voted_model()
+    before = (_provenance(model.groups), _provenance(model.vote_groups))
+    for difficulty in DIFFICULTIES:
+        song_model.render(model, raw, difficulty)
+    assert (_provenance(model.groups), _provenance(model.vote_groups)) == before
+
+
+def test_the_reference_tier_is_the_model_itself():
+    """`hard` is the tier the model was built at, so its render has to come back
+    with the model's own bars. It used to hold by luck: the vote was taken over
+    the first pass's groups at build time and over the *second* pass's on every
+    render, so the reference tier was re-deciding what `build` had decided."""
+    model, raw = _voted_model()
+    rendered = song_model.render(model, raw, HARD)
+    assert _shape(rendered) == _shape(model.sections)
+
+
+def _shape(sections):
+    return [(s.group, s.kind, s.repeats,
+             [[(c.root_pc, c.quality, c.start_beat, c.length_beats) for c in bar]
+              for bar in s.bars])
+            for s in sections]
+
+
+# --- the key, and the small circle it used to sit in -------------------------
+
+def test_the_key_is_read_off_the_chart_the_vote_left_behind(monkeypatch):
+    """Key detection runs before the vote because the vote's diatonic tie-break
+    needs it — so the key is upstream of edits made partly on its own authority.
+    Reading it again off the corrected bars breaks that circle, and it is free:
+    the chords are already in hand."""
+    seen: list[set] = []
+    real = song_model.detect_key
+
+    def spy(spans):
+        seen.append({(s.root_pc, s.quality) for s in spans})
+        return real(spans)
+
+    monkeypatch.setattr(song_model, "detect_key", spy)
+    model, _ = _voted_model()
+
+    assert len(seen) == 2, "once for the vote's tie-break, once on what it produced"
+    assert (9, "minor7") in seen[0], "the engine's mistake was in the first reading"
+    assert (9, "minor7") not in seen[1], "and not in the chart the key came from"
+    assert model.key.tonic == "G"
+
+
+def test_a_vote_that_changed_nothing_does_not_re_read_the_key(monkeypatch):
+    """Re-running it there could differ only in the trailing partial bar
+    `bars_from_spans` drops — a change with no reason behind it."""
+    calls = []
+    real = song_model.detect_key
+    monkeypatch.setattr(song_model, "detect_key",
+                        lambda spans: (calls.append(1), real(spans))[1])
+    model = song_model.build(grid=_grid(), raw=_sevenths(), onsets=[])
+    assert not model.consensus.touched
+    assert len(calls) == 1
+
+
+# --- how much of `hard` is real ----------------------------------------------
+
+def test_the_model_measures_how_much_of_the_reference_tier_survived_intact():
+    """`Cmaj9` is not a chord the container can carry, so it ships as `Cmaj7` —
+    playable, and not what was heard. One bar in four here, and the number is the
+    only thing in the analysis that can say the `hard` tier is a fiction."""
+    raw = _sevenths()
+    assert song_model.build(grid=_grid(), raw=raw, onsets=[]).exact_ratio == 1.0
+
+    reduced = [replace(span, label="C:maj9") if i % 4 == 3 else span
+               for i, span in enumerate(raw)]
+    assert song_model.build(grid=_grid(), raw=reduced, onsets=[]).exact_ratio == 0.75
+
+
+# --- one groove, two groups --------------------------------------------------
+
+def test_a_groove_two_groups_share_is_named_for_both():
+    """A pattern's id is content-addressed — meter and strokes, not the name —
+    so two groups that strum alike compile to **one** embedded pattern. That is
+    the right encoding; what was wrong is that the name came from whichever
+    group was written last, so the player saw "Part 1 strum" on the pattern the
+    second section points at."""
+    labels = ["G", "D", "Em", "C"] * 2 + ["C", "F", "C", "G"] * 2
+    raw = [RawChordSpan(start_ms=i * BAR_MS, end_ms=(i + 1) * BAR_MS, label=label,
+                        confidence=0.9) for i, label in enumerate(labels)]
+    model = song_model.build(grid=_grid(), raw=raw, onsets=[])
+
+    assert len({g.label for g in model.groups}) == 2, "two groups"
+    ids = {p.pattern.id for p in model.patterns.values()}
+    assert len(ids) == 1, "and with no onsets, one shared quarter-note groove"
+    assert {p.pattern.name for p in model.patterns.values()} == {"Part 1 & Part 2 strum"}
+
+
+def test_a_groove_the_whole_song_plays_is_named_for_no_section():
+    """Three groups and one quarter-note fallback between them — which is what
+    every song analyzed without an onset detector looks like. At that point the
+    groove belongs to the song rather than to any section of it, and a list of
+    three names has stopped being a name."""
+    labels = ["G", "D", "Em", "C"] * 2 + ["C", "F", "C", "G"] * 2 + ["Am", "F", "G", "Am"] * 2
+    raw = [RawChordSpan(start_ms=i * BAR_MS, end_ms=(i + 1) * BAR_MS, label=label,
+                        confidence=0.9) for i, label in enumerate(labels)]
+    model = song_model.build(grid=_grid(len(labels)), raw=raw, onsets=[])
+
+    assert len(model.patterns) >= 3
+    assert len({p.pattern.id for p in model.patterns.values()}) == 1
+    assert {p.pattern.name for p in model.patterns.values()} == {"Strum"}
 
 
 # --- the consensus switch ----------------------------------------------------

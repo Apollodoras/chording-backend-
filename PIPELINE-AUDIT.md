@@ -21,10 +21,11 @@ is. `HIGH` means the user notices.
 |---|---|---|
 | 1 | Strumming correctness (A1–A6) | **Done** — `26b4d84`, on `main` |
 | 2 | Structure (B1–B5) | **Done** — branch `structure-audit` |
-| 3 | Meter/tempo (D1–D2) | Not started |
-| 4 | Hygiene (C1–C3, E1–E4) | Not started |
+| 3 | Meter/tempo (D1–D2) | **Done** — branch `structure-audit` |
+| 4 | Hygiene (C1–C3, E1–E4) | **Done** — branch `structure-audit` |
 
-Tests: 414 at the start of the audit → 423 after Phase 1 → 432 after Phase 2.
+Tests: 414 at the start of the audit → 423 after Phase 1 → 432 after Phase 2 →
+443 after Phase 3 → 458 after Phase 4.
 
 ---
 
@@ -109,30 +110,117 @@ much smaller lie than an eighteen-bar section claiming to be one piece of music.
 
 ---
 
-## Phase 3 — meter / tempo ⏳
+## Phase 3 — meter / tempo ✅
 
 | # | Sev | Finding | State |
 |---|---|---|---|
-| D1 | MED | **A suspect tempo octave is detected, reported… and then hard-kills the song.** `meter.py` flags bpm outside 55–200 as a suspect octave and deliberately never corrects it; `lint.py` makes tempo outside 40–220 a fatal `LintFailure`. So a tracker reading 230 bpm for a 115 bpm song produces no song at all, with the generic "didn't produce a song we could play" — while the pipeline is holding the diagnosis (`tempo_octave_suspect=True`). The three tempo ranges in the codebase (55–200, 40–220, patterns' 30–300) are not consistent with each other. | ⏳ |
-| D2 | LOW | `_rotate` rebuilds downbeats as `beats[start::bar_beats]`, which assumes a metrically uniform beat list — one inserted or dropped beat shifts every later downbeat, discarding the downbeat-aware tracker's ability to survive irregular bars. Rare (the phase gate is strict), but it corrupts the whole tail of the grid when it fires. | ⏳ |
+| D1 | MED | **A suspect tempo octave is detected, reported… and then hard-kills the song.** `meter.py` flags bpm outside 55–200 as a suspect octave and deliberately never corrects it; `lint.py` makes tempo outside 40–220 a fatal `LintFailure`. So a tracker reading 230 bpm for a 115 bpm song produces no song at all, with the generic "didn't produce a song we could play" — while the pipeline is holding the diagnosis (`tempo_octave_suspect=True`). The three tempo ranges in the codebase (55–200, 40–220, patterns' 30–300) are not consistent with each other. | ✅ the ranges are declared together and nest; the pipeline now degrades honestly on both sides of the container's range; the octave rewrite itself ships behind `CHORDS_THEORY_TEMPO_OCTAVE`, off |
+| D2 | LOW | `_rotate` rebuilds downbeats as `beats[start::bar_beats]`, which assumes a metrically uniform beat list — one inserted or dropped beat shifts every later downbeat, discarding the downbeat-aware tracker's ability to survive irregular bars. Rare (the phase gate is strict), but it corrupts the whole tail of the grid when it fires. | ✅ each downbeat moves relative to **itself**; the head is extended back over the music the forward rotation would leave in no bar, which is the coverage the slice had |
 
-Minimum viable D1 is *degrade honestly*: `tempo_octave_suspect` + out-of-lint-range
-becomes low confidence and a specific player-facing error, not an opaque
-`LintFailure`. Actually halving the grid rewrites the axis and needs the
-benchmark's verdict first — stage it behind a flag like `theory_consensus`.
+**D1, in the three pieces it turned out to be.**
+
+*The ranges now nest, in one place.* `payload.py` declares all three with the
+ordering as the contract — plausible (55–200) ⊂ container (40–220) ⊂ pattern
+(30–300) — and `lint.py` and `meter.py` read them from there. The nesting is not
+decoration: patterns are emitted at the song's own tempo, so an inversion is a
+song that lints clean carrying a pattern that does not, and the innermost range
+being inside the container's is what makes "implausible" a warning rather than a
+death sentence.
+
+*The pipeline degrades honestly, on both sides.* A tempo the container can still
+carry but the analysis calls implausible now ships `low_confidence` — the song
+lands in the Library and the sidecar is withheld, because the axis is precisely
+what is in doubt. A tempo outside the container's range raises `TempoUnreadable`,
+which names the reading and says what it usually means, instead of arriving three
+lines later as `LintFailure`'s "that video didn't produce a song we could play".
+Both are reachable in `tests/test_pipeline.py`; before the change the second case
+was reproduced as exactly that opaque lint failure.
+
+*The rewrite is staged, not shipped.* `Settings.theory_tempo_octave`
+(`CHORDS_THEORY_TEMPO_OCTAVE`) halves or doubles the whole grid — beats **and**
+downbeats, so two of the tracker's bars become one, walked bar by bar rather than
+sliced for the same reason D2 exists. It is off by default and for a different
+reason than `theory_consensus`: not "measured and marginal" but **unmeasured**.
+Only a single octave is ever applied, and only when it lands inside the plausible
+band; 460 bpm halves to 230, which is still not a tempo, so it is declined and
+stays suspect. That is the difference between an octave error and a tracker that
+failed.
+
+### Measured
+
+`bench/run_bench.py --theory`, at Phase 2 and again with Phase 3: the `truth` run
+is **byte-identical**, 0.963 → 0.963, every track unchanged, and the emitted
+contract fixtures differ by exactly one additive field (`tempoOctaveShift: 0`).
+
+That is the expected result and it is worth stating plainly rather than dressing
+up: **no track in the corpus has a suspect tempo** — every ground-truth tempo is
+between 66 and 179 bpm — and the phase gate does not fire on a ground-truth grid,
+so neither D1 nor D2 has anything to change here. The corpus cannot price this
+phase. What it can do is prove Phase 3 broke nothing, which is what it did.
+
+The `btc` + Beat This! row could not be re-run: `beat_this` is not installed in
+this environment, and that is the run that would exercise the two cases — a
+tracker whose reported bpm is an octave out, and a phase rotation firing on a
+grid with irregular bars. Both fixes are therefore pinned by fixtures rather than
+by the benchmark, and D2's fixture was checked to **fail against the old
+`_rotate`** (it puts every bar line a beat off the music).
+
+**The one thing not done, deliberately.** `_octave` is not consulted about *what*
+the octave error is — it trusts `BeatGrid.bpm` and rescales by 2. A tracker that
+reports 3× (counting the eighths of a 6/8 bar) is out of its reach, and the
+harmonic evidence that would settle it is the same chord-changes-on-barlines
+histogram the phase check uses. That is a real extension and it needs a track
+that exhibits the failure before it is worth writing.
 
 ---
 
-## Phase 4 — hygiene ⏳
+## Phase 4 — hygiene ✅
 
 Small, and mostly about failure modes lint cannot see.
 
 | # | Sev | Finding | State |
 |---|---|---|---|
-| C1 | LOW | `render()` re-runs `consensus.apply` per tier, and `apply` writes `rewritten_bars`/`contested_bars`/`canonical` onto the **shared** `RepeatGroup` objects — so `model.groups` ends up carrying whichever tier rendered last, not the reference vote. The wire is fine (the sidecar snapshots earlier); benchmarks and logs read tier-polluted numbers. Also, the build-time vote used first-pass groups while tier renders use second-pass groups, so "hard = reference" holds by luck rather than by construction. | ⏳ |
-| C2 | LOW | `postprocess.exact_ratio` is the promised "the hard tier is a fiction on this track" signal — promised again in `GridSpan`'s docstring — and is computed **nowhere in production**. Surface it in `TheoryReport` or delete the promise. | ⏳ |
-| C3 | LOW | Key is detected *before* the vote, yet the vote's diatonic tie-break uses that key. Mildly circular; re-detecting after voting is free and strictly cleaner. | ⏳ |
-| E1 | LOW | `compile_song` silently `continue`s a section whose group has no pattern — a silently shorter song. Unreachable today, which is exactly why it should raise rather than hide a future regression. | ⏳ |
-| E2 | LOW | `lint_sync` checks anchors stopping *short* of the chart but never anchors running *past* its end. With E1, a dropped section would ship anchors addressing bars that do not exist. | ⏳ |
-| E3 | LOW | `postprocess.merge` silently drops the second of two different chords quantized to the same start beat; it should keep the longer or more confident one. | ⏳ |
-| E4 | LOW | Two groups whose grooves hash to the same content-addressed id share one `PatternPayload` and the last name wins — "Verse strum" shown where "Chorus strum" was meant. Cosmetic. | ⏳ |
+| C1 | LOW | `render()` re-runs `consensus.apply` per tier, and `apply` writes `rewritten_bars`/`contested_bars`/`canonical` onto the **shared** `RepeatGroup` objects — so `model.groups` ends up carrying whichever tier rendered last, not the reference vote. The wire is fine (the sidecar snapshots earlier); benchmarks and logs read tier-polluted numbers. Also, the build-time vote used first-pass groups while tier renders use second-pass groups, so "hard = reference" holds by luck rather than by construction. | ✅ a render is a **read**: `apply(record=False)`, so nothing is written back, and the model carries `vote_groups` — the pass the vote was actually taken over — for renders to replay |
+| C2 | LOW | `postprocess.exact_ratio` is the promised "the hard tier is a fiction on this track" signal — promised again in `GridSpan`'s docstring — and is computed **nowhere in production**. Surface it in `TheoryReport` or delete the promise. | ✅ computed on the reference tier in `model.build`, carried as `SongModel.exact_ratio`, reported as the sidecar's `analysis.exactRatio` |
+| C3 | LOW | Key is detected *before* the vote, yet the vote's diatonic tie-break uses that key. Mildly circular; re-detecting after voting is free and strictly cleaner. | ✅ re-read off the corrected bars (`structure.spans_from_bars`), and only when the vote actually rewrote something |
+| E1 | LOW | `compile_song` silently `continue`s a section whose group has no pattern — a silently shorter song. Unreachable today, which is exactly why it should raise rather than hide a future regression. | ✅ raises `ValueError` naming the group |
+| E2 | LOW | `lint_sync` checks anchors stopping *short* of the chart but never anchors running *past* its end. With E1, a dropped section would ship anchors addressing bars that do not exist. | ✅ both ends of the coverage rule now, with the final barline (`songBeat == length`) explicitly not "past" |
+| E3 | LOW | `postprocess.merge` silently drops the second of two different chords quantized to the same start beat; it should keep the longer or more confident one. | ✅ longer wins, confidence breaks the tie |
+| E4 | LOW | Two groups whose grooves hash to the same content-addressed id share one `PatternPayload` and the last name wins — "Verse strum" shown where "Chorus strum" was meant. Cosmetic. | ✅ named for both ("Verse & Chorus strum"), in `model._patterns` where the names are, so the id — which hashes meter and strokes, not the name — is untouched |
+
+**Where C1's two halves ended up.** The write-back is the reproducible one:
+a model built on sevenths, rendered at `easy`, came back describing itself with
+plain triads — `test_rendering_a_tier_does_not_edit_the_model_it_renders` fails
+against the old code. The "hard = reference" half is pinned as a property rather
+than as a reproduction, and that is worth saying plainly: on every fixture tried,
+the two form passes agree, so voting over the wrong one produced the same answer.
+It held by luck and now holds by construction, which is the whole claim.
+
+**E4 was not fixed where it shows.** The collision appears in `compile`, which
+keys embedded patterns by id — but the name is decided in `model._patterns`,
+where the group names still exist, so that is where it is fixed. Renaming is safe
+for exactly the reason the bug exists: §12.5's id is a hash of the meter and the
+strokes and deliberately not of the name, so the wire is byte-identical. Beyond
+two sharers the pattern is named "Strum" — a groove the whole song plays belongs
+to no section, and a list of names has stopped being a name.
+
+### Measured
+
+`bench/run_bench.py --theory`, at Phase 3 and again with Phase 4: the `truth` run
+is **unchanged**, 0.963 → 0.963, and consensus is still a provable no-op on
+perfect input (0 rewritten bars on all 15 tracks).
+
+That is not a hopeful reading of an unchanged number — on this corpus Phase 4
+*cannot* move that run, and it is worth writing down why. Every behavioural change
+in it is either downstream of the wire (C2, E1, E2, E4) or gated on the vote
+having rewritten a bar (C1's replay, C3's re-read), which on ground truth never
+happens. That leaves E3, the one change that can alter a chord on any input — and
+instrumenting `merge` across the corpus counts **zero** coincident-start
+collisions in the truth run, so it never fires. What the benchmark can say here is
+that Phase 4 broke nothing, and it says it.
+
+The `btc` + Beat This! row could not be re-run, for the same reason as in Phase 3:
+neither engine is installed in this environment. E3 is the finding that row would
+price, since quantization only puts two chords on one beat when the chords arrive
+off-grid — which is what a real engine's output is and what ground truth is not.
+It is pinned by fixtures instead.

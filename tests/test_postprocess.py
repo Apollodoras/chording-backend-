@@ -85,6 +85,24 @@ def test_merge_marks_a_merged_span_inexact_if_either_half_was():
     assert not out[0].exact
 
 
+def test_two_chords_quantized_onto_one_beat_keep_the_one_with_more_evidence():
+    """A 300 ms Am inside a bar of C rounds onto C's own downbeat, and then the
+    two are not two chords — they are two readings of one slot. The second used
+    to be dropped silently, so which chord the bar showed was decided by the
+    sort: a passing chord could evict the chord the bar is actually in. The
+    longer one wins, because it is the one the bar is spent on."""
+    out = merge([span(0, 1, root=9, quality=MINOR), span(0, 4, root=0)])
+    assert [(s.root_pc, s.length_beats) for s in out] == [(0, 4)]
+
+
+def test_and_on_a_tie_the_one_the_engine_believed():
+    """Same start, same length — nothing left to separate them but how sure the
+    engine was, which is the same evidence the consensus vote consults."""
+    out = merge([span(0, 4, root=9, quality=MINOR, confidence=0.3),
+                 span(0, 4, root=0, confidence=0.9)])
+    assert [(s.root_pc, s.confidence) for s in out] == [(0, 0.9)]
+
+
 # --- drop_short -------------------------------------------------------------
 
 def test_dropped_spans_give_their_beats_to_the_neighbour():
