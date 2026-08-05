@@ -1,4 +1,14 @@
 {
+  "analysis": {
+    "contestedBars": 0,
+    "groups": 1,
+    "meterSource": "tracker",
+    "phaseShift": 0,
+    "rewrittenBars": 0,
+    "scale": "ionian",
+    "sections": 1,
+    "tempoOctaveSuspect": false
+  },
   "analyzedAt": "2026-01-01T00:00:00Z",
   "beatAnchors": [
     {

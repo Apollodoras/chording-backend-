@@ -32,8 +32,12 @@ def half(root, start, quality=MAJOR) -> BarChord:
 
 
 def build(sections: list[Section], **kwargs) -> CompositionPayload:
-    patterns = {i: fallback(bar_beats=4, tempo=120, name=f"Section {i} strum")
-                for i in range(len(sections))}
+    # Keyed by repeat-group letter (§20.3), which is what the compiler looks a
+    # section's groove up by. These fixtures build sections directly, so they
+    # share the empty group and therefore one pattern.
+    patterns = {s.group: fallback(bar_beats=4, tempo=120,
+                                  name=f"Section {s.group or '1'} strum")
+                for s in sections}
     payload = compile_song(
         video_id="dQw4w9WgXcQ", title="Known Song", sections=sections,
         patterns=patterns, key=DetectedKey("G", "major", 0.9),
@@ -193,7 +197,7 @@ def test_chords_are_spelled_for_the_songs_key():
     right where "A#" is wrong."""
     section = Section(kind="verse", bars=[bar(whole(5)), bar(whole(10)),
                                           bar(whole(0)), bar(whole(5))])
-    patterns = {0: fallback(bar_beats=4, tempo=120, name="Verse strum")}
+    patterns = {section.group: fallback(bar_beats=4, tempo=120, name="Verse strum")}
     payload = compile_song(
         video_id="x" * 11, title="Flat Song", sections=[section], patterns=patterns,
         key=DetectedKey("F", "major", 0.9), tempo=120, time_signature="4/4",

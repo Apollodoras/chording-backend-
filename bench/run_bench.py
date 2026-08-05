@@ -386,6 +386,124 @@ def bench_pipeline(cases: list[Case]) -> None:
     print()
 
 
+def truth_spans(truth: dict) -> list[RawChordSpan]:
+    """Ground truth, shaped as an engine's output — a *perfect* engine's.
+
+    Confidence 1.0 on every span, which is not a detail: §20.4's third gate
+    forbids the consensus vote from overruling a bar that was believed as much
+    as the winner, so a perfect engine makes the whole layer a provable no-op.
+    That is what the truth-as-engines run below is checking.
+    """
+    return [RawChordSpan(start_ms=int(c["startMs"]), end_ms=int(c["endMs"]),
+                         label=c["name"], confidence=1.0)
+            for c in truth["chords"]]
+
+
+def _analyze(case: Case, grid: BeatGrid, raw: list[RawChordSpan], *, vote: bool):
+    settings = Settings(scratch_root="/tmp/chords-scratch", theory_consensus=vote)
+    meta = VideoMeta(video_id="bench0000000", title=case.name,
+                     duration_s=case.truth["duration_ms"] / 1000.0)
+    return assemble(meta=meta, grid=grid, raw=raw, onsets=[], settings=settings,
+                    chords_engine=EngineInfo("bench", "1"),
+                    beats_engine=EngineInfo("bench", "1"))
+
+
+def _delivered(outcome, truth: dict) -> float:
+    return delivered_accuracy(
+        CompositionPayload.model_validate(outcome.songs[HARD]), outcome.sync, truth)
+
+
+def bench_theory(cases: list[Case]) -> None:
+    """§20's two-sided test — and it has to pass on *both* sides to ship.
+
+    A layer that edits the chords an engine reported cannot be judged by one
+    number, because the two ways it can be wrong pull in opposite directions:
+
+    **Run A — ground truth as both engines.** Every span arrives correct and
+    fully believed, so there is nothing to fix and anything consensus changes it
+    changes *away from the truth*. The requirement is `rewritten = 0` and a
+    `delivered` identical to the vote-off run. This is the regression guard, and
+    it is the run that would have caught the alignment defect: it isolates the
+    pipeline's own arithmetic from any engine's mistakes.
+
+    **Run B — the deployed engines.** Now the spans are wrong in the way real
+    spans are wrong, and the layer has to earn its place. The requirement is
+    that `delivered` goes *up*. If it does not, consensus is not paying for the
+    risk it carries and `CHORDS_THEORY_CONSENSUS=off` is the correct posture.
+
+    Nothing here averages the two. They answer different questions.
+    """
+    print("THEORY LAYER  (§20 — consensus off vs on)")
+    print(f"{'run':<8}{'track':<22}{'off':>8}{'on':>8}{'delta':>8}"
+          f"{'rewrit':>8}{'contest':>9}{'sects':>7}{'key':>16}")
+
+    runs: list[tuple[str, list[tuple[Case, BeatGrid, list[RawChordSpan]]]]] = []
+    runs.append(("truth", [(c, grid_from(c.truth), truth_spans(c.truth)) for c in cases]))
+
+    chord_name = Settings().chord_engine
+    beat_name = Settings().beat_tracker
+    if chord_name in engines._CHORD_ENGINES and beat_name in engines._BEAT_TRACKERS:
+        runs.append((f"{chord_name}", [(c, grid_for(beat_name, c)[0],
+                                        chords_for(chord_name, c)[0]) for c in cases]))
+
+    for label, prepared in runs:
+        off_all: list[float] = []
+        on_all: list[float] = []
+        rewritten_total = 0
+        for case, grid, raw in prepared:
+            try:
+                off = _analyze(case, grid, raw, vote=False)
+                on = _analyze(case, grid, raw, vote=True)
+            except Exception as exc:
+                print(f"{label:<8}{case.name:<22}{'—':>8}{'—':>8}"
+                      f"{'':>8}{'':>8}{'':>9}{'':>7}  {type(exc).__name__}")
+                continue
+            off_score, on_score = _delivered(off, case.truth), _delivered(on, case.truth)
+            report = on.theory
+            rewritten_total += report.rewrittenBars
+            delta = on_score - off_score
+            key = f"{CompositionPayload.model_validate(on.songs[HARD]).tonic} {report.scale}"
+            print(f"{label:<8}{case.name:<22}{off_score:>8.3f}{on_score:>8.3f}"
+                  f"{delta:>+8.3f}{report.rewrittenBars:>8}{report.contestedBars:>9}"
+                  f"{report.sections:>7}{key:>16}")
+            if off_score == off_score:
+                off_all.append(off_score)
+                on_all.append(on_score)
+
+        if off_all:
+            mean_off, mean_on = statistics.mean(off_all), statistics.mean(on_all)
+            verdict = _verdict(label, mean_off, mean_on, rewritten_total)
+            print(f"{label:<8}{'MEAN':<22}{mean_off:>8.3f}{mean_on:>8.3f}"
+                  f"{mean_on - mean_off:>+8.3f}{rewritten_total:>8}"
+                  f"{'':>9}{'':>7}  {verdict}")
+        print()
+
+
+# A gain smaller than this is not worth the risk of a layer that edits chords:
+# on nine tracks it is one or two songs moving, which is noise, and the cost of
+# being wrong is a chart that confidently shows a chord nobody played.
+MATERIAL_GAIN = 0.005
+
+
+def _verdict(label: str, off: float, on: float, rewritten: int) -> str:
+    """State plainly whether the run met its requirement.
+
+    Deliberately harder to please than "the mean went up". A layer with this
+    much downside has to clear a margin, not a sign — and a mean that improves
+    while individual tracks regress is exactly the shape a small corpus produces
+    by chance.
+    """
+    if label == "truth":
+        return ("PASS — no-op on perfect input" if rewritten == 0 and on >= off - 1e-9
+                else "FAIL — edited a correct chart")
+    gain = on - off
+    if gain >= MATERIAL_GAIN:
+        return "PASS — consensus earns its place"
+    if gain > 0:
+        return f"MARGINAL (+{gain:.3f}) — real but within noise on {label}; read the per-track rows"
+    return "no gain — ship with CHORDS_THEORY_CONSENSUS=off"
+
+
 def summarise(chord_tallies: dict[str, Tally], beat_tallies: dict[str, Tally],
               real: list[Case], synthetic: list[Case]) -> None:
     """The table the decision is actually made from."""
@@ -435,9 +553,16 @@ def main() -> int:
         print("! No real tracks — synthetic audio cannot tell you how these engines\n"
               "  behave on a dense mix, which is what the choice hinges on.\n")
 
+    if "--theory" in sys.argv:
+        # §20 on its own: the two-sided consensus test, without paying for a
+        # full engine sweep. `truth` needs no engines at all.
+        bench_theory(cases)
+        return 0
+
     chord_tallies = bench_chords(cases)
     beat_tallies = bench_beats(cases)
     bench_pipeline(cases)
+    bench_theory(cases)
     summarise(chord_tallies, beat_tallies, real, synthetic)
     return 0
 

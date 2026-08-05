@@ -19,7 +19,7 @@ mirrors deliberately — §16).
 
 **Working end to end, in the deployed shape, and now measured on the thing that
 actually matters.** A YouTube id (or an uploaded file) goes in; a linted
-`CompositionPayload` v2 and a `videoSync` sidecar come out. 348 tests, green, no
+`CompositionPayload` v2 and a `videoSync` sidecar come out. 414 tests, green, no
 audio and no network required to run them.
 
 That last clause is new and it was the important one. Every number this repo
@@ -43,14 +43,16 @@ App Review 5.2.3 stays a non-event — is [`RIGHTS.md`](RIGHTS.md).
 | §12.2 chord normalization | ✅ Harte + symbolic → the app's closed grammar |
 | §5.4 post-processing | ✅ quantize → merge → drop → hold N/C → simplify → confidence gate |
 | §5.5 difficulty tiers | ✅ re-scoped against the grammar ceiling (§12.2) |
-| §15 sections | ✅ repetition-based, whole bars, honest `Part N` fallback |
-| §14 strumming patterns | ✅ fold/histogram/convention + quarter-note fallback |
+| §15 sections | ✅ superseded by §20.3 — fuzzy, global, phase-aligned repeat groups |
+| §14 strumming patterns | ✅ fold/histogram/convention + quarter-note fallback, pooled per repeat group (§20.4) |
 | §13 `videoSync` sidecar | ✅ beat anchors + the §13.2 invariant, enforced by lint |
 | §16 API | ✅ Mo-shaped: Firebase bearer, `{message, code}` errors, job-id + poll |
 | §16.5 contract fixtures | ✅ emitted and byte-stable; the app-side test is a small follow-up (below) |
 | §5.1 fetch + decode | ✅ yt-dlp + ffmpeg, bounded, behind the §4 seam — **plus an upload path** with no YouTube-terms exposure ([`RIGHTS.md`](RIGHTS.md)) |
 | egress | ✅ **`CHORDS_YTDLP_PROXY` is live** (IPRoyal residential, rotating) — verified clearing the bot check on the first attempt, twice, on real audio ([below](#the-bot-check-is-per-ip-and-cookies-do-not-fix-it)) |
 | the beat axis | ✅ one origin for chart, bars and anchors (`axis.py`) — the defect that cost 23 points |
+| §20 theory layer | ✅ meter reconciled against the harmony, repeat groups, gated consensus, modal key, one model rendered per tier |
+| §21 two-sided benchmark | ✅ consensus is a **provable no-op** on perfect input, and measured separately on real engines |
 | §5.2/§5.3 engines | ✅ **BTC + Beat This!**, benchmarked against real recordings (below) |
 | §4 two-container shape | ✅ the API delegates to the worker; `tests/test_deployment.py` covers what `modal_app.py` relies on |
 | CI | ✅ suite, Postgres, fixture stability, and a test that the API image cannot touch audio |
@@ -75,7 +77,7 @@ scratch root: empty
 ```bash
 python3.11 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 cp .env.example .env
-.venv/bin/python -m pytest              # 307 tests, ~20s, no network, no audio stack
+.venv/bin/python -m pytest              # 414 tests, ~14s, no network, no audio stack
 .venv/bin/uvicorn app.main:app --reload
 ```
 
@@ -161,6 +163,58 @@ beats too. Note that `delivered` is scored on the **`hard`** tier — `normal`
 deliberately folds diminished and augmented onto their nearest playable triad
 (§5.5), and charging the pipeline for a reduction it was asked to make reads
 Michelle as 0.812 instead of 0.952.
+
+---
+
+## The music-theory layer (§20), and what it actually bought
+
+A song repeats itself. Almost every section here is one progression played
+several times, in one key and one meter — while a chord recognizer makes
+**independent** mistakes, so it can hear verse 3 differently from verses 1 and 2
+on a nearly identical recording. §20 is the layer that knows this: it reconciles
+the meter against the harmony, finds the song's repeat groups, and lets a
+group's occurrences vote their engine noise out.
+
+That last part edits chords the engine reported, which makes it the most
+dangerous code in the service — `lint` and `lint_sync` both check the song
+against *itself*, so a chart made uniformly self-consistent is exactly what they
+cannot complain about. It is the same shape as the alignment defect: 23 points
+gone behind three hundred green tests.
+
+So overwriting requires **three independent gates** (§20.4): two-thirds
+agreement, a harmonically *near* disagreement (C↔Am is a mishearing, C↔F is a
+chord change), and a dissenter that was believed **less** than the winner. The
+third gate is what makes the design testable — ground truth arrives at a flat
+confidence of 1.0, so **on perfect input consensus is provably a no-op**, from
+the construction rather than from luck.
+
+`python bench/run_bench.py --theory` runs it twice, because the two ways it can
+be wrong pull in opposite directions:
+
+| run | consensus off | on | bars rewritten |
+|---|---|---|---|
+| ground truth as both engines | **0.939** | **0.939** | 0 |
+| BTC + Beat This! | **0.796** | **0.799** | 15 |
+| BTC + Beat This!, pre-§20 commit | **0.796** | — | — |
+
+Read honestly, because the temptation is to read it the other way:
+
+- **The architecture is delivered-neutral.** Meter reconciliation, the new form
+  detection, the model/render split and the modal keyfinder together move the
+  number by nothing. What they bought is coherence and provenance — repeats
+  collapse, the three tiers agree by construction, sections carry group
+  identity, and the sidecar reports what was changed — not accuracy.
+- **Consensus is a marginal win**: +0.003, with Michelle up 0.028 and Let It Be
+  *down* 0.014. Real, but within noise on nine tracks. That is why
+  `CHORDS_THEORY_CONSENSUS` exists, and why the harness prints MARGINAL rather
+  than PASS below half a point.
+- **Key detection is a wash**: 5/9 exact tonics before and after. The modal fix
+  is still right on its own terms (`G F C G` was called *A minor*; it is G
+  mixolydian), and so is capping the tonic-endpoint bonus.
+
+Anyone extending this should assume the remaining accuracy is in the engines,
+and in §20.2's downbeat-phase check on tracks where the tracker is genuinely
+wrong — not in voting harder.
 
 ---
 
@@ -277,12 +331,15 @@ POST /v1/analyze/upload   {file}     ──┘        (free — §16.4, id is a 
                                        │
                        probe ──► gate (blocklist · 10-min cap · kill switch)
                                        │   nothing fetched until this passes
-                       scratch dir ──► decode ──► beats ──► chords ──► onsets
+       scratch dir ──► decode ──► beats ──► chords ──► onsets ──► energy
                                        └─► rm -rf audio  (every exit path)
                                        │
+                       §20.2 meter reconciled against the harmony
                        build_axis ──► ONE beat axis (chart · bars · anchors)
                                        │
-                       §5.4 post-process ──► §15 sections ──► §14 patterns
+                       §5.4 post-process ──► §20.3 form ──► §20.4 consensus
+                                       │        (repeat groups)   (gated vote)
+                       §20.6 ONE model ──► rendered once per difficulty
                                        │
                        §12 compile ──► lint ──► Postgres: chord_maps
 GET /v1/analyze/{jobId} ──► status / {song, videoSync}
@@ -304,6 +361,11 @@ See [`RIGHTS.md`](RIGHTS.md).
 | `app/store.py` | maps, jobs, blocklist, audit log, quota, limiter — two backends |
 | `app/analysis/` | the pipeline; `scratch.py` is §2.1 in code |
 | `app/analysis/axis.py` | **one** beat axis — chart, bars and anchors share an origin by construction |
+| `app/analysis/harmony.py` | §20.1 — harmonic distance: is a disagreement a mishearing or a chord change? |
+| `app/analysis/meter.py` | §20.2 — the harmony's second opinion on where the bar starts |
+| `app/analysis/form.py` | §20.3 — repeat groups, found fuzzily and globally (supersedes §15's segmentation) |
+| `app/analysis/consensus.py` | §20.4 — the three-gate vote; the only code that edits a chord the engine reported |
+| `app/analysis/model.py` | §20.6 — the song model; the tiers are renders of it, not separate analyses |
 | `app/analysis/ytdlp_source.py` | the only code that ever holds audio — worker image only |
 | `app/analysis/file_source.py` | the upload path: player-supplied audio, no YouTube-terms exposure |
 | `app/analysis/adapters/` | one file per engine; nothing else imports a model |

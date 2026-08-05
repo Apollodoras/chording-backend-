@@ -109,6 +109,7 @@ def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
             chord_engine=engines.build_chord_engine(settings),
             beat_tracker=engines.build_beat_tracker(settings),
             onset_detector=engines.build_onset_detector(settings),
+            structure_probe=engines.build_structure_probe(settings),
             progress=progress,
         )
     except EgressBlocked as exc:

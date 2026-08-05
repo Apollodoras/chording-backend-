@@ -43,7 +43,7 @@ from ..payload import (
     derived_uuid,
     song_id,
 )
-from ..sync import Confidence, EngineVersions, VideoSync, anchors_for
+from ..sync import Confidence, EngineVersions, TheoryReport, VideoSync, anchors_for
 from .keyfinder import DetectedKey
 from .strumming import ExtractedPattern
 from .structure import BarChord, Section
@@ -64,7 +64,7 @@ def compile_song(
     video_id: str,
     title: str,
     sections: list[Section],
-    patterns: dict[int, ExtractedPattern],
+    patterns: dict[str, ExtractedPattern],
     key: DetectedKey,
     tempo: int,
     time_signature: str,
@@ -72,10 +72,11 @@ def compile_song(
 ) -> CompositionPayload:
     """Sections → a `CompositionPayload` v2.
 
-    `patterns` is keyed by section index, because §14 emits one pattern per
-    distinct section groove and two sections may legitimately share one (the
-    content-addressed id means an identical groove is literally the same
-    pattern object).
+    `patterns` is keyed by **repeat-group letter** (§20.3), not by section
+    index. That is the musically correct key and it is also the one that makes
+    the encoding compact: every occurrence of a verse is the same music, so it
+    gets the same groove, and the content-addressed pattern id means the
+    payload carries one pattern object rather than one per occurrence.
     """
     beats = parse_bar_beats(time_signature) or 4.0
     flats = prefers_flats(key.tonic, key.mode)
@@ -85,7 +86,7 @@ def compile_song(
 
     song = song_id(video_id, difficulty)
     for index, section in enumerate(sections):
-        extracted = patterns.get(index)
+        extracted = patterns.get(section.group)
         if extracted is None:
             continue
         pattern = extracted.pattern
@@ -260,6 +261,7 @@ def build_sync(
     pattern_confidence: float | None,
     total_bars: int,
     offset_ms: int | None = 0,
+    analysis: TheoryReport | None = None,
 ) -> VideoSync:
     """The §13 sidecar for a compiled song.
 
@@ -282,4 +284,5 @@ def build_sync(
         beatAnchors=anchors_for(usable, bar_beats=bar_beats),
         engine=EngineVersions(chords=engine_chords, beats=engine_beats),
         analyzedAt=analyzed_at,
+        analysis=analysis,
     )

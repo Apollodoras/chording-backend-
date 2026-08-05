@@ -140,6 +140,7 @@ def analyze_one(name: str) -> dict:
             chord_engine=engines.build_chord_engine(settings),
             beat_tracker=engines.build_beat_tracker(settings),
             onset_detector=engines.build_onset_detector(settings),
+            structure_probe=engines.build_structure_probe(settings),
             progress=lambda status, fraction: stages.append(f"{status}@{fraction:.2f}"),
         )
     except Exception as exc:  # noqa: BLE001

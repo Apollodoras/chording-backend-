@@ -59,15 +59,14 @@ class FailingRunner(RemoteJobRunner):
 @pytest.fixture
 def no_engines():
     """The API image's real registry: empty. Nothing is installed over there."""
-    saved = (dict(engines._CHORD_ENGINES), dict(engines._BEAT_TRACKERS),
-             dict(engines._ONSET_DETECTORS))
-    engines._CHORD_ENGINES.clear()
-    engines._BEAT_TRACKERS.clear()
-    engines._ONSET_DETECTORS.clear()
+    registries = (engines._CHORD_ENGINES, engines._BEAT_TRACKERS,
+                  engines._ONSET_DETECTORS, engines._STRUCTURE_PROBES)
+    saved = [dict(registry) for registry in registries]
+    for registry in registries:
+        registry.clear()
     yield
-    engines._CHORD_ENGINES.update(saved[0])
-    engines._BEAT_TRACKERS.update(saved[1])
-    engines._ONSET_DETECTORS.update(saved[2])
+    for registry, contents in zip(registries, saved):
+        registry.update(contents)
 
 
 @pytest.fixture
@@ -113,7 +112,7 @@ def test_healthz_separates_container_capability_from_service_capability(api_cont
     body = api_container.get("/healthz").json()
 
     assert body["fetch"] == "unconfigured"
-    assert body["engines"] == {"chords": [], "beats": [], "onsets": []}
+    assert body["engines"] == {"chords": [], "beats": [], "onsets": [], "structure": []}
     assert body["enginesReady"] is False
     assert body["canAnalyze"] is True
     assert body["db"] == "ok"

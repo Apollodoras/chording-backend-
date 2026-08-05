@@ -39,17 +39,19 @@ import logging
 from typing import Callable
 
 from ..errors import AnalysisError, CODE_FEATURE_DISABLED
-from .types import BeatTracker, ChordEngine, OnsetDetector
+from .types import BeatTracker, ChordEngine, OnsetDetector, StructureProbe
 
 log = logging.getLogger("chords.engines")
 
 ChordEngineFactory = Callable[[], ChordEngine]
 BeatTrackerFactory = Callable[[], BeatTracker]
 OnsetDetectorFactory = Callable[[], OnsetDetector]
+StructureProbeFactory = Callable[[], StructureProbe]
 
 _CHORD_ENGINES: dict[str, ChordEngineFactory] = {}
 _BEAT_TRACKERS: dict[str, BeatTrackerFactory] = {}
 _ONSET_DETECTORS: dict[str, OnsetDetectorFactory] = {}
+_STRUCTURE_PROBES: dict[str, StructureProbeFactory] = {}
 
 
 def register_chord_engine(name: str, factory: ChordEngineFactory) -> None:
@@ -62,6 +64,10 @@ def register_beat_tracker(name: str, factory: BeatTrackerFactory) -> None:
 
 def register_onset_detector(name: str, factory: OnsetDetectorFactory) -> None:
     _ONSET_DETECTORS[name] = factory
+
+
+def register_structure_probe(name: str, factory: StructureProbeFactory) -> None:
+    _STRUCTURE_PROBES[name] = factory
 
 
 # --- built-in adapters -------------------------------------------------------
@@ -86,6 +92,10 @@ _BUILTIN_BEAT_TRACKERS = {
 
 _BUILTIN_ONSET_DETECTORS = {
     "librosa": (".adapters.librosa_beats", "LibrosaOnsetDetector", ("librosa", "numpy")),
+}
+
+_BUILTIN_STRUCTURE_PROBES = {
+    "librosa": (".adapters.librosa_energy", "LibrosaEnergyProbe", ("librosa", "numpy")),
 }
 
 
@@ -116,6 +126,7 @@ def register_builtins() -> None:
         (_CHORD_ENGINES, _BUILTIN_CHORD_ENGINES, register_chord_engine),
         (_BEAT_TRACKERS, _BUILTIN_BEAT_TRACKERS, register_beat_tracker),
         (_ONSET_DETECTORS, _BUILTIN_ONSET_DETECTORS, register_onset_detector),
+        (_STRUCTURE_PROBES, _BUILTIN_STRUCTURE_PROBES, register_structure_probe),
     ):
         for name, (module, attribute, requirements) in table.items():
             if name in registry or not _installed(requirements):
@@ -139,6 +150,7 @@ def available() -> dict[str, list[str]]:
         "chords": sorted(_CHORD_ENGINES),
         "beats": sorted(_BEAT_TRACKERS),
         "onsets": sorted(_ONSET_DETECTORS),
+        "structure": sorted(_STRUCTURE_PROBES),
     }
 
 
@@ -189,6 +201,15 @@ def build_onset_detector(settings) -> OnsetDetector | None:
     if name is None:
         name = sorted(_ONSET_DETECTORS)[0]
     return _ONSET_DETECTORS[name]()
+
+
+def build_structure_probe(settings) -> StructureProbe | None:
+    """Optional, like the onset detector, and for the same reason: without one
+    every section is `Part N` (§15's honest fallback) rather than the analysis
+    failing. Nothing the chart is built from depends on it."""
+    if not _STRUCTURE_PROBES or not getattr(settings, "structure_probe", True):
+        return None
+    return _STRUCTURE_PROBES[sorted(_STRUCTURE_PROBES)[0]]()
 
 
 def is_ready(settings) -> bool:

@@ -779,3 +779,173 @@ chord-analysis service inherit Mo's deployment or Mo's blast radius**.
 
 Also inherited from Mo, non-negotiably: **no lyrics, ever, in any field.** The app's
 campfire rail has no lyrics line by deliberate design.
+
+---
+
+# AMENDMENT (2026-08-04) — the music-theory layer
+
+**Supersedes §15 where they conflict.** §5.4, §12, §13 and §14 are unchanged and
+still binding; this amendment sits *between* the engines and the compiler and
+changes what is handed to §12, not what §12 emits.
+
+## 20. Why a theory layer at all
+
+Everything up to §19 treats the engines' output as the truth and the chart as a
+tidied copy of it. That is the right default and it is also the reason the
+service leaves accuracy on the table, because it ignores the single largest
+piece of free evidence a song contains: **a song repeats itself.**
+
+Almost every section of almost every song in this repertoire is one progression
+played several times, with one strumming pattern, in one key, in one meter. A
+chord recognizer, by contrast, makes **independent** mistakes — it can hear the
+third verse differently from the first two even though the recording is nearly
+identical. So four passes of one verse are four noisy readings of one signal,
+and the disagreements between them are mostly the engine, not the music.
+
+Two things follow, and the second is the dangerous one:
+
+- structure that is **found** from the chords is destroyed by chord errors, and
+  §15's segmentation compared bars by exact equality, so one misheard chord made
+  a verse a different section;
+- structure that is **imposed** on the chords can silently overwrite real music.
+
+§20 is the attempt to get the first without the second.
+
+### 20.1 The rule everything else hangs off
+
+When two readings of the same bar disagree, **harmonic distance says whether
+that is the engine or the music** (`app/analysis/harmony.py`).
+
+C and Am share two of three notes. So do C and Em, C and Cm, C and Csus4. Those
+are exactly the confusions a recognizer makes, because they are the confusions
+the *signal* supports — in a dense mix the third really is ambiguous. C and F
+share one note; C and F♯ share none, and no engine arrives at one from the other
+by accident.
+
+So a near-miss disagreement is evidence of noise and a distant one is evidence
+of music. This is the whole safety argument, and it is why the layer is allowed
+to touch anything at all.
+
+### 20.2 Timing (`meter.py`)
+
+The beat tracker is a *rhythmic* witness making a partly *harmonic* claim. Chord
+changes overwhelmingly land on barlines, so the residue of chord-change
+positions modulo the bar is a second opinion on where the "one" is.
+
+A rotation is applied only when the tracker's own share of chord-change mass is
+poor **and** some rotation is decisively better. Beat This! scores a downbeat F
+of 0.893 on the real corpus; casually second-guessing it would lose more than it
+won. Meter is arbitrated only when the tracker reports low confidence. **Tempo
+octave errors are reported and never corrected** — that rewrites what a beat is,
+and there is no clean harmonic evidence for it.
+
+This is the same *class* of defect the alignment work fixed (`axis.py`): a chart
+laid out of phase with its own recording scored 0.768 with a perfect engine, and
+no lint could see it.
+
+### 20.3 Form (`form.py`, supersedes §15's segmentation)
+
+Bars are compared by **sound** (`harmony.similarity`), blocks are matched
+**globally** rather than only against their neighbours, and the block grid's
+**phase** is chosen by how much repetition it exposes — a song opening with a
+two-bar intro used to put every boundary two bars out.
+
+The output is a set of **repeat groups** with rehearsal letters. §15's ~4-bar
+floor, its tail-joins-previous rule and its `Part N` fallback are unchanged.
+`repeats` is still only used for *identical* passes, never merely similar ones.
+
+### 20.4 Consensus (`consensus.py`) — the dangerous part
+
+Per repeat group, per bar slot, the occurrences vote. Overwriting requires
+**three independent gates**, all of which must hold:
+
+1. **support** — at least ⅔ of occurrences agree (so 1-of-2 never votes);
+2. **near-miss** — every dissenter is harmonically close to the winner (§20.1);
+3. **confidence** — the dissenter was believed *less* than the winner.
+
+Gate 3 does the real work: it is the only one consulting evidence from outside
+the repetition. An engine that was confident about the F in verse 3 is telling
+us the F is there.
+
+It also gives the layer a property worth stating: **on perfect input, consensus
+is provably a no-op.** Ground truth arrives at a flat confidence of 1.0, so no
+dissenter is ever less believed than a winner, so nothing is ever rewritten.
+
+Where the gates do not all hold the slot is **contested**: nothing is rewritten,
+for any occurrence, and the count is reported. Strumming patterns are pooled
+across every bar of every occurrence of a group — the unambiguous half, since a
+pattern was always a per-section average and this only enlarges its sample.
+
+### 20.5 Key (`keyfinder.py`)
+
+Scored against **four modes** — ionian, aeolian, mixolydian, dorian — and
+projected to the container's major/minor at the wire.
+
+The modes are there to find the **tonic**, which is what spelling keys off.
+`G F C G` scored against major and minor only comes out A minor, because every
+chord is diatonic to it and the start-and-end-on-G cue is outvoted by
+membership. Only four modes, because modes of one collection contain the same
+notes and cannot be told apart by membership at all — so every mode admitted
+that does not really occur as a key is a pure liability. Lydian, phrygian and
+locrian cost a correct tonic on the real corpus and bought nothing.
+
+Modulation is deliberately **not** modelled: the container carries one key, so a
+detected key change could be neither expressed nor acted on.
+
+### 20.6 One model, three renders (`model.py`)
+
+The structure is built **once**, at `hard`, and each difficulty is a render of
+it. Boundaries, repeat groups and patterns are therefore identical across tiers
+*by construction* rather than by inspection. (The cross-tier `lint_sync` check
+stays anyway — it costs nothing and is not the kind of thing to remove on the
+strength of an argument.)
+
+### 20.7 The audio layer's one new output (`StructureProbe`)
+
+§15 says the repeated high-energy segment can defensibly be called the chorus.
+Nothing ever measured energy, so **every song shipped as `Part 1…N`** and that
+half of §15 was dead code. A loudness envelope — one normalized scalar per
+~46 ms hop — is now the only new thing crossing the audio boundary. It is not
+audio, cannot be inverted into audio, carries no melodic, harmonic or lyrical
+content, and is never persisted; §2.1 is unaffected. A probe failure **must not
+fail the analysis**: without it, sections are `Part N`, which §15 calls the
+honest answer.
+
+## 21. How this is measured, and what it actually bought
+
+A layer that edits the chords an engine reported cannot be judged by one number,
+because the two ways it can be wrong pull in opposite directions. So
+`bench/run_bench.py --theory` runs it twice:
+
+- **Run A — ground truth as both engines.** Nothing to fix, so anything it
+  changes it changes away from the truth. Requirement: zero rewrites and an
+  unchanged `delivered`. This is the regression guard.
+- **Run B — the deployed engines.** Requirement: `delivered` goes *up*.
+
+Measured on the nine-track real corpus, 2026-08-04:
+
+| | delivered |
+|---|---|
+| Run A, consensus off / on | **0.939 / 0.939**, 0 bars rewritten |
+| Run B, consensus off / on | **0.796 / 0.799**, 15 bars rewritten |
+| Run B at the pre-§20 commit | **0.796** |
+
+Read honestly:
+
+- **The architecture is delivered-neutral.** The meter reconciliation, the new
+  form detection, the model/render split and the modal keyfinder together move
+  the number by nothing on either run. What they bought is structure and
+  provenance, not accuracy.
+- **Consensus is a marginal win.** +0.003 on the mean, with Michelle up 0.028
+  and Let It Be *down* 0.014. That is real but within noise on nine tracks,
+  which is why `CHORDS_THEORY_CONSENSUS` exists and why the benchmark prints
+  MARGINAL rather than PASS below half a point.
+- **Key detection is a wash**: 5/9 exact tonics before and after, with the
+  mixolydian fix and the endpoint cap both correct on their own terms.
+
+The honest summary is that §20 makes the song *more coherent* — repeats collapse,
+tiers agree, sections carry group identity, the sidecar reports what was
+changed — without yet making it much *more accurate*. Anyone extending this
+should assume the accuracy win, if there is one, is in the engines and in
+§20.2's phase check on tracks where the tracker is genuinely wrong, not in
+voting harder.

@@ -9,12 +9,12 @@ than as anything that looks like a bug here.
 
 from __future__ import annotations
 
+from app.analysis.form import segment
 from app.analysis.postprocess import process
 from app.analysis.structure import (
     MIN_SECTION_BARS,
     BarChord,
     bars_from_spans,
-    segment,
 )
 from app.analysis.types import GridSpan
 from app.chords import MAJOR, MINOR, NORMAL

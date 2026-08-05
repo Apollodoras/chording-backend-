@@ -72,6 +72,14 @@ class Settings:
     # Mean-confidence floor below which the map is flagged `lowConfidence` and
     # videoSync is withheld entirely (§5.4.6, §13.3).
     confidence_floor: float = 0.5
+    # §20.4 — let a song's repeated sections vote their engine mistakes out.
+    # A flag rather than a constant because this is the one part of the theory
+    # layer that *edits chords the engine reported*, and the honest way to ship
+    # something that can only be judged by measurement is to be able to turn it
+    # off in production without a deploy. Everything else in §20 — the meter
+    # reconciliation, the form detection, the pooled patterns — only ever
+    # rearranges or re-derives; this one overwrites.
+    theory_consensus: bool = True
     # Which chord engine / beat tracker to use. Chosen by the §8-step-2
     # benchmark (`bench/run_bench.py`, results in README):
     #
@@ -117,6 +125,7 @@ def load_settings() -> Settings:
         job_deadline_s=float(os.environ.get("CHORDS_JOB_DEADLINE_S", "180")),
         scratch_root=os.environ.get("CHORDS_SCRATCH_ROOT", "/tmp/chords-scratch"),
         confidence_floor=float(os.environ.get("CHORDS_CONFIDENCE_FLOOR", "0.5")),
+        theory_consensus=_bool("CHORDS_THEORY_CONSENSUS", True),
         chord_engine=os.environ.get("CHORDS_CHORD_ENGINE") or "btc",
         beat_tracker=os.environ.get("CHORDS_BEAT_TRACKER") or "beat_this",
         cors_allow_origins=os.environ.get("CHORDS_CORS_ORIGINS", ""),

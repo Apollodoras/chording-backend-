@@ -19,7 +19,8 @@ from app.analysis.compile import compile_song
 from app.analysis.keyfinder import DetectedKey
 from app.analysis.postprocess import process
 from app.analysis.strumming import fallback
-from app.analysis.structure import bars_from_spans, segment
+from app.analysis.form import segment
+from app.analysis.structure import bars_from_spans
 from app.chords import NORMAL
 from app.lint import lint, lint_sync, repair, section_beats, total_beats
 from app.payload import CompositionPayload, bar_beats
@@ -52,8 +53,8 @@ def make_sync(**overrides) -> VideoSync:
 def known_song() -> CompositionPayload:
     spans = process(known_chords(), known_axis(), difficulty=NORMAL)
     sections = segment(bars_from_spans(spans, BAR_BEATS))
-    patterns = {i: fallback(bar_beats=4, tempo=120, name="Verse strum")
-                for i in range(len(sections))}
+    patterns = {s.group: fallback(bar_beats=4, tempo=120, name="Verse strum")
+                for s in sections}
     payload = compile_song(
         video_id="dQw4w9WgXcQ", title="Known Song", sections=sections,
         patterns=patterns, key=DetectedKey("G", "major", 0.9),

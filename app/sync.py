@@ -81,6 +81,40 @@ class EngineVersions(BaseModel):
     beats: str
 
 
+class TheoryReport(BaseModel):
+    """What the §20 layer concluded, and what it changed to get there.
+
+    Carried on the sidecar rather than in the payload for two reasons. The
+    payload is the container the app already imports and must stay
+    byte-identical to what any other client decodes (§12); and these are facts
+    about the *analysis*, not about the song — the same distinction that put
+    ``engine`` and ``analyzedAt`` here rather than in the composition.
+
+    ``rewrittenBars`` is the one to watch. It counts bars where a repeated
+    section's majority overruled a single occurrence — edits the player cannot
+    see and neither lint can check (`consensus.py`). A song reporting a high
+    count is one whose verses the engine heard inconsistently; a song reporting
+    a high ``contestedBars`` is one whose verses genuinely differ. Both are
+    worth knowing and neither is visible anywhere else.
+
+    ``scale`` is the modal answer the container has no field for: a song the
+    payload calls "G major" may really be G mixolydian (§20.5), and this is
+    where that survives.
+    """
+
+    scale: str = "ionian"
+    sections: int = 0
+    groups: int = 0
+    rewrittenBars: int = 0
+    contestedBars: int = 0
+    # Beats the downbeat grid was rotated by against the tracker's own answer
+    # (§20.2). Non-zero means the harmony and the pulse disagreed about where
+    # the bar started, and the harmony won.
+    phaseShift: int = 0
+    meterSource: str = "tracker"
+    tempoOctaveSuspect: bool = False
+
+
 class VideoSync(BaseModel):
     source: str = SOURCE_YOUTUBE
     videoId: str
@@ -99,6 +133,11 @@ class VideoSync(BaseModel):
     beatAnchors: list[BeatAnchor] = Field(default_factory=list)
     engine: EngineVersions
     analyzedAt: str
+    # §20's provenance. Optional so every sidecar written before the theory
+    # layer existed still validates, and additive so the client — whose
+    # `VideoSync` is a synthesized `Codable` and therefore ignores keys it does
+    # not know — decodes it unchanged.
+    analysis: Optional[TheoryReport] = None
 
 
 class AnalyzeResponse(BaseModel):

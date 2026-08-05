@@ -81,6 +81,40 @@ class Onset:
 
 
 @dataclass(frozen=True)
+class EnergyCurve:
+    """How loud the recording is over time — the audio layer's vote on structure.
+
+    §15 says naming the repeated **high-energy** segment `chorus` is defensible
+    and that naming nothing is the honest fallback otherwise. Until now the
+    fallback was the only branch that ever ran, because nothing in the pipeline
+    measured energy: every song shipped as `Part 1…N`. This is the missing
+    evidence, and it is the *only* new thing §20 asks to cross the audio
+    boundary.
+
+    **What crosses is a scalar per hop and nothing else.** That matters for §2.1:
+    a loudness envelope at ~20 Hz is not audio, cannot be inverted into audio,
+    and carries no melodic, harmonic or lyrical content — there is no more of the
+    recording in it than there is in `bpm`. It is also never persisted; it lives
+    inside one `analyze` call and dies with it. The rule this module exists to
+    make structural — that no type here *could* carry a spectrogram — is
+    unchanged: `values` is a list of floats and there is nowhere in it to put
+    one.
+    """
+
+    hop_ms: int
+    values: list[float]
+
+    def mean_between(self, start_ms: float, end_ms: float) -> float:
+        """Mean level over a time range, for scoring one bar."""
+        if self.hop_ms <= 0 or not self.values or end_ms <= start_ms:
+            return 0.0
+        first = max(0, int(start_ms // self.hop_ms))
+        last = min(len(self.values), max(first + 1, int(end_ms // self.hop_ms)))
+        window = self.values[first:last]
+        return sum(window) / len(window) if window else 0.0
+
+
+@dataclass(frozen=True)
 class GridSpan:
     """A chord after quantization — addressed in **beat indices**, not time.
 
@@ -158,6 +192,24 @@ class OnsetDetector(Protocol):
     version: str
 
     def detect(self, pcm: PCM, sr: int) -> list[Onset]: ...
+
+
+@runtime_checkable
+class StructureProbe(Protocol):
+    """§20.7's seam — the audio layer's contribution to *naming* sections.
+
+    Deliberately the same shape as the other three adapters, and deliberately
+    the weakest: where the chord engine and the beat tracker produce things the
+    chart is built from, this one produces evidence for a label. A song analyzed
+    without a probe is a song whose sections are called `Part N`, which §15 says
+    is the honest answer when the segmentation cannot tell — so this being
+    absent is a supported configuration, not a degraded one.
+    """
+
+    name: str
+    version: str
+
+    def probe(self, pcm: PCM, sr: int) -> EnergyCurve: ...
 
 
 @dataclass(frozen=True)
