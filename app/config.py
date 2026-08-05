@@ -51,6 +51,24 @@ class Settings:
     # --- Abuse hardening (mirrors Mo's A4) -----------------------------------
     rate_limit_per_min: int = 0
     rate_limit_ip_per_min: int = 0
+    # Cheap authenticated reads — `GET /v1/analyze/{jobId}` and `GET
+    # /v1/maps/{videoId}` — get their **own** budget rather than sharing the one
+    # above, and this is a correctness fix rather than a tuning knob.
+    #
+    # The client models an analysis as one long await and runs the poll loop
+    # inside `RemoteChordAnalysisService`, so a single job is one POST followed
+    # by a poll every few seconds for as long as the job takes. Against a shared
+    # budget of ten that arithmetic is fatal: ~14 requests land in the first
+    # minute, and **every job that runs longer than about forty seconds
+    # rate-limits its own status checks** — which is every YouTube job there is.
+    # The player saw "too many requests" for a job that was running perfectly.
+    #
+    # The two limits guard genuinely different things. `rate_limit_per_min`
+    # gates work and spend: a fetch, a decode, a DSP pipeline, a quota
+    # decrement. A poll is one indexed row read whose whole purpose is to be
+    # repeated. Sizing the second from the first is how the second one ends up
+    # wrong.
+    rate_limit_poll_per_min: int = 0
     rate_limit_window_s: float = 60.0
 
     # --- Admin (§3 takedown intake) ------------------------------------------
@@ -115,6 +133,33 @@ def _bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _poll_limit() -> int:
+    """The budget for cheap authenticated reads (see `rate_limit_poll_per_min`).
+
+    Defaulted rather than required, because the alternative is a fix that only
+    works on a deployment somebody remembered to update: this ships as a code
+    change, and the secret it would otherwise depend on is edited by hand in the
+    Modal dashboard. An unset `CHORDS_RATE_LIMIT_POLL_PER_MIN` therefore means
+    "sixty a minute, or six times the spend budget if that is larger" — one
+    poll a second, comfortably above any sane client loop and still a ceiling on
+    a runaway one.
+
+    `0` is honoured when it is set **explicitly**, and means off, the same as its
+    two siblings. That distinction is why this reads the variable rather than
+    passing a default to `os.environ.get`: "unset" and "set to zero" have to mean
+    different things here, and only one of them can be spelled `"0"`.
+
+    Off when the per-uid limit is off, too — that is the local-dev shape, and a
+    limiter appearing on one route in a deployment that has disabled limiting
+    everywhere else is a surprise nobody asked for.
+    """
+    raw = os.environ.get("CHORDS_RATE_LIMIT_POLL_PER_MIN")
+    if raw is not None and raw.strip():
+        return int(raw)
+    uid_per_min = int(os.environ.get("CHORDS_RATE_LIMIT_PER_MIN", "0"))
+    return max(60, uid_per_min * 6) if uid_per_min > 0 else 0
+
+
 def load_settings() -> Settings:
     return Settings(
         analysis_enabled=_bool("CHORDS_ANALYSIS_ENABLED", True),
@@ -128,6 +173,7 @@ def load_settings() -> Settings:
         daily_quota=int(os.environ.get("CHORDS_DAILY_QUOTA", "10")),
         rate_limit_per_min=int(os.environ.get("CHORDS_RATE_LIMIT_PER_MIN", "0")),
         rate_limit_ip_per_min=int(os.environ.get("CHORDS_RATE_LIMIT_IP_PER_MIN", "0")),
+        rate_limit_poll_per_min=_poll_limit(),
         rate_limit_window_s=float(os.environ.get("CHORDS_RATE_LIMIT_WINDOW_S", "60")),
         admin_token=os.environ.get("CHORDS_ADMIN_TOKEN") or None,
         max_video_seconds=int(os.environ.get("CHORDS_MAX_VIDEO_SECONDS", str(DEFAULT_MAX_VIDEO_SECONDS))),

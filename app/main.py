@@ -62,6 +62,7 @@ from .store import (
     BLOCK_CHANNEL,
     BLOCK_VIDEO,
     RATE_SCOPE_IP,
+    RATE_SCOPE_POLL,
     RATE_SCOPE_UID,
     STATUS_FAILED,
     STATUS_READY,
@@ -218,17 +219,24 @@ def _install_ip_rate_limit(app: FastAPI) -> None:
         return await call_next(request)
 
 
-def _guard(request: Request, principal: Principal) -> None:
+def _guard(request: Request, principal: Principal, *,
+           scope: str = RATE_SCOPE_UID, limit: int | None = None) -> None:
     """The per-uid burst limit, after authentication.
 
     Per-uid *and* per-IP because they catch different attackers: one account
     behind many addresses, and many accounts behind one.
+
+    `scope`/`limit` exist so the **polling** routes can be counted separately
+    (`RATE_SCOPE_POLL`). Both are needed together: a bigger limit on the same
+    scope would let a poll loop still eat the slots `POST /v1/analyze` needs, and
+    a separate scope on the same limit would not have fixed anything.
     """
     settings: Settings = request.app.state.settings
-    if settings.rate_limit_per_min <= 0:
+    limit = settings.rate_limit_per_min if limit is None else limit
+    if limit <= 0:
         return
     allowed, retry_after = request.app.state.store.hit_rate_limit(
-        RATE_SCOPE_UID, principal.uid, settings.rate_limit_per_min, settings.rate_limit_window_s
+        scope, principal.uid, limit, settings.rate_limit_window_s
     )
     if not allowed:
         seconds = max(1, int(retry_after + 0.5))
@@ -297,6 +305,29 @@ def _principal_checked(request: Request) -> Principal:
         request.headers.get("Authorization"), check_revoked=True
     )
     _guard(request, principal)
+    return principal
+
+
+def _principal_polling(request: Request) -> Principal:
+    """Same as `_principal`, on the budget meant for being asked repeatedly.
+
+    For the two routes a client is *supposed* to call in a loop: `GET
+    /v1/analyze/{jobId}` while a job runs, and `GET /v1/maps/{videoId}`. Both are
+    a single indexed read, neither spends quota, and neither can start work.
+
+    Counting them against `rate_limit_per_min` was a real outage in miniature.
+    That budget is ten a minute; the client polls every two seconds easing to
+    five, so one ordinary analysis spends the whole minute's allowance in about
+    forty seconds and the next status check comes back 429. The client threw
+    that straight out of its poll loop, so **the app reported a failure for a
+    job the server was still running successfully** — and the retry restarted
+    the same countdown. Nothing about the video, the engines or the network was
+    involved.
+    """
+    principal = request.app.state.authenticator(request.headers.get("Authorization"))
+    settings: Settings = request.app.state.settings
+    _guard(request, principal, scope=RATE_SCOPE_POLL,
+           limit=settings.rate_limit_poll_per_min)
     return principal
 
 
@@ -391,6 +422,13 @@ def _install_routes(app: FastAPI) -> None:
             "rateLimit": {
                 "uidPerMin": settings.rate_limit_per_min,
                 "ipPerMin": settings.rate_limit_ip_per_min,
+                # Published because the relationship between these two is the
+                # thing that breaks, not either number on its own. A `pollPerMin`
+                # at or near `uidPerMin` means job status checks are competing
+                # with the requests that start jobs, and the visible symptom is
+                # long analyses "failing" with a 429 while the worker is still
+                # happily running them.
+                "pollPerMin": settings.rate_limit_poll_per_min,
             },
         }
 
@@ -547,7 +585,7 @@ def _install_routes(app: FastAPI) -> None:
         return JSONResponse(status_code=202, content={"jobId": job_id, "status": "queued"})
 
     @app.get("/v1/analyze/{job_id}")
-    async def analyze_status(job_id: str, principal: Principal = Depends(_principal)):
+    async def analyze_status(job_id: str, principal: Principal = Depends(_principal_polling)):
         store: Store = app.state.store
         job = store.get_job(job_id)
         if job is None:
@@ -573,7 +611,7 @@ def _install_routes(app: FastAPI) -> None:
 
     @app.get("/v1/maps/{video_id}")
     async def get_map(video_id: str, difficulty: str | None = None,
-                      principal: Principal = Depends(_principal)):
+                      principal: Principal = Depends(_principal_polling)):
         store: Store = app.state.store
         cached = store.get_map(video_id, _difficulty(difficulty))
         if cached is None:

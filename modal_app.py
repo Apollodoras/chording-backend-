@@ -75,17 +75,46 @@ app = modal.App("rosetta-dechorder")
 #
 # SQLite on a network volume tolerates exactly ONE writer. Postgres removes that
 # constraint, but this file runs on *your machine* at `modal deploy` time, where
-# it cannot see the secret the container will get. So the pin is lifted by an
-# explicit signal in the deploy shell:
+# it cannot see the secret the container will get. So the pin has to be lifted by
+# a signal in the deploy shell, and the question is which signal.
 #
-#     CHORDS_DATABASE_URL="$(the DSN in chords-secrets)" modal deploy modal_app.py
+#     CHORDS_SCALE_OUT=1 modal deploy modal_app.py
+#
+# **A flag, not the DSN.** The original spelling asked for the Postgres
+# connection string itself, and that ask was the bug: it put a live database
+# credential — user, password, host — into shell history and into the scrollback
+# of whatever terminal was open, to answer a question whose entire information
+# content is one bit. Predictably, it got skipped, and the deployment ran pinned
+# to a single API container while `/healthz` said `"store": "postgres"` and
+# looked entirely healthy. `CHORDS_DATABASE_URL` is still honoured so an existing
+# runbook or CI job does not silently regress, but it is no longer the way to
+# spell this.
+#
+# Neither one is a *proof*: both are the operator asserting what is in
+# `chords-secrets`, and nothing local can verify that. What closes the loop is
+# `scripts/smoke.py`, which reads `store` back off the running deployment — the
+# assertion here and the observation there have to agree, and the smoke run is
+# where a disagreement surfaces.
 #
 # Unset ⇒ the pin stays. Fail-safe direction: a deployment still on SQLite keeps
-# its single writer, and the cost of forgetting the variable is "correct but not
+# its single writer, and the cost of forgetting the flag is "correct but not
 # scaled out" rather than "silently losing writes". (Same reasoning, and the same
 # shape, as Mo's `modal_app.py`.)
-_ON_POSTGRES = bool(os.environ.get("CHORDS_DATABASE_URL"))
-MAX_CONTAINERS = None if _ON_POSTGRES else 1
+_SCALE_OUT = bool(os.environ.get("CHORDS_SCALE_OUT") or os.environ.get("CHORDS_DATABASE_URL"))
+MAX_CONTAINERS = None if _SCALE_OUT else 1
+
+# Say which one happened, on the deploy that chooses it. The pin's whole failure
+# mode is being invisible: a pinned deployment behaves correctly under any load
+# one person can generate, so it is discovered months later by a queue. `print`
+# rather than `log` deliberately — this runs in the deploy shell, before any
+# logging is configured, and the operator reading that output is the only
+# audience there will ever be.
+print(
+    f"[modal_app] API containers: {'unpinned (scaled out)' if _SCALE_OUT else 'PINNED TO 1'}"
+    + ("" if _SCALE_OUT else
+       " — set CHORDS_SCALE_OUT=1 to lift this once chords-secrets carries a"
+       " Postgres DSN. Leave it unset only if the deployment is still on SQLite.")
+)
 
 # How many containers a single job may be handed to before its egress block is
 # reported as a failure. **Two budgets, because the retry is doing two different

@@ -118,6 +118,70 @@ def test_polling_a_finished_job_returns_the_song_and_its_sidecar(client):
     assert body["videoSync"]["beatAnchors"]
 
 
+def test_polling_a_job_does_not_spend_the_budget_that_starts_one(settings, store):
+    """The defect that made long analyses report failure while they succeeded.
+
+    `POST /v1/analyze` returns a job id and the client polls until it is ready —
+    so a single analysis is one expensive request followed by however many cheap
+    ones the job's duration demands. Sharing one per-uid budget between the two
+    meant the cheap ones ate the expensive one's allowance and then started
+    429ing themselves: at ten a minute, any job over ~40 s rate-limited its own
+    status checks, and the client turned that into "that song couldn't be made".
+
+    Asserted as **more polls than the spend budget allows**, not as a specific
+    number, because the number is a deployment's business and the relationship is
+    the invariant.
+    """
+    app = create_app(replace(settings, rate_limit_per_min=2, rate_limit_poll_per_min=30),
+                     store=store, source=FakeSource(),
+                     runner=JobRunner(settings, store, FakeSource()))
+    with TestClient(app) as client:
+        job_id = client.post("/v1/analyze", json={"videoId": VIDEO}, headers=AUTH).json()["jobId"]
+        for _ in range(20):
+            assert client.get(f"/v1/analyze/{job_id}", headers=AUTH).status_code == 200
+
+
+def test_the_poll_budget_is_a_ceiling_not_an_exemption(settings, store):
+    """Cheap is not free. A client whose backoff has broken must still be stopped
+    — the fix is a bigger bucket for polls, not the absence of one."""
+    app = create_app(replace(settings, rate_limit_per_min=10, rate_limit_poll_per_min=3),
+                     store=store, source=FakeSource(),
+                     runner=JobRunner(settings, store, FakeSource()))
+    with TestClient(app) as client:
+        job_id = client.post("/v1/analyze", json={"videoId": VIDEO}, headers=AUTH).json()["jobId"]
+        codes = [client.get(f"/v1/analyze/{job_id}", headers=AUTH).status_code for _ in range(5)]
+    assert 429 in codes
+
+
+def test_a_poll_429_tells_the_client_how_long_to_wait(settings, store):
+    """`Retry-After` is what makes this recoverable rather than fatal: the client
+    treats a poll 429 as backpressure and sleeps, so a header that went missing
+    would put it straight back to guessing."""
+    app = create_app(replace(settings, rate_limit_per_min=10, rate_limit_poll_per_min=1),
+                     store=store, source=FakeSource(),
+                     runner=JobRunner(settings, store, FakeSource()))
+    with TestClient(app) as client:
+        job_id = client.post("/v1/analyze", json={"videoId": VIDEO}, headers=AUTH).json()["jobId"]
+        client.get(f"/v1/analyze/{job_id}", headers=AUTH)
+        response = client.get(f"/v1/analyze/{job_id}", headers=AUTH)
+    assert response.status_code == 429
+    assert response.json()["code"] == "rate_limited"
+    assert int(response.headers["Retry-After"]) >= 1
+
+
+def test_starting_a_job_is_still_limited_when_polling_is_generous(settings, store):
+    """The separation must not have widened the budget it was meant to protect —
+    the spending route is the one the limiter exists for."""
+    app = create_app(replace(settings, rate_limit_per_min=1, rate_limit_poll_per_min=60),
+                     store=store, source=FakeSource(),
+                     runner=JobRunner(settings, store, FakeSource()))
+    with TestClient(app) as client:
+        client.post("/v1/analyze", json={"videoId": "aaaaaaaaaaa"}, headers=AUTH)
+        response = client.post("/v1/analyze", json={"videoId": "bbbbbbbbbbb"}, headers=AUTH)
+    assert response.status_code == 429
+    assert response.json()["code"] == "rate_limited"
+
+
 def test_a_warm_request_returns_the_result_inline(client):
     """The common case once warm (§16.1)."""
     analyze(client)

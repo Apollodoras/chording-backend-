@@ -11,9 +11,17 @@ Two halves, because they fail for different reasons and at different times.
 production deployment must look like. Every check here corresponds to a way this
 service can come up *looking* healthy and be wrong: serving 401s to everyone
 because the Firebase credential didn't parse, pinned to a SQLite file that dies
-with the container because `CHORDS_DATABASE_URL` wasn't passed at deploy time,
-or unable to accept an analysis because the API container answered a question
-about its own capabilities instead of the worker's.
+with the container because `chords-secrets` has no DSN in it, or unable to accept
+an analysis because the API container answered a question about its own
+capabilities instead of the worker's.
+
+One thing this **cannot** see, and it is worth naming because a reasonable
+reading of the checks below says otherwise: `store: "postgres"` proves the
+*secret* carries a DSN, and says nothing about whether `CHORDS_SCALE_OUT` was
+passed at `modal deploy` time. Those are two independent settings that the
+original wording of both files ran together, and a deployment can perfectly well
+be on Postgres and still pinned to one API container. The deploy shell is the
+only place that answer exists — `modal_app.py` prints it there.
 
 **The analysis half** runs one real video end to end and then asks for it again.
 The second request is the interesting one: §16.4 says a cache hit is free, and
@@ -120,15 +128,29 @@ def check_health(*, expect_production: bool) -> dict:
               body.get("auth") not in {"dev-token", "open", "none"},
               f"auth mode is {body.get('auth')!r} — set CHORDS_REQUIRE_AUTH=1",
               info=f"mode {body.get('auth')!r}")
-        # SQLite here means CHORDS_DATABASE_URL was not passed at `modal deploy`
-        # time: the deployment is pinned to one container and its writes live on
-        # a disk that is not the database anyone else reads.
+        # SQLite here means `chords-secrets` has no CHORDS_DATABASE_URL in it:
+        # the container's writes live on a disk that is not the database anyone
+        # else reads, and die with it. (Whether the API is *also* pinned to one
+        # container is a separate deploy-shell setting this endpoint cannot see —
+        # see the module docstring.)
         check("store is Postgres", body.get("store") == "postgres",
-              f"store is {body.get('store')!r} — pass CHORDS_DATABASE_URL to `modal deploy`")
+              f"store is {body.get('store')!r} — add CHORDS_DATABASE_URL to chords-secrets")
         limits = body.get("rateLimit") or {}
         check("per-IP rate limit set", bool(limits.get("ipPerMin")),
               "CHORDS_RATE_LIMIT_IP_PER_MIN=0 — an unauthenticated flood is uncapped",
               info=f"{limits.get('ipPerMin')}/min", fatal=False)
+        # The relationship, not the number. A poll budget at or below the spend
+        # budget means a client polling a running job exhausts its own allowance
+        # and gets 429s for a job that is succeeding — which is what shipped, and
+        # what `_principal_polling` now separates. Warn rather than fail: a
+        # deployment with limiting off entirely is a legitimate (dev) shape, and
+        # both being zero is that shape rather than this bug.
+        uid_per_min, poll_per_min = limits.get("uidPerMin") or 0, limits.get("pollPerMin") or 0
+        check("job polling has its own, larger budget",
+              poll_per_min > uid_per_min or (uid_per_min == 0 and poll_per_min == 0),
+              f"pollPerMin={poll_per_min} vs uidPerMin={uid_per_min} — status checks "
+              "are competing with the requests that start jobs",
+              info=f"{poll_per_min}/min vs {uid_per_min}/min spend", fatal=False)
         # Egress, *only when this container can see it*. On the two-container
         # deployment it cannot: fetching lives in the worker and the API image
         # has `source=None` by design (§4), so `egress` is null here no matter

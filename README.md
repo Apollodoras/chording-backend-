@@ -508,10 +508,21 @@ take Mo down with it. (Modal app names are `[a-zA-Z0-9-_.]+`, so "Rosetta
 Dechorder" lands as that slug.)
 
 ```bash
-CHORDS_DATABASE_URL="$(the DSN in chords-secrets)" modal deploy modal_app.py
+CHORDS_SCALE_OUT=1 modal deploy modal_app.py                 # 1 ⇒ chords-secrets holds a Postgres DSN
 CHORDS_BASE_URL=https://…modal.run python scripts/smoke.py   # the API container
 modal run scripts/worker_check.py                            # the worker image
+modal run scripts/worker_env_check.py                        # the worker secret
 ```
+
+`CHORDS_SCALE_OUT` is the operator asserting what is in `chords-secrets`, so the
+API can be allowed more than one container (SQLite on a network volume tolerates
+exactly one writer; Postgres does not care). It used to be spelled as the DSN
+itself — which put a live database password in shell history to communicate one
+bit, and predictably got skipped, leaving the deployment pinned to one container
+while `/healthz` reported `"store": "postgres"` and looked perfectly healthy. The
+old spelling still works so existing runbooks do not silently re-pin. `modal
+deploy` prints which shape it chose; that line in the deploy output is the only
+place the answer exists.
 
 **Both halves, because neither can see the other.** `smoke.py` talks HTTP to the
 API container; §4 gives the worker its own image, and the only channel between
@@ -635,9 +646,14 @@ stands, nobody can.
 Two Modal Secrets, and the split is §19.2 applied one level further in:
 `chords-secrets` (API — Firebase, admin token, DSN) and
 `chords-worker-secrets` (worker — **no auth credentials at all**, since it never
-authenticates anyone). Passing `CHORDS_DATABASE_URL` at deploy time is what lifts
-the single-container pin; forgetting it leaves a SQLite deployment correctly
-pinned rather than silently losing writes.
+authenticates anyone). `CHORDS_SCALE_OUT=1` at deploy time is what lifts the
+single-container pin; forgetting it leaves a SQLite deployment correctly pinned
+rather than silently losing writes.
+
+What is *in* the worker secret is invisible from outside — `/healthz` reports the
+API container's own posture, and on this two-container shape that is correctly
+"no fetch, no engines, no egress". `scripts/worker_env_check.py` asks the worker
+instead, and prints key names and the proxy's scheme and host, never a value.
 
 Keep this deployment's credentials separate from Mo's (§19.2). Same Firebase
 project for identity, different service-account key: Mo never touches a
@@ -786,14 +802,18 @@ or a lawyer — every item below is console work, and none of it is code.
    - `chords-secrets` → `FIREBASE_PROJECT_ID`, `FIREBASE_SERVICE_ACCOUNT_JSON`,
      `CHORDS_REQUIRE_AUTH=1`, `CHORDS_ADMIN_TOKEN`, `CHORDS_DATABASE_URL`,
      `CHORDS_RATE_LIMIT_IP_PER_MIN` (60 is a reasonable start),
-     `CHORDS_RATE_LIMIT_PER_MIN` (10).
+     `CHORDS_RATE_LIMIT_PER_MIN` (10). `CHORDS_RATE_LIMIT_POLL_PER_MIN` is
+     deliberately **not** on this list: job-status polls need their own, much
+     larger budget, and defaulting it in code rather than in a hand-edited
+     secret is what makes that true of every deployment rather than of the ones
+     somebody remembered to update.
    - `chords-worker-secrets` → `CHORDS_DATABASE_URL` **and no auth credentials at
      all**. The worker authenticates nobody.
    - `CHORDS_DEV_TOKEN` must appear in neither — `CHORDS_REQUIRE_AUTH` refuses to
      start if it is set.
 6. **Deploy and gate it:**
    ```bash
-   CHORDS_DATABASE_URL="$(the DSN)" modal deploy modal_app.py
+   CHORDS_SCALE_OUT=1 modal deploy modal_app.py
    CHORDS_BASE_URL=https://…modal.run python scripts/smoke.py
    ```
 7. **One real analysis**, with a Firebase ID token for a verified account:

@@ -43,6 +43,11 @@ log = logging.getLogger("chords.store")
 
 RATE_SCOPE_UID = "uid"
 RATE_SCOPE_IP = "ip"
+# Cheap authenticated reads, counted against their own budget and keyed by uid
+# like `RATE_SCOPE_UID`. A separate *scope* rather than a separate limit on the
+# same one: sharing the scope would mean a poll still consumed a slot the
+# spending routes need, which is the defect this exists to fix.
+RATE_SCOPE_POLL = "poll"
 
 # Blocklist kinds (§3): a takedown may name one video or a whole channel.
 BLOCK_VIDEO = "video"

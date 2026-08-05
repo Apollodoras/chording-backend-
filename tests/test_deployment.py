@@ -404,3 +404,47 @@ def test_a_proxied_worker_retries_less_than_an_unproxied_one():
     # Insurance, not abolition: a rotating pool can still miss, and a proxied
     # deployment that never retries fails songs the second attempt would have got.
     assert budgets["MAX_EGRESS_ATTEMPTS_PROXIED"] >= 2
+
+
+def test_the_container_pin_is_lifted_by_a_flag_not_by_a_credential():
+    """`CHORDS_SCALE_OUT=1`, not the Postgres DSN.
+
+    The pin exists because SQLite on a network volume tolerates one writer, and
+    only the deploy shell can say whether the secret holds a DSN. Spelling that
+    assertion as the DSN *itself* meant a live database password had to be pasted
+    into a shell — into history, into scrollback — to communicate one bit. It got
+    skipped, exactly as that ask deserves, and the deployment ran pinned to a
+    single API container while `/healthz` reported `store: "postgres"` and looked
+    entirely fine.
+
+    Read out of the source rather than imported, for the reason in this module's
+    docstring. Both spellings must remain live: dropping `CHORDS_DATABASE_URL`
+    would silently re-pin any runbook or CI job still using it, which is the same
+    invisible regression in the other direction.
+    """
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "modal_app.py").read_text()
+    pin = next(line for line in source.splitlines() if line.startswith("_SCALE_OUT"))
+    assert "CHORDS_SCALE_OUT" in pin, (
+        "the pin must be liftable without putting a database credential in the "
+        "deploy shell"
+    )
+    assert "CHORDS_DATABASE_URL" in pin, (
+        "the old spelling must keep working, or an existing runbook silently "
+        "re-pins the deployment to one container"
+    )
+
+
+def test_the_deploy_says_out_loud_which_container_shape_it_chose():
+    """The pin's failure mode is being invisible, not being wrong.
+
+    A pinned API container behaves correctly under any load one person can
+    generate; it is discovered later, by a queue. `modal deploy` runs this module
+    locally, so the deploy shell is the only place the answer exists and the only
+    place it can be reported.
+    """
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "modal_app.py").read_text()
+    assert "print(" in source and "PINNED TO 1" in source
