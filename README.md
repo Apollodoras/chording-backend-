@@ -49,7 +49,7 @@ App Review 5.2.3 stays a non-event — is [`RIGHTS.md`](RIGHTS.md).
 | §16 API | ✅ Mo-shaped: Firebase bearer, `{message, code}` errors, job-id + poll |
 | §16.5 contract fixtures | ✅ emitted and byte-stable; the app-side test is a small follow-up (below) |
 | §5.1 fetch + decode | ✅ yt-dlp + ffmpeg, bounded, behind the §4 seam — **plus an upload path** with no YouTube-terms exposure ([`RIGHTS.md`](RIGHTS.md)) |
-| egress | ✅ per-IP bot check measured, retry across containers, and a proxy-aware retry budget — `CHORDS_YTDLP_PROXY` is unset and is the owner's call ([below](#the-bot-check-is-per-ip-and-cookies-do-not-fix-it)) |
+| egress | ✅ **`CHORDS_YTDLP_PROXY` is live** (IPRoyal residential, rotating) — verified clearing the bot check on the first attempt, twice, on real audio ([below](#the-bot-check-is-per-ip-and-cookies-do-not-fix-it)) |
 | the beat axis | ✅ one origin for chart, bars and anchors (`axis.py`) — the defect that cost 23 points |
 | §5.2/§5.3 engines | ✅ **BTC + Beat This!**, benchmarked against real recordings (below) |
 | §4 two-container shape | ✅ the API delegates to the worker; `tests/test_deployment.py` covers what `modal_app.py` relies on |
