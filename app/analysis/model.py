@@ -151,9 +151,12 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
     # collapse with `repeats`, which they could not before.
     sections, groups = form.detect(bars, bar_beats=bar_beats, energy=bar_energy)
 
+    # The song's own meter, not `f"{bar_beats}/4"`: `bar_beats` is quarter-note
+    # beats, so synthesising a signature from it labelled every 6/8 song's
+    # patterns "3/4" — the same bar length, and a meter the song is not in.
     patterns = _patterns(groups, sections, onsets=onsets, axis=axis,
                          bar_beats=bar_beats, tempo=meter.tempo,
-                         time_signature=f"{axis.bar_beats}/4")
+                         time_signature=meter.time_signature)
 
     return SongModel(
         meter=meter, axis=axis, key=key, sections=sections, groups=groups,

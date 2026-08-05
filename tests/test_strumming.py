@@ -18,8 +18,17 @@ from app.analysis.strumming import (
     fallback,
     fold_onsets,
 )
+from app.analysis.types import Onset
 from app.chords import MAJOR  # noqa: F401  (keeps the import surface honest)
-from tests.conftest import BAR_BEATS, DDUUDU, MS_PER_BEAT, known_beats, known_onsets
+from tests.conftest import (
+    BAR_BEATS,
+    DDUUDU,
+    MS_PER_BEAT,
+    ghost_sixteenths,
+    jittered_onsets,
+    known_beats,
+    known_onsets,
+)
 
 
 # --- the convention ---------------------------------------------------------
@@ -69,8 +78,30 @@ def test_subdivision_prefers_the_coarsest_grid_that_explains_the_onsets():
 def test_folding_lays_every_bar_on_top_of_every_other():
     folded = fold_onsets(known_onsets(), known_beats(), bar_beats=BAR_BEATS,
                          first_beat=0, last_beat=16)
-    positions = sorted({round(p, 3) for p, _ in folded})
+    positions = sorted({round(o.position, 3) for o in folded})
     assert positions == DDUUDU
+
+
+def test_folding_remembers_which_bar_each_onset_came_from():
+    """Support is a share of *bars*, so the fold has to carry bar identity — a
+    bar with a flam or a doubled drum hit must not stand in for two bars of
+    evidence."""
+    folded = fold_onsets(known_onsets(), known_beats(), bar_beats=BAR_BEATS,
+                         first_beat=0, last_beat=16)
+    assert sorted({o.bar for o in folded}) == [0, 1, 2, 3]
+    downbeats = [o for o in folded if abs(o.position) < 0.01]
+    assert sorted(o.bar for o in downbeats) == [0, 1, 2, 3]
+
+
+def test_a_bar_that_repeats_a_stroke_is_still_one_bar_of_evidence():
+    """`support = onsets / bars` let a flam count twice: struck in 7 bars of 16
+    but hit 14 times, these cells scored 0.875 and entered the pattern. Counted
+    as a share of bars they are 0.44 — a fill, and below the threshold."""
+    played_in = range(7)
+    doubled = [(bar, position, 1.0) for bar in played_in for position in (0.0, 2.0)] + \
+              [(bar, position + 0.02, 1.0) for bar in played_in for position in (0.0, 2.0)]
+    result = extract(doubled, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
+    assert result.is_fallback
 
 
 def test_the_known_song_extracts_as_d_du_ud_u():
@@ -97,9 +128,63 @@ def test_the_downbeat_reads_as_accented():
 def test_a_one_off_fill_never_enters_the_repeating_pattern():
     """An onset that happens in a third of the bars is a fill; putting it in the
     pattern makes every bar wrong instead of one bar right."""
-    folded = [(0.0, 1.0)] * 8 + [(2.0, 1.0)] * 8 + [(1.25, 1.0)] * 2
+    folded = [(bar, 0.0, 1.0) for bar in range(8)] + \
+             [(bar, 2.0, 1.0) for bar in range(8)] + \
+             [(bar, 1.25, 1.0) for bar in range(2)]
     result = extract(folded, bar_beats=BAR_BEATS, bars=8, tempo=120, name="Verse strum")
     assert [s.beat for s in result.pattern.strokes] == [0.0, 2.0]
+
+
+# --- what real recordings do to all of the above -----------------------------
+
+def test_the_known_song_survives_jitter_around_the_barline():
+    """The defect this file could not see. Onsets never land exactly on the grid,
+    and a downbeat is far likelier to be early than late — a hand 20 ms ahead of
+    the "one" folds to ~3.98, the far end of the bar, where no cell could claim
+    it. The beat-1 stroke silently disappeared and the extraction still reported
+    confidence 1.0 in what was left."""
+    folded = fold_onsets(jittered_onsets(), known_beats(), bar_beats=BAR_BEATS,
+                         first_beat=0, last_beat=64)
+    result = extract(folded, bar_beats=BAR_BEATS, bars=16, tempo=120, name="Verse strum")
+    assert not result.is_fallback
+    assert [s.beat for s in result.pattern.strokes] == DDUUDU
+    assert [s.direction for s in result.pattern.strokes] == \
+        ["down", "down", "up", "up", "down", "up"]
+
+
+def test_an_onset_ahead_of_the_downbeat_supports_the_bar_it_anticipates():
+    """Rolled forward onto the "one" it was reaching for — so it is evidence for
+    the next bar, not for the bar it was played at the end of. Getting this wrong
+    would show up as a downbeat supported by every bar but the first."""
+    early = [Onset(t_ms=int(bar * BAR_BEATS * MS_PER_BEAT) - 20, strength=1.0)
+             for bar in range(1, 8)]
+    folded = fold_onsets(early, known_beats(), bar_beats=BAR_BEATS,
+                         first_beat=0, last_beat=32)
+    assert all(abs(o.position) <= 0.12 for o in folded)
+    assert sorted(o.bar for o in folded) == [1, 2, 3, 4, 5, 6, 7]
+
+
+def test_one_sixteenth_ghost_does_not_flip_every_upstroke_to_a_downstroke():
+    """A hi-hat on one 16th of every bar is present in every drummed recording.
+    Scored by share of onsets it carried the grid from 8ths to 16ths, and since
+    direction is read off the grid, the "&"s at 1.5 and 2.5 flipped from up to
+    down — D-DU-UD-U degrading toward all-downstrokes."""
+    folded = fold_onsets(known_onsets() + ghost_sixteenths(), known_beats(),
+                         bar_beats=BAR_BEATS, first_beat=0, last_beat=64)
+    result = extract(folded, bar_beats=BAR_BEATS, bars=16, tempo=120, name="Verse strum")
+    assert [s.beat for s in result.pattern.strokes] == DDUUDU
+    assert [s.direction for s in result.pattern.strokes] == \
+        ["down", "down", "up", "up", "down", "up"]
+
+
+def test_a_real_sixteenth_feel_still_reads_as_sixteenths():
+    """The guard above must not deafen the extractor to genuine 16ths — two per
+    bar is a feel, not a ghost."""
+    positions = (0.0, 0.75, 1.0, 1.75, 2.0, 3.0)
+    folded = [(bar, p, 1.0) for bar in range(16) for p in positions]
+    result = extract(folded, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
+    assert [s.beat for s in result.pattern.strokes] == list(positions)
+    assert [s.direction for s in result.pattern.strokes][:2] == ["down", "up"]
 
 
 # --- degrading honestly -----------------------------------------------------
@@ -108,12 +193,30 @@ def test_thin_support_falls_back_to_quarter_note_downstrokes():
     """A boring pattern that plays is worth more than a confident one that's
     wrong — and the app *requires* a pattern, or the section is silently
     dropped."""
-    result = extract([(0.3, 1.0), (2.7, 1.0)], bar_beats=BAR_BEATS, bars=16,
+    result = extract([(0, 0.3, 1.0), (0, 2.7, 1.0)], bar_beats=BAR_BEATS, bars=16,
                      tempo=120, name="Verse strum")
     assert result.is_fallback
     assert [s.beat for s in result.pattern.strokes] == [0.0, 1.0, 2.0, 3.0]
     assert all(s.direction == "down" for s in result.pattern.strokes)
     assert result.confidence == 0.0
+
+
+def test_one_chord_a_bar_is_a_pattern_when_it_is_played_every_bar():
+    """A slow ballad struck once a bar was replaced by the four-downstroke
+    fallback — *more* strokes than the recording has, presented as the honest
+    floor. One stroke is a pattern when the evidence is unambiguous."""
+    folded = [(bar, 0.0, 1.0) for bar in range(16)]
+    result = extract(folded, bar_beats=BAR_BEATS, bars=16, tempo=120, name="Verse strum")
+    assert not result.is_fallback
+    assert [s.beat for s in result.pattern.strokes] == [0.0]
+
+
+def test_one_stroke_in_half_the_bars_is_still_not_a_pattern():
+    """The floor moved for the unambiguous case only; a lone half-supported cell
+    has nothing else in the bar to corroborate it."""
+    folded = [(bar, 0.0, 1.0) for bar in range(9)]
+    result = extract(folded, bar_beats=BAR_BEATS, bars=16, tempo=120, name="Verse strum")
+    assert result.is_fallback
 
 
 def test_no_onsets_at_all_still_produces_a_playable_bar():

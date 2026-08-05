@@ -137,8 +137,15 @@ class LibrosaOnsetDetector:
         import numpy as np
 
         envelope = librosa.onset.onset_strength(y=pcm, sr=sr, hop_length=HOP)
+        # `backtrack=False` on purpose. Backtracking rolls each detection back to
+        # the preceding energy minimum, which is what you want when slicing audio
+        # into samples and wrong when you want the time a hand struck: it moves
+        # every onset earlier, by an amount that depends on the attack's shape.
+        # §14 folds these onto a bar, so a systematic early bias is not noise
+        # that averages out — it walks the whole pattern off the grid, and the
+        # downbeat (the one cell with a bar boundary in front of it) off first.
         frames = librosa.onset.onset_detect(
-            onset_envelope=envelope, sr=sr, hop_length=HOP, backtrack=True
+            onset_envelope=envelope, sr=sr, hop_length=HOP, backtrack=False
         )
         if len(frames) == 0:
             return []

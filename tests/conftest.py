@@ -15,6 +15,7 @@ predictable, so a test can assert "the third bar's chord is Em" rather than
 
 from __future__ import annotations
 
+import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,6 +102,46 @@ def known_onsets() -> list[Onset]:
                 strength=1.6 if offset == 0.0 else 1.0,
             ))
     return onsets
+
+
+def jittered_onsets(*, spread_ms: int = 30, bias_ms: int = -12) -> list[Onset]:
+    """`known_onsets`, played by hands instead of by a sequencer.
+
+    Two things separate a real detection from the exact grid every strumming
+    fixture used before this one, and the pattern extractor has to survive both:
+
+    - **spread** — no onset lands exactly on its cell;
+    - **bias** — the detector's onsets skew *early*. That is the direction that
+      matters, because an onset ahead of the downbeat wraps to the far end of the
+      bar when folded, and for a long time nothing there could claim it.
+
+    Deterministic (a fixed seed): a fixture that fails one run in twenty is worse
+    than no fixture.
+    """
+    rng = random.Random(20260804)
+    onsets: list[Onset] = []
+    for bar in range(TOTAL_BEATS // BAR_BEATS):
+        bar_start = bar * BAR_BEATS * MS_PER_BEAT
+        for offset in DDUUDU:
+            wobble = rng.uniform(-spread_ms, spread_ms) + bias_ms
+            onsets.append(Onset(
+                t_ms=int(bar_start + offset * MS_PER_BEAT + wobble),
+                strength=1.6 if offset == 0.0 else 1.0,
+            ))
+    return sorted(onsets, key=lambda o: o.t_ms)
+
+
+def ghost_sixteenths(*, position: float = 1.25) -> list[Onset]:
+    """One 16th-note hi-hat per bar — what a full mix always adds to the strums.
+
+    Quiet (a ghost note is not a strum) and perfectly consistent, which is the
+    combination that used to drag the whole grid to 16ths on the strength of a
+    sixth of the onsets.
+    """
+    return [
+        Onset(t_ms=int((bar * BAR_BEATS + position) * MS_PER_BEAT), strength=0.35)
+        for bar in range(TOTAL_BEATS // BAR_BEATS)
+    ]
 
 
 def known_meta(video_id: str = "dQw4w9WgXcQ") -> VideoMeta:

@@ -567,7 +567,7 @@ per-string picking (the field exists; don't use it), no swing parameter.
 | Dimension | Recoverable? | How |
 |---|---|---|
 | **Onset positions** | Yes | onset detection (`librosa.onset`, or madmom's) folded onto the beat grid |
-| **Subdivision** (8ths vs 16ths) | Yes | histogram onsets modulo the bar; pick the grid that explains them |
+| **Subdivision** (8ths vs 16ths) | Yes | quantize onsets modulo the bar; pick the coarsest grid they sit on |
 | **Accent** | Roughly | onset strength relative to the bar's mean |
 | **Direction (down/up)** | **No — infer by convention** | see below |
 | **Mute / percussive** | Not reliably in a full mix | **don't emit `mute`** |
@@ -580,12 +580,30 @@ it for detection. It is also *correct* far more often than not, because that is 
 the instrument is physically played.
 
 **Method that works:** per section, fold that section's onsets onto one bar of the
-beat grid → histogram over candidate subdivisions → keep positions above a support
+beat grid → score candidate subdivisions → keep positions above a support
 threshold → assign directions by the rule above → emit one `PatternPayload` per
 distinct section pattern. If support is too thin or too noisy, **fall back to a plain
 quarter-note downstroke bar** — a boring pattern that plays is worth more than a
 confident one that's wrong. Carry a `patternConfidence` in `videoSync` so the client
 can say so.
+
+Three details in that sentence are load-bearing, and each one shipped a defect
+before it was got right (`app/analysis/strumming.py` carries the full reasoning):
+
+- **The bar is a loop, not a line.** A hand is rarely late to the "one" and often
+  early, so folding modulo the bar puts downbeat strokes at the *far end* of it.
+  Match cells around the bar and roll an anticipating onset forward onto the
+  downbeat it was reaching for, or the beat-1 stroke silently vanishes from
+  patterns extracted off real recordings while confidence in the rest stays 1.0.
+  For the same reason, run onset detection with **`backtrack=False`**: backtracking
+  is a slicing feature and biases every onset early.
+- **Score subdivisions by average error, not by how many onsets "fit".** Every 8th
+  is also a 16th, so a fit count always leans finer, and one consistent hi-hat 16th
+  per bar — i.e. every drummed recording — is enough to carry the grid to 16ths.
+  Since direction is read off the grid, that flips every "&" in the bar from an
+  upstroke to a downstroke.
+- **Support is a share of bars, not of onsets.** Otherwise one bar with a flam
+  stands in for two bars of evidence.
 
 **Don't over-fit.** Campfire shows the pattern as direction triangles under the bar and
 the player strums through it; a 16-onset syncopated transcription of a strummed

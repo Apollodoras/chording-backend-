@@ -57,7 +57,7 @@ from dataclasses import dataclass
 
 from . import harmony
 from .form import RepeatGroup, bar_similarity
-from .strumming import ExtractedPattern, extract, fallback, fold_onsets
+from .strumming import ExtractedPattern, FoldedOnset, extract, fallback, fold_onsets
 from .structure import BarChord
 from .types import Onset
 
@@ -260,7 +260,7 @@ def pattern_for_group(group: RepeatGroup, *, onsets: list[Onset], axis,
         return fallback(bar_beats=bar_beats, tempo=tempo, name=name,
                         time_signature=time_signature)
 
-    folded: list[tuple[float, float]] = []
+    folded: list[FoldedOnset] = []
     bars = 0
     for start in group.occurrences:
         first_beat = start * bar_beats

@@ -126,6 +126,25 @@ def test_sections_of_one_group_share_a_groove():
         assert section.group in model.patterns
 
 
+def test_a_pattern_names_the_meter_the_song_is_actually_in():
+    """`bar_beats` is *quarter-note* beats, so 6/8 arrives as 3.0 — and building
+    the pattern's signature back out of it as f"{bar_beats}/4" shipped every 6/8
+    song a chart in 6/8 whose patterns claimed 3/4. Same bar length, so nothing
+    played wrong and nothing failed the lint; the label was simply a lie, and
+    `strumming`'s docstring promises the opposite."""
+    beats = [i * BEAT_MS for i in range(16 * 3 + 1)]
+    grid = BeatGrid(beats_ms=beats, downbeats_ms=beats[::3], bpm=120.0,
+                    confidence=0.9, time_signature="6/8")
+    raw = [RawChordSpan(start_ms=i * BEAT_MS * 3, end_ms=(i + 1) * BEAT_MS * 3,
+                        label=("C", "G", "Am", "F")[i % 4], confidence=0.9)
+           for i in range(16)]
+    model = song_model.build(grid=grid, raw=raw, onsets=[])
+    assert model is not None
+    assert model.meter.time_signature == "6/8"
+    assert model.axis.bar_beats == 3          # the bar is still three quarter-beats
+    assert {p.pattern.timeSignature for p in model.patterns.values()} == {"6/8"}
+
+
 # --- energy ------------------------------------------------------------------
 
 def test_a_loudness_curve_becomes_one_number_per_bar():

@@ -8,7 +8,7 @@ in every emitted pattern's `tags`:
 | Dimension | Recoverable | How |
 |---|---|---|
 | onset positions | yes | fold this section's onsets onto one bar of the grid |
-| subdivision (8ths vs 16ths) | yes | histogram onsets modulo the bar; keep the grid that explains them |
+| subdivision (8ths vs 16ths) | yes | quantize onsets modulo the bar; keep the coarsest grid they sit on |
 | accent | roughly | onset strength against the bar's own mean |
 | **direction (down/up)** | **no — convention** | the alternating-hand rule, below |
 | mute / percussive | not in a full mix | **never emitted** |
@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from ..payload import PATTERN_PREFIX, PatternPayload, Stroke, derived_uuid
 from .axis import position_in
@@ -54,6 +55,13 @@ SUPPORT_THRESHOLD = 0.5
 # How close (in beats) an onset must sit to a grid cell to count as landing on it.
 TOLERANCE_BEATS = 0.12
 
+# How much *average* quantization error a coarser grid may cost before the finer
+# one is worth taking (see `choose_subdivision`). 0.05 beats is 25 ms at 120 bpm
+# — under the tolerance above, so a grid is never refined for timing jitter, and
+# small enough that a real subdivision (which costs a quarter-beat per onset it
+# cannot place) always clears it.
+SUBDIVISION_MARGIN_BEATS = 0.05
+
 # Louder than this multiple of the bar's mean onset strength reads as an accent.
 ACCENT_RATIO = 1.35
 
@@ -61,11 +69,30 @@ ACCENT_RATIO = 1.35
 # the quarter-note fallback is used instead.
 MIN_STROKES = 2
 
+# ...unless the one stroke is played this reliably. A chord struck on the downbeat
+# of nine bars in ten is a real (if sparse) pattern — slow ballads are played that
+# way — and replacing it with the four-downstroke fallback puts *more* strokes in
+# the bar than the recording has.
+SOLID_SUPPORT = 0.9
+
 DOWN, UP = "down", "up"
 
 # Tags every emitted pattern carries, so nobody downstream — or in six months —
 # mistakes the direction assignment for detection.
 CONVENTION_TAGS = ["yt", "extracted", "directions-by-convention"]
+
+
+class FoldedOnset(NamedTuple):
+    """One onset laid onto the pattern bar, with the bar it came from.
+
+    The bar identity is not decoration: support is "in how many *bars* was this
+    stroke played", and counting onsets instead lets one bar with a flam or a
+    doubled drum hit stand in for two bars of evidence.
+    """
+
+    bar: int
+    position: float     # bar-local, in quarter-note beats
+    strength: float
 
 
 @dataclass(frozen=True)
@@ -86,8 +113,8 @@ beat_position = position_in
 
 
 def fold_onsets(onsets: list[Onset], axis, *, bar_beats: float,
-                first_beat: float, last_beat: float) -> list[tuple[float, float]]:
-    """Onsets inside a beat range → (bar-local beat position, strength).
+                first_beat: float, last_beat: float) -> list[FoldedOnset]:
+    """Onsets inside a beat range → `FoldedOnset`s on one bar of the grid.
 
     "Folding" is the whole trick: every bar of a section is laid on top of every
     other, so a stroke played in all eight bars shows up as eight onsets at the
@@ -98,39 +125,84 @@ def fold_onsets(onsets: list[Onset], axis, *, bar_beats: float,
     position is taken modulo the bar, so folding against a beat list whose
     origin differs from the chart's would put every stroke on the wrong side of
     the beat.
+
+    **A downbeat stroke is rarely late and often early.** Taken modulo the bar,
+    a hand that arrives 20 ms *ahead* of the "one" folds to ~3.98 rather than
+    ~0.0 — the far end of the bar, supporting nothing. Nobody plays there; they
+    played the downbeat of the *next* bar and got there first. So an onset within
+    tolerance of the top of the bar is rolled forward onto that downbeat, which
+    is both where it belongs on the grid and which bar it is evidence for. The
+    bar index is global (it counts from the song's beat 0, not from
+    `first_beat`), so pooling several occurrences of the same section keeps their
+    bars distinct.
     """
     locate = axis.position_at if hasattr(axis, "position_at") else \
         (lambda t: position_in(axis, t))
-    folded: list[tuple[float, float]] = []
+    origin_bar = int(round(first_beat / bar_beats))
+    # A stroke anticipating the downbeat that *ends* the range belongs to the
+    # next section, not this one — it is evidence for a bar we are not folding.
+    bar_limit = origin_bar + int(round((last_beat - first_beat) / bar_beats))
+    folded: list[FoldedOnset] = []
     for onset in onsets:
         position = locate(onset.t_ms)
         if position < first_beat - TOLERANCE_BEATS or position >= last_beat:
             continue
-        local = (position - first_beat) % bar_beats
-        folded.append((local, onset.strength))
+        offset = position - first_beat
+        bar = origin_bar + int(offset // bar_beats)
+        local = offset % bar_beats
+        if local > bar_beats - TOLERANCE_BEATS:
+            local -= bar_beats          # a small negative: just shy of the "one"
+            bar += 1
+        if bar >= bar_limit:
+            continue
+        folded.append(FoldedOnset(bar=bar, position=local, strength=onset.strength))
     return folded
 
 
 def choose_subdivision(positions: list[float]) -> int:
-    """The coarsest grid that explains most of the onsets.
+    """The coarsest grid the onsets sit on, scored by mean quantization error.
 
-    Scored by the share of onsets landing within tolerance of a cell. Coarsest
-    that comes within a small margin of the best wins, because 16ths explain
-    everything 8ths explain (every 8th is also a 16th) and picking the finest
-    grid would invent syncopation out of timing jitter.
+    Each grid is scored by how far, on average, an onset lies from its nearest
+    cell — and coarsest-first wins, but only where "coarser" actually means
+    "less detail about the same grid":
+
+    - Against a grid it **nests inside** (every 8th is also a 16th) the coarser
+      one wins unless the finer one is better by more than
+      `SUBDIVISION_MARGIN_BEATS`. This is §14's "don't over-fit": without the
+      bias, timing jitter alone would always favour the finest grid and invent
+      syncopation out of it.
+    - Against a grid it **doesn't** nest inside, the better fit simply wins.
+      Triplets and 16ths are different feels, not two resolutions of one grid, and
+      3 is only nominally coarser than 4 — a 16th sits just 1/12 of a beat off a
+      triplet cell, so a margin measured in beats would hand every 16th-note
+      pattern to the triplet grid.
+
+    Mean error is also what makes this survive a full mix. Scored by *share of
+    onsets explained*, one consistent hi-hat 16th per bar — a sixth of the
+    onsets, and present in every drummed recording — was enough to carry the vote
+    to 16ths, and since `direction_for` reads the grid, every "&" in the bar
+    flipped from an upstroke to a downstroke. Averaged instead, that ghost costs
+    a quarter-beat spread across the bar's strokes and changes nothing; two of
+    them per bar, which is a real 16th feel, still wins.
     """
     if not positions:
         return 1
     scores: dict[int, float] = {}
     for subdivision in SUBDIVISIONS:
         cell = 1.0 / subdivision
-        hits = sum(1 for p in positions if abs(p / cell - round(p / cell)) * cell <= TOLERANCE_BEATS)
-        scores[subdivision] = hits / len(positions)
-    best = max(scores.values())
+        error = sum(abs(p / cell - round(p / cell)) * cell for p in positions)
+        scores[subdivision] = error / len(positions)
+
     for subdivision in SUBDIVISIONS:
-        if scores[subdivision] >= best - 0.1:
-            return subdivision
-    return 1
+        finer = [s for s in SUBDIVISIONS if s > subdivision]
+        nested = [s for s in finer if s % subdivision == 0]
+        rivals = [s for s in finer if s % subdivision != 0]
+        if any(scores[subdivision] > scores[s] + SUBDIVISION_MARGIN_BEATS for s in nested):
+            continue
+        if any(scores[subdivision] > scores[s] for s in rivals):
+            continue
+        return subdivision
+    return SUBDIVISIONS[-1]
 
 
 def direction_for(position: float, subdivision: int) -> str:
@@ -144,12 +216,12 @@ def direction_for(position: float, subdivision: int) -> str:
     return DOWN if cell % 2 == 0 else UP
 
 
-def extract(onsets_in_bar: list[tuple[float, float]], *, bar_beats: float, bars: int,
+def extract(onsets_in_bar: list[FoldedOnset], *, bar_beats: float, bars: int,
             tempo: int, name: str, time_signature: str = "4/4") -> ExtractedPattern:
     """Folded onsets → one bar of strokes (§14's method, end to end).
 
     `bars` is how many bars were folded together, and it is what turns a raw
-    count into support: three onsets at the same position means everything across
+    count into support: a stroke played in three bars means everything across
     three bars and nothing across sixteen.
 
     `bar_beats` is quarter-note beats (the app's unit — ``n × 4/d``), so 6/8
@@ -161,19 +233,24 @@ def extract(onsets_in_bar: list[tuple[float, float]], *, bar_beats: float, bars:
         return fallback(bar_beats=max(1.0, bar_beats), tempo=tempo, name=name,
                         time_signature=time_signature)
 
-    subdivision = choose_subdivision([p for p, _ in onsets_in_bar])
+    folded = [FoldedOnset(*onset) for onset in onsets_in_bar]
+    subdivision = choose_subdivision([onset.position for onset in folded])
     cell = 1.0 / subdivision
     cells = int(round(bar_beats * subdivision))
 
     kept: list[tuple[float, float, float]] = []   # (position, support, mean strength)
     for index in range(cells):
         position = index * cell
-        matched = [s for p, s in onsets_in_bar if abs(p - position) <= TOLERANCE_BEATS]
-        support = len(matched) / bars
+        matched = [o for o in folded
+                   if _distance_in_bar(o.position, position, bar_beats) <= TOLERANCE_BEATS]
+        # Support is a share of *bars*, not of onsets: a cell struck twice in half
+        # the bars is half-supported, however many onsets that is.
+        support = len({o.bar for o in matched}) / bars
         if support >= SUPPORT_THRESHOLD:
-            kept.append((position, min(1.0, support), sum(matched) / len(matched)))
+            kept.append((position, min(1.0, support),
+                         sum(o.strength for o in matched) / len(matched)))
 
-    if len(kept) < MIN_STROKES:
+    if not _is_a_pattern(kept):
         # Too thin or too noisy to be a pattern. A boring bar that plays is worth
         # more than a confident one that's wrong.
         return fallback(bar_beats=bar_beats, tempo=tempo, name=name,
@@ -193,6 +270,28 @@ def extract(onsets_in_bar: list[tuple[float, float]], *, bar_beats: float, bars:
     confidence = sum(support for _, support, _ in kept) / len(kept)
     pattern = _pattern(strokes, time_signature=time_signature, tempo=tempo, name=name)
     return ExtractedPattern(pattern=pattern, confidence=round(confidence, 3))
+
+
+def _distance_in_bar(position: float, cell: float, bar_beats: float) -> float:
+    """How far an onset is from a cell, **around** the bar rather than along it.
+
+    The bar is a loop, not a line: the last cell and the downbeat are adjacent,
+    one grid step apart. Measured linearly, an onset a hair ahead of the "one"
+    sits a whole bar away from it and no cell can claim it — which is exactly how
+    the beat-1 stroke used to vanish from patterns extracted off real recordings
+    while the extraction still reported full confidence in the rest.
+    """
+    direct = abs(position - cell)
+    return min(direct, bar_beats - direct)
+
+
+def _is_a_pattern(kept: list[tuple[float, float, float]]) -> bool:
+    """Whether the kept cells are worth emitting instead of the fallback."""
+    if len(kept) >= MIN_STROKES:
+        return True
+    # One stroke is a pattern only when it is played almost every bar; anything
+    # less is a coincidence with nothing else in the bar to corroborate it.
+    return len(kept) == 1 and kept[0][1] >= SOLID_SUPPORT
 
 
 def fallback(*, bar_beats: float, tempo: int, name: str,
