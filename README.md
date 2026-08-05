@@ -738,6 +738,31 @@ Three consequences worth building on:
    Unproxied is a real deployment; it just means the success rate tracks
    Google's datacentre policy rather than anything in this repo.
 
+   **Rotation has to be per *fetch*, not per *request* — a third load-bearing
+   word** (2026-08-05). "Randomize IP" is the setting a rotating pool ships with,
+   and it rotates on every HTTP request. yt-dlp makes several per fetch, and a
+   `googlevideo` media URL is **bound to the IP that resolved it**, so the player
+   response arrives on one address and the bytes are requested from another:
+   **HTTP 403**, every time, while `probe` — which needs no such consistency —
+   succeeds and makes the job look healthy right up to the download. Measured in
+   the worker image, download stage, per attempt:
+
+   | video | per-request rotation | sticky session |
+   |---|---|---|
+   | `8ui9umU0C2g` (official label upload) | **0/3** — 403, 403, bot | 2/3 |
+   | `36X3wecT2z8` blues-in-e | 2/3 | 3/3 |
+   | `85Sqw6FTxm4` canon-fingerstyle | 2/3 | 3/3 |
+
+   The binding is enforced on label-owned content and slack on ordinary uploads —
+   which is precisely why all three gates stayed green while a real user could not
+   play an official music video. `ytdlp_source._sticky_proxy` therefore pins a
+   fresh `_session-<id>_lifetime-10m` per yt-dlp invocation: sticky *within* one
+   fetch, a new draw *between* fetches, so `EgressBlocked` still has somewhere to
+   retry into. Do **not** pin a session in `CHORDS_YTDLP_PROXY` itself — that is
+   one address for every job forever, i.e. the static-datacentre failure above.
+   `real_song_check.py`'s `label-owned-fetch` entry exists to fail if this
+   regresses.
+
 3. **Label-owned music is a second, separate wall.** Every official Beatles
    upload in `bench/corpus.json` is refused in every player client. On the one
    occasion cookies *did* clear the bot check, YouTube answered with storyboard

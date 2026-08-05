@@ -70,6 +70,24 @@ SONGS = {
         "expect": {"C", "A", "F", "G", "E"},
         "note": "Vocal + guitar. Tests a real arrangement rather than an instrumental.",
     },
+    # -- the label-owned fetch path, which nothing else here covers ------------
+    "label-owned-fetch": {
+        "videoId": "8ui9umU0C2g",
+        "title": "Manchester Orchestra - The Silence (Official Music Video)",
+        "expect": set(),
+        "fetchOnly": True,
+        "note": ("An *official label upload that is nonetheless fetchable*, and the "
+                 "only entry here that is. Every other default is an ordinary "
+                 "upload, and the Isophonics ids are label-owned but blocked — so "
+                 "between them they left a gap that a real user fell into: "
+                 "label-owned media URLs are IP-bound, which made per-request "
+                 "proxy rotation 403 the download 3/3 while the probe succeeded "
+                 "and while all four ordinary uploads passed. This exists to fail "
+                 "if `_sticky_proxy` ever stops pinning a session. Chord roots are "
+                 "deliberately not asserted — it is here for the fetch, and "
+                 "inventing an expected key for a song nobody verified would make "
+                 "the gate lie in the other direction."),
+    },
     # -- the Isophonics ids, kept for the record. All bot-checked. -------------
     "iso-let-it-be": {"videoId": "CGj85pVzRJs", "title": "Let It Be (Isophonics)",
                       "expect": {"C", "G", "A", "F"}, "isophonics": True,
@@ -82,7 +100,8 @@ SONGS = {
                      "truth": {"tempo": 117.42, "meter": "4/4", "chords": 92}},
 }
 
-DEFAULT_SONGS = ("blues-in-e", "canon-fingerstyle", "canon-rock", "hallelujah-cover")
+DEFAULT_SONGS = ("blues-in-e", "canon-fingerstyle", "canon-rock", "hallelujah-cover",
+                 "label-owned-fetch")
 ISOPHONICS = tuple(name for name, song in SONGS.items() if song.get("isophonics"))
 
 
@@ -229,6 +248,7 @@ def analyze_one(name: str) -> dict:
     in_expected = sum(count for root, count in distinct.items() if root in expect)
     report["expectedRoots"] = sorted(expect)
     report["shareInExpectedRoots"] = round(in_expected / len(roots), 3) if roots else 0.0
+    report["fetchOnly"] = bool(song.get("fetchOnly"))
 
     for key in ("bpm", "tempo", "timeSignature", "meter", "key", "keyName"):
         if key in wire:
@@ -257,10 +277,16 @@ def _verdict(reports: list[dict]) -> int:
             failures.append(f"{name}: analysis returned no chords")
             continue
 
-        share = report.get("shareInExpectedRoots", 0)
-        verdict = "strong" if share >= 0.7 else "partial" if share >= 0.4 else "WEAK"
-        notes.append(f"{name}: {report['chordCount']} chords, "
-                     f"{share:.0%} on expected roots {report['expectedRoots']} — {verdict}")
+        if report.get("fetchOnly"):
+            # Still fatal above if it produced no chords — that is the fetch
+            # working. Just no accuracy verdict, because no key was asserted.
+            notes.append(f"{name}: {report['chordCount']} chords — fetch path OK "
+                         "(label-owned; roots not asserted)")
+        else:
+            share = report.get("shareInExpectedRoots", 0)
+            verdict = "strong" if share >= 0.7 else "partial" if share >= 0.4 else "WEAK"
+            notes.append(f"{name}: {report['chordCount']} chords, "
+                         f"{share:.0%} on expected roots {report['expectedRoots']} — {verdict}")
 
         bpm = report.get("bpm") or report.get("tempo")
         if bpm:

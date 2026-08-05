@@ -31,9 +31,10 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
-from ..errors import AnalysisError, EgressBlocked, VideoUnavailable
+from ..errors import AnalysisError, EgressBlocked, MediaUrlRefused, VideoUnavailable
 from .types import PCM, VideoMeta
 
 log = logging.getLogger("chords.fetch.ytdlp")
@@ -80,6 +81,23 @@ _BOT_CHECK_MARKERS = (
     "confirm you're not a bot",
 )
 
+# The *download* refusing an URL the *probe* was given happily. See
+# `MediaUrlRefused` for the mechanism and the measurement; the short version is
+# that a googlevideo URL is bound to the IP that resolved it, so this is what a
+# per-request rotating proxy looks like from the media endpoint. Matched only on
+# the fetch, never on the probe: a 403 there is a different animal, and marking
+# it retryable would buy cold starts for videos that fail identically forever.
+_MEDIA_REFUSED_MARKERS = (
+    "http error 403",
+    "403: forbidden",
+)
+
+# How long a sticky egress session is held. It only has to outlive one fetch —
+# `_FETCH_TIMEOUT_S` is 240 s — and every fetch asks for a new one, so a longer
+# lifetime would not make any single download more reliable, it would just keep
+# reusing an address after it stopped being needed.
+_PROXY_SESSION_LIFETIME_M = 10
+
 
 class FetchError(AnalysisError):
     """A fetch or decode failed for a reason that is ours, not the video's."""
@@ -90,6 +108,47 @@ class FetchError(AnalysisError):
 
 def _is_bot_check(stderr: str) -> bool:
     return any(marker in (stderr or "").lower() for marker in _BOT_CHECK_MARKERS)
+
+
+def _is_media_refused(stderr: str) -> bool:
+    return any(marker in (stderr or "").lower() for marker in _MEDIA_REFUSED_MARKERS)
+
+
+def _sticky_proxy(raw: str) -> str:
+    """`raw` with a fresh per-fetch session pinned onto the credential.
+
+    The pool is bought rotating, and rotating is still what we want *between*
+    fetches — every retry has to be a fresh draw or `EgressBlocked` has nothing to
+    retry into. What broke the download is that it also rotated *within* one
+    fetch. This asks for both: one address for the life of a single yt-dlp
+    invocation, a new one next time.
+
+    IPRoyal takes its pool directives in the **password** (`pass_session-<id>_
+    lifetime-<n>m`); other vendors put them in the username, so this is
+    deliberately the one vendor-shaped thing in the module rather than a general
+    "proxy session" abstraction over a pool we do not have. A credential that
+    already names a session is left exactly alone — that is an operator pinning
+    one on purpose, and silently appending a second directive would be a strange
+    way to repay them.
+
+    String surgery rather than `urlsplit`/`urlunsplit` on purpose: `urlsplit`
+    returns userinfo still percent-encoded, so rebuilding through `quote` would
+    double-encode a password containing a `@` or `:` — and the suffix added here
+    is URL-safe by construction, so appending it to the raw text is both simpler
+    and lossless.
+    """
+    scheme, sep, rest = raw.partition("://")
+    if not sep or "@" not in rest:
+        return raw
+    userinfo, _, hostport = rest.rpartition("@")
+    if ":" not in userinfo:
+        return raw
+    user, _, password = userinfo.partition(":")
+    if "_session-" in password:
+        return raw
+    session = uuid.uuid4().hex[:12]
+    password = f"{password}_session-{session}_lifetime-{_PROXY_SESSION_LIFETIME_M}m"
+    return f"{scheme}://{user}:{password}@{hostport}"
 
 
 def _looks_unavailable(stderr: str) -> bool:
@@ -242,7 +301,13 @@ class YtDlpSource:
         if cookies:
             args += ["--cookies", cookies]
         if self._proxy:
-            args += ["--proxy", self._proxy]
+            # A fresh session **per invocation**, which is the unit that has to be
+            # IP-stable: one `yt_dlp` subprocess resolves a media URL and then
+            # downloads it, and those two requests must leave from one address.
+            # `probe` and `_fetch` are separate subprocesses and deliberately get
+            # separate sessions — nothing carries between them, and two draws are
+            # better than one.
+            args += ["--proxy", _sticky_proxy(self._proxy)]
         return args
 
     # -- metadata only ------------------------------------------------------
@@ -354,6 +419,18 @@ class YtDlpSource:
         if result.returncode != 0:
             if _looks_unavailable(result.stderr):
                 raise _unavailable_error(result.stderr)
+            if _is_media_refused(result.stderr):
+                log.error(
+                    "yt-dlp resolved a media URL and was then refused it (403) — "
+                    "nothing is wrong with this video, and the probe for it "
+                    "succeeded. A googlevideo URL is bound to the IP that "
+                    "resolved it, so this is what per-request proxy rotation "
+                    "looks like from the media endpoint. Retrying on a fresh "
+                    "container draws a fresh sticky session. If it persists, the "
+                    "pool is rotating inside a single fetch: CHORDS_YTDLP_PROXY "
+                    "must support session pinning (see `_sticky_proxy`)."
+                )
+                raise MediaUrlRefused()
             log.warning("fetch failed for %s: %s", video_id, (result.stderr or "").strip()[:400])
             raise FetchError()
 

@@ -96,6 +96,34 @@ class EgressBlocked(VideoUnavailable):
         super().__init__()
 
 
+class MediaUrlRefused(EgressBlocked):
+    """The media URL was resolved on one address and fetched from another.
+
+    YouTube binds a `googlevideo` media URL to the IP that asked for it. A
+    *per-request* rotating proxy hands each of yt-dlp's requests a different
+    residential address, so the player response is fetched from one and the bytes
+    are requested from another — and the download comes back **403 Forbidden**
+    while the metadata probe, which needs no such consistency, succeeds.
+
+    Measured 2026-08-05 in the worker image, download stage, per attempt: the
+    official label upload `8ui9umU0C2g` scored **0/3** through the pool as it was
+    configured (403, 403, bot check) and 2/3 with a sticky session, while two
+    ordinary uploads scored 2/3 and 3/3 either way. So the binding is enforced on
+    label-owned content and slack on the rest — which is exactly why every deploy
+    gate stayed green: `real_song_check.py`'s corpus is ordinary uploads.
+
+    A subclass of `EgressBlocked` because the response is the same one: this is a
+    property of *how this container left the network*, not of the video, so a
+    fresh container — which draws a fresh sticky session — is the fix, and the
+    player should see the same calm refundable `unavailable` either way. It used
+    to raise a bare `FetchError`, which is terminal: the job simply failed, with
+    no retry and no refund, on a video that a second attempt would have served.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+
 class TempoUnreadable(AnalysisError):
     """The beat tracker's tempo is one the container cannot carry.
 

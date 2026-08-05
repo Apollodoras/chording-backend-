@@ -21,7 +21,8 @@ from __future__ import annotations
 import pytest
 
 from app.analysis import engines, ytdlp_source
-from app.errors import CODE_VIDEO_UNAVAILABLE, EgressBlocked, VideoUnavailable
+from app.errors import (CODE_VIDEO_UNAVAILABLE, EgressBlocked, MediaUrlRefused,
+                        VideoUnavailable)
 from app.jobs import OUTCOME_EGRESS_BLOCKED, OUTCOME_FAILED, run_job
 from app.store import STATUS_QUEUED, STATUS_UNAVAILABLE
 from tests.conftest import FakeBeatTracker, FakeChordEngine, FakeOnsetDetector, FakeSource
@@ -126,6 +127,10 @@ def test_a_plain_unavailable_video_is_terminal_even_when_retries_are_allowed(set
 
 # --- the proxy knob ----------------------------------------------------------
 
+def _proxy_arg(args: list[str]) -> str:
+    return args[args.index("--proxy") + 1]
+
+
 def test_the_proxy_is_passed_to_yt_dlp_when_configured(monkeypatch):
     """The lever the measurement actually points at. Inert until set, so the
     default deployment is unchanged."""
@@ -133,12 +138,108 @@ def test_the_proxy_is_passed_to_yt_dlp_when_configured(monkeypatch):
     args = ytdlp_source.YtDlpSource()._common_args()
 
     assert "--proxy" in args
-    assert args[args.index("--proxy") + 1] == "http://user:pass@proxy.example:8080"
+    proxy = _proxy_arg(args)
+    # Same pool, same credential, same endpoint — only the session is added.
+    assert proxy.startswith("http://user:pass_session-")
+    assert proxy.endswith("@proxy.example:8080")
 
 
 def test_no_proxy_argument_when_unset(monkeypatch):
     monkeypatch.delenv("CHORDS_YTDLP_PROXY", raising=False)
     assert "--proxy" not in ytdlp_source.YtDlpSource()._common_args()
+
+
+# --- the sticky session ------------------------------------------------------
+
+def test_each_invocation_gets_its_own_session(monkeypatch):
+    """Sticky *within* a fetch, fresh *between* fetches.
+
+    Both halves matter. One address for the life of one yt-dlp invocation is what
+    stops the 403 (`MediaUrlRefused`); a *new* address next time is what gives
+    `EgressBlocked` somewhere to retry into. Pinning one session in the credential
+    would buy the first and destroy the second.
+    """
+    monkeypatch.setenv("CHORDS_YTDLP_PROXY", "http://user:pass@proxy.example:8080")
+    source = ytdlp_source.YtDlpSource()
+
+    first = _proxy_arg(source._common_args())
+    second = _proxy_arg(source._common_args())
+
+    assert first != second, "two fetches must not share one egress address"
+    assert "_lifetime-10m" in first
+
+
+def test_a_session_the_operator_pinned_is_left_alone(monkeypatch):
+    """Appending a second `_session-` directive to a credential that already names
+    one is a strange way to repay someone who did it deliberately."""
+    pinned = "http://user:pass_session-abc123_lifetime-30m@proxy.example:8080"
+    monkeypatch.setenv("CHORDS_YTDLP_PROXY", pinned)
+
+    assert _proxy_arg(ytdlp_source.YtDlpSource()._common_args()) == pinned
+
+
+@pytest.mark.parametrize("raw", [
+    "http://proxy.example:8080",              # no credential at all
+    "socks5://proxy.example:1080",
+])
+def test_a_credentialless_proxy_is_passed_through_untouched(monkeypatch, raw):
+    """There is nowhere to put a session directive, and inventing a userinfo
+    section would turn a working proxy into a failing one."""
+    monkeypatch.setenv("CHORDS_YTDLP_PROXY", raw)
+
+    assert _proxy_arg(ytdlp_source.YtDlpSource()._common_args()) == raw
+
+
+def test_a_password_with_reserved_characters_is_not_double_encoded(monkeypatch):
+    """`urlsplit` hands back userinfo still percent-encoded, so rebuilding the URL
+    through `quote` would turn `%40` into `%2540` and break authentication."""
+    monkeypatch.setenv("CHORDS_YTDLP_PROXY", "http://user:p%40ss@proxy.example:8080")
+
+    proxy = _proxy_arg(ytdlp_source.YtDlpSource()._common_args())
+
+    assert proxy.startswith("http://user:p%40ss_session-")
+    assert "%2540" not in proxy
+
+
+# --- the download refused an URL the probe was given ------------------------
+
+MEDIA_403_STDERR = "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+
+
+def test_a_refused_media_url_is_retryable_rather_than_terminal():
+    """The defect this replaced: a 403 raised a bare `FetchError`, which is
+    terminal — the job failed, unrefunded and un-retried, on a video whose own
+    probe had just succeeded and which a second container would have served."""
+    assert ytdlp_source._is_media_refused(MEDIA_403_STDERR)
+
+    error = MediaUrlRefused()
+    assert isinstance(error, EgressBlocked), "the worker must retry this elsewhere"
+    # ...while staying the same calm, refundable outcome on the wire.
+    assert isinstance(error, VideoUnavailable)
+    assert error.code == CODE_VIDEO_UNAVAILABLE
+    assert error.message == VideoUnavailable().message
+
+
+def test_a_retryable_media_refusal_leaves_the_job_alive(settings, store):
+    store.create_job(job_id="j4", uid="u1", video_id=VIDEO, difficulty="normal")
+    store.try_record_use("u1", 5)
+    used_before = store.usage_today("u1")
+
+    outcome = run_job(job_id="j4", video_id=VIDEO, difficulty="normal", uid="u1",
+                      settings=settings, store=store,
+                      source=FakeSource(error=MediaUrlRefused()),
+                      may_retry_elsewhere=True)
+
+    assert outcome == OUTCOME_EGRESS_BLOCKED
+    assert store.get_job("j4").status == STATUS_QUEUED
+    assert store.usage_today("u1") == used_before
+
+
+def test_an_ordinary_fetch_failure_is_still_terminal():
+    """The 403 marker must not swallow the general case — a fetch that failed for
+    a reason a fresh container cannot change should not cost three cold starts."""
+    assert not ytdlp_source._is_media_refused("ERROR: unable to download video data")
+    assert not ytdlp_source._is_media_refused("ERROR: HTTP Error 404: Not Found")
 
 
 # --- egress, reported ---------------------------------------------------------
