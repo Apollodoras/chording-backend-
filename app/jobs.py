@@ -135,28 +135,71 @@ def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
     # One row per difficulty: all three tiers are computed from one analysis
     # (§5.5 — "compute once, store all three, let the client pick") and stored
     # together, so switching difficulty later is a cache hit rather than a job.
-    sync_wire = outcome.sync.model_dump() if outcome.sync else None
-    for tier, song in outcome.songs.items():
-        store.put_map(
-            video_id=video_id, difficulty=tier, song=song, sync=sync_wire,
-            engine_chords=outcome.engine_chords, engine_beats=outcome.engine_beats,
-            analyzed_at=outcome.analyzed_at, channel_id=outcome.meta.channel_id,
-            title=outcome.meta.title, duration_ms=outcome.duration_ms,
-            low_confidence=outcome.low_confidence,
-        )
-
-    store.update_job(job_id, status=STATUS_READY, progress=1.0)
+    #
+    # Inside a `try` for exactly the reason the analysis above is. This half
+    # talks to the database too, and it used to be the only exit path with no
+    # protection at all: a `put_map` that failed — a dropped connection, a
+    # serialization error, a full disk — escaped, and with it the "never raises"
+    # promise. The row was left at `analyzing` with the client polling it, and
+    # under `ThreadJobRunner` there was not even a log line, because the
+    # exception landed in a `Future` nobody reads.
+    #
+    # The lease reaper did eventually collect it, which is what kept this from
+    # being permanent — but fifteen minutes after the fact, for a job that had
+    # already succeeded. Answering now is strictly better.
+    #
+    # Refunded on the reaper's reasoning rather than via `REFUNDABLE_CODES`:
+    # this failure did cost us the whole analysis, unlike the ones in that set,
+    # but the player still got nothing for it and has to ask again. Charging
+    # someone for our own storage failure is the one reading nobody would
+    # defend.
+    try:
+        sync_wire = outcome.sync.model_dump() if outcome.sync else None
+        for tier, song in outcome.songs.items():
+            store.put_map(
+                video_id=video_id, difficulty=tier, song=song, sync=sync_wire,
+                engine_chords=outcome.engine_chords, engine_beats=outcome.engine_beats,
+                analyzed_at=outcome.analyzed_at, channel_id=outcome.meta.channel_id,
+                title=outcome.meta.title, duration_ms=outcome.duration_ms,
+                low_confidence=outcome.low_confidence,
+            )
+        store.update_job(job_id, status=STATUS_READY, progress=1.0)
+    except Exception:
+        log.exception("job %s (%s) analyzed but could not be filed", job_id, video_id)
+        _finish_failed(store, job_id, uid, CODE_ANALYSIS_FAILED,
+                       "That analysis finished but couldn’t be saved — try again.",
+                       refund=True)
+        return OUTCOME_FAILED
     log.info("job %s ready: %s (%s) in %.1fs", job_id, video_id,
              ", ".join(sorted(outcome.songs)), time.monotonic() - started)
     return OUTCOME_READY
 
 
-def _finish_failed(store: Store, job_id: str, uid: str, code: str, message: str) -> None:
+def _finish_failed(store: Store, job_id: str, uid: str, code: str, message: str,
+                   *, refund: bool | None = None) -> None:
+    """Write a terminal status and settle the charge — without ever raising.
+
+    Every caller is on `run_job`'s "never raises" path, and the one failure that
+    reliably reaches this function is the store itself, which is also the thing
+    that would take that promise down. When the database is unreachable there is
+    nowhere left to record anything, so the honest response is a log line and a
+    return: the lease reaper is the backstop for a row nobody could finish, and
+    it runs from whichever container is still healthy.
+
+    `refund` overrides the `REFUNDABLE_CODES` default for a caller that knows
+    better. A job that analyzed cleanly and then could not be *filed* is not in
+    that set — it cost us the full analysis — but the player still got nothing
+    and has to ask again.
+    """
     status = _STATUS_FOR_CODE.get(code, STATUS_FAILED)
-    store.update_job(job_id, status=status, progress=1.0,
-                     error_code=code, error_message=message)
-    if code in REFUNDABLE_CODES:
-        store.refund_use(uid)
+    give_back = (code in REFUNDABLE_CODES) if refund is None else refund
+    try:
+        store.update_job(job_id, status=status, progress=1.0,
+                         error_code=code, error_message=message)
+        if give_back:
+            store.refund_use(uid)
+    except Exception:
+        log.exception("job %s: could not record the terminal status", job_id)
 
 
 class JobRunner:

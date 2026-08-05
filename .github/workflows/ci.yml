@@ -27,6 +27,13 @@ jobs:
       - name: Install (base + dev only)
         run: pip install -e ".[dev]"
 
+      - name: Lint
+        # Dead imports and unread locals only (ruff's default rules) — not a
+        # style gate. It runs before the tests because it is the cheaper of the
+        # two and catches the class of mistake a passing suite hides: an import
+        # left behind by a refactor still resolves, so nothing goes red.
+        run: python -m ruff check app tests bench modal_app.py
+
       - name: Test
         run: python -m pytest -q
 

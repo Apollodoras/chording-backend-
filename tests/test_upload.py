@@ -18,11 +18,12 @@ adapter tests — the CI job that guards §4 installs no audio stack at all.
 from __future__ import annotations
 
 import shutil
+from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.analysis import engines
+from app.analysis import engines, file_source
 from app.analysis.file_source import (
     MAX_UPLOAD_BYTES,
     FileSource,
@@ -30,6 +31,7 @@ from app.analysis.file_source import (
     is_upload_id,
     upload_id,
 )
+from app.errors import VideoTooLong
 from app.jobs import JobRunner
 from app.main import create_app
 from app.store import BLOCK_VIDEO
@@ -250,3 +252,74 @@ def test_available_reports_this_image_honestly():
     can do, so the API image refuses an upload it could not process rather than
     accepting it and failing later."""
     assert available() == bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+
+# --- the decode is bounded before it reaches memory --------------------------
+
+def _tone(path, seconds: float) -> bytes:
+    """`seconds` of a steady tone, as WAV bytes."""
+    import struct
+    import wave
+
+    frames = int(22050 * seconds)
+    with wave.open(str(path), "w") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(22050)
+        out.writeframes(struct.pack(f"<{frames}h", *([1000] * frames)))
+    return path.read_bytes()
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
+                    reason="needs ffmpeg + ffprobe")
+def test_a_decode_is_bounded_rather_than_measured_afterwards(tmp_path, settings, monkeypatch):
+    """`gate()` refuses a long file on the duration **ffprobe claimed**, and a
+    claim is not a measurement. A container that understates its real length
+    used to decode unbounded into the scratch dir — tmpfs, so RAM on the worker
+    — and then be read into memory a second time by `_read_wav`. With a 4 GB cap
+    that is a dead container instead of a clean refusal.
+
+    The assertion that matters is the second one: the ceiling has to sit *above*
+    the length tolerance. Clamping at the same number would truncate an
+    over-length file to exactly the limit, and the measured check would then
+    never fire — a refusal silently turned into a shortened song.
+    """
+    commands = []
+    real_run = file_source._run
+
+    def spy(command, *, timeout):
+        commands.append(command)
+        return real_run(command, timeout=timeout)
+
+    monkeypatch.setattr(file_source, "_run", spy)
+
+    capped = replace(settings, max_video_seconds=1)
+    data = _tone(tmp_path / "long.wav", seconds=5)
+    source = FileSource(data, filename="long.wav", settings=capped)
+    workdir = tmp_path / "scratch"
+    workdir.mkdir()
+
+    with pytest.raises(VideoTooLong):
+        source.decode(source.video_id, workdir)
+
+    decode = commands[-1]
+    assert "-t" in decode, "the decode itself has to be bounded, not just checked"
+    ceiling = float(decode[decode.index("-t") + 1])
+    assert ceiling > capped.max_video_seconds * file_source._LENGTH_TOLERANCE, \
+        "a ceiling at the tolerance would truncate an over-long file into legality"
+    assert list(workdir.iterdir()) == [], "and it still leaves nothing behind (§2.1)"
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
+                    reason="needs ffmpeg + ffprobe")
+def test_the_bound_never_shortens_audio_that_is_within_the_cap(tmp_path, settings):
+    """The other half: a legal file has to come back whole."""
+    data = _tone(tmp_path / "ok.wav", seconds=2)
+    source = FileSource(data, filename="ok.wav",
+                        settings=replace(settings, max_video_seconds=600))
+    workdir = tmp_path / "scratch"
+    workdir.mkdir()
+
+    pcm, rate = source.decode(source.video_id, workdir)
+
+    assert 1.9 < len(pcm) / rate < 2.1, "a song well inside the cap is untouched"

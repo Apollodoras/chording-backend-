@@ -20,6 +20,7 @@ from dataclasses import replace
 
 from fastapi.testclient import TestClient
 
+from app import jobs
 from app.jobs import JobRunner, ThreadJobRunner
 from app.main import create_app
 from app.store import (
@@ -138,3 +139,106 @@ def test_a_job_id_that_was_swept_reads_as_expired_not_as_an_error(settings, stor
     assert response.status_code == 404
     assert response.json()["code"] == "not_found"
     assert "expired" in response.json()["message"].lower()
+
+
+# --- a job that analyzed and could not be filed ------------------------------
+#
+# `run_job` promises never to raise, because it runs detached from any request:
+# an escaping exception leaves the row at `analyzing` and the client polling
+# something that will never move. Every failure path honoured that. The success
+# path did not — persistence sat outside the try — so the one case where the
+# expensive work had already been done was the one case that could hang.
+
+class _Meta:
+    channel_id = "UC123"
+    title = "A Song"
+
+
+class _Outcome:
+    """A successful analysis, as `run_pipeline` would return it."""
+
+    sync = None
+    songs = {"normal": {"id": "yt:x", "title": "A Song"}}
+    engine_chords = "btc"
+    engine_beats = "beat_this"
+    analyzed_at = "2026-08-05T00:00:00Z"
+    meta = _Meta()
+    duration_ms = 180_000
+    low_confidence = False
+
+
+def _analyzed_job(store, settings, monkeypatch, *, put_map):
+    """Run one job whose analysis succeeds and whose persistence is `put_map`.
+
+    The engine builders are stubbed alongside the pipeline because `run_job`
+    calls them before it calls the pipeline, so without this these tests would
+    be asserting on whichever engines the registry happens to hold — which is a
+    different module's business. What is under test here is the bookkeeping
+    around a completed analysis, so the analysis is the part that gets faked.
+    """
+    monkeypatch.setattr(jobs, "run_pipeline", lambda **kw: _Outcome())
+    for builder in ("build_chord_engine", "build_beat_tracker",
+                    "build_onset_detector", "build_structure_probe"):
+        monkeypatch.setattr(jobs.engines, builder, lambda _s: None)
+    monkeypatch.setattr(store, "put_map", put_map)
+    store.create_job(job_id="j1", uid="u1", video_id=VIDEO, difficulty="normal")
+    store.try_record_use("u1", 10)
+    return jobs.run_job(job_id="j1", video_id=VIDEO, difficulty="normal", uid="u1",
+                        settings=settings, store=store, source=FakeSource())
+
+
+def test_a_store_failure_after_a_good_analysis_still_answers_the_poller(store, settings, monkeypatch):
+    """The reproduction: `put_map` raises, and the job used to be abandoned
+    mid-flight — status `analyzing`, progress 0.05, no message, and the charge
+    still spent. The lease reaper collected it fifteen minutes later; the client
+    polled a corpse until then."""
+    def explode(**kwargs):
+        raise RuntimeError("database connection lost")
+
+    outcome = _analyzed_job(store, settings, monkeypatch, put_map=explode)
+
+    assert outcome == jobs.OUTCOME_FAILED
+    job = store.get_job("j1")
+    assert job.is_terminal, "an abandoned row is the thing this must never leave"
+    assert job.status == STATUS_FAILED
+    assert job.progress == 1.0
+    assert "couldn’t be saved" in job.error_message
+
+
+def test_an_analysis_we_could_not_file_is_not_charged_for(store, settings, monkeypatch):
+    """It cost us the whole analysis, so it is not in `REFUNDABLE_CODES` — but
+    the player got nothing and has to ask again, which is the reaper's reasoning
+    for the same shape of failure."""
+    def explode(**kwargs):
+        raise RuntimeError("database connection lost")
+
+    _analyzed_job(store, settings, monkeypatch, put_map=explode)
+
+    assert store.usage_today("u1") == 0
+
+
+def test_a_store_too_broken_to_record_the_failure_still_does_not_raise(store, settings, monkeypatch):
+    """The far end of the same promise. If the database is unreachable there is
+    nowhere to write a terminal status either — so this returns and lets the
+    lease reaper answer from a healthier container, rather than raising into a
+    thread pool that will not log it."""
+    def explode(*args, **kwargs):
+        raise RuntimeError("database on fire")
+
+    monkeypatch.setattr(store, "update_job", explode)
+
+    outcome = _analyzed_job(store, settings, monkeypatch, put_map=explode)
+
+    assert outcome == jobs.OUTCOME_FAILED
+
+
+def test_the_happy_path_still_files_every_tier_and_reports_ready(store, settings, monkeypatch):
+    """The guard must not have changed what success does."""
+    filed = []
+    outcome = _analyzed_job(store, settings, monkeypatch,
+                            put_map=lambda **kw: filed.append(kw["difficulty"]))
+
+    assert outcome == jobs.OUTCOME_READY
+    assert filed == ["normal"]
+    assert store.get_job("j1").status == STATUS_READY
+    assert store.usage_today("u1") == 1

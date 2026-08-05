@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8,<0.9"]
 # The audio half. Deliberately NOT a default dependency: the API container must
 # not be able to fetch or decode audio at all (handoff §2.1 blast radius, §4
 # "worker isolation matters"). Only the worker image installs this group, and
@@ -96,3 +96,12 @@ engines-chroma = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff]
+# The default rule set (`E4`, `E7`, `E9`, `F`) on purpose: the dead imports and
+# unread locals it finds are real, and everything past that is style this
+# codebase already settles by hand. In particular `E501` stays off — the prose
+# in these docstrings is the documentation, and reflowing it to a column count
+# would cost more than it buys.
+target-version = "py311"
+extend-exclude = ["vendor"]

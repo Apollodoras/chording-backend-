@@ -19,7 +19,7 @@ from app.analysis.structure import (
 )
 from app.analysis.types import GridSpan
 from app.chords import MAJOR, MINOR, NORMAL
-from tests.conftest import known_axis, known_chords, known_grid
+from tests.conftest import known_axis, known_chords
 
 
 def span(start, length, root=0, quality=MAJOR):

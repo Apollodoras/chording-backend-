@@ -134,7 +134,6 @@ class LibrosaOnsetDetector:
 
     def detect(self, pcm: PCM, sr: int) -> list[Onset]:
         import librosa
-        import numpy as np
 
         envelope = librosa.onset.onset_strength(y=pcm, sr=sr, hop_length=HOP)
         # `backtrack=False` on purpose. Backtracking rolls each detection back to

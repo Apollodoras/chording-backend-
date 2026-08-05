@@ -97,6 +97,15 @@ class SongModel:
     # and a tier render has to reproduce the reference one rather than take its
     # own — so `render` uses these.
     vote_groups: list[form.RepeatGroup] = field(default_factory=list)
+    # And the key it was taken with, for exactly the same reason. The vote's
+    # diatonic tie-break consumes a key, and it consumed the **pre-vote**
+    # reading — `key` above is the post-vote one, re-read off the corrected bars
+    # so the song reports the key its chart actually settled on. Replaying the
+    # vote with that one would be taking a different vote, not reproducing the
+    # reference: the tie-break would break the other way on any bar the two keys
+    # disagree about. Stored rather than recomputed because the reading that
+    # matters here is a historical fact about a decision already made.
+    vote_key: DetectedKey | None = None
 
     @property
     def bar_beats(self) -> int:
@@ -157,6 +166,9 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
                                  tonic_pc=key.tonic_pc)
 
     report = ConsensusReport()
+    # Captured before the re-read below can replace it: this is the key the vote
+    # is about to be taken with, and `render` has to replay it with the same one.
+    vote_key = key
     if vote:
         bars, report = consensus.apply(
             bars, vote_groups, bar_beats=bar_beats,
@@ -193,7 +205,7 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
         confidence=postprocess.mean_confidence(spans),
         total_bars=sum(s.total_bars for s in sections),
         exact_ratio=postprocess.exact_ratio(spans),
-        vote_groups=vote_groups,
+        vote_groups=vote_groups, vote_key=vote_key,
     )
 
 
@@ -206,11 +218,16 @@ def render(model: SongModel, raw: list[RawChordSpan], difficulty: str) -> list[S
     every tier tiles the song the same way and the one sidecar addresses all of
     them.
 
-    The vote is replayed over the model's **`vote_groups`**, and told not to
-    record what it did. Both halves matter and neither is cosmetic: voting over
-    `model.groups` (the encoding pass) meant the reference tier's render took a
-    subtly different vote from the one `build` took, so "hard is the model" held
-    by luck; and recording would leave the model's groups carrying whichever tier
+    The vote is replayed over the model's **`vote_groups`**, with the model's
+    **`vote_key`**, and told not to record what it did. All three matter and none
+    is cosmetic. Voting over `model.groups` (the encoding pass) meant the
+    reference tier's render took a subtly different vote from the one `build`
+    took, so "hard is the model" held by luck. Voting with `model.key` was the
+    same mistake wearing the other hat: that is the key re-read *after* the vote,
+    so on any song where the correction moved the reading, the replay's diatonic
+    tie-break broke differently from the original's — and the guard on both is
+    the same `consensus.touched`, so the two conditions never came apart.
+    Recording, finally, would leave the model's groups carrying whichever tier
     compiled last instead of the reference vote, which is what the benchmark and
     the logs read.
     """
@@ -221,9 +238,13 @@ def render(model: SongModel, raw: list[RawChordSpan], difficulty: str) -> list[S
     if not bars:
         return []
     if model.consensus.touched:
+        # `or model.key` for a model assembled by hand rather than by `build` —
+        # a test fixture, mostly. Before the re-read existed the two were the
+        # same object, so it is also the answer that was always right.
+        vote_key = model.vote_key or model.key
         bars, _ = consensus.apply(
             bars, model.vote_groups, bar_beats=float(model.axis.bar_beats),
-            tonic_pc=model.key.tonic_pc, mode=model.key.scale,
+            tonic_pc=vote_key.tonic_pc, mode=vote_key.scale,
             record=False,
         )
     return impose(model.sections, bars)

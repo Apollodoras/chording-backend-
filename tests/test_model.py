@@ -282,6 +282,59 @@ def test_the_key_is_read_off_the_chart_the_vote_left_behind(monkeypatch):
     assert model.key.tonic == "G"
 
 
+def test_a_render_replays_the_vote_with_the_key_the_vote_used(monkeypatch):
+    """The other half of "a render reproduces the reference vote".
+
+    `build` votes with the key read off the engine's own chords, then re-reads
+    the key from the bars the vote left behind — so `model.key` is deliberately
+    *not* the key the vote was taken with. Replaying with it made the tier
+    renders take a different vote from the one the model was built on, exactly
+    the way voting over the second pass's groups used to: the diatonic tie-break
+    consumes the tonic, so any bar the two readings disagree about could settle
+    the other way. Both are guarded on the same `consensus.touched`, so the case
+    never arose without the fix being needed.
+
+    The re-read is forced here rather than found: on the fixtures available a
+    corrected bar or two never moves the reading, which is why this was latent
+    and not a visible wrong chart. The property is what is being pinned.
+    """
+    votes: list[tuple[int, str]] = []
+    real_apply = song_model.consensus.apply
+
+    def spy_apply(bars, groups, *, bar_beats, tonic_pc=0, mode="ionian", record=True):
+        votes.append((tonic_pc, mode))
+        return real_apply(bars, groups, bar_beats=bar_beats, tonic_pc=tonic_pc,
+                          mode=mode, record=record)
+
+    real_detect = song_model.detect_key
+    readings: list[int] = []
+
+    def shifting_detect(spans):
+        found = real_detect(spans)
+        readings.append(found.tonic_pc)
+        # The second call is C3's post-vote re-read. Move it somewhere else so
+        # "which key did the replay use" has an observable answer at all.
+        if len(readings) == 2:
+            return replace(found, tonic_pc=(found.tonic_pc + 5) % 12)
+        return found
+
+    monkeypatch.setattr(song_model.consensus, "apply", spy_apply)
+    monkeypatch.setattr(song_model, "detect_key", shifting_detect)
+
+    model, raw = _voted_model()
+    # Stated against `readings[0]` — the pre-vote reading `build` voted with —
+    # rather than against `model.vote_key`, so that this fails on the behaviour
+    # and not merely on the absence of the field that fixes it.
+    assert len(readings) == 2, "the fixture has to reach the re-read"
+    assert model.key.tonic_pc != readings[0], "and the re-read has to differ"
+
+    song_model.render(model, raw, HARD)
+
+    assert len(votes) == 2, "one vote in build, one in the render"
+    assert votes[0] == votes[1], \
+        "the render has to replay the vote build took, not take a new one"
+
+
 def test_a_vote_that_changed_nothing_does_not_re_read_the_key(monkeypatch):
     """Re-running it there could differ only in the trailing partial bar
     `bars_from_spans` drops — a change with no reason behind it."""

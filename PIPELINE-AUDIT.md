@@ -23,9 +23,14 @@ is. `HIGH` means the user notices.
 | 2 | Structure (B1–B5) | **Done** — branch `structure-audit` |
 | 3 | Meter/tempo (D1–D2) | **Done** — branch `structure-audit` |
 | 4 | Hygiene (C1–C3, E1–E4) | **Done** — branch `structure-audit` |
+| 5 | The service half (F1–F4) | **Done** — branch `structure-audit` |
 
 Tests: 414 at the start of the audit → 423 after Phase 1 → 432 after Phase 2 →
-443 after Phase 3 → 458 after Phase 4.
+443 after Phase 3 → 458 after Phase 4 → 466 after Phase 5.
+
+Phase 5 is a **second audit**, run over the half the first one never looked at:
+`main` / `jobs` / `store` / `auth` / `modal_app` and the upload path. The
+pipeline findings above were re-checked first and all hold.
 
 ---
 
@@ -224,3 +229,56 @@ neither engine is installed in this environment. E3 is the finding that row woul
 price, since quantization only puts two chords on one beat when the chords arrive
 off-grid — which is what a real engine's output is and what ground truth is not.
 It is pinned by fixtures instead.
+
+---
+
+## Phase 5 — the service half ✅
+
+A second audit, over the code the first four phases never touched: the HTTP
+service, the job seam, the store, auth, the Modal deployment and the upload
+path. The pipeline was re-checked first — suite green, emitted fixtures
+byte-stable, the API image still provably audio-free — and every Phase 1–4
+finding still holds.
+
+The defects here are a different shape from the pipeline's. Those were "the
+analysis is confidently wrong about the music"; these are **"the service is
+confidently wrong about what it just did"** — a promise in a docstring that the
+code no longer keeps. All four were reproduced before being written down, and
+each carries a test that fails without its fix.
+
+| # | Sev | Finding | State |
+|---|---|---|---|
+| F1 | MED | **A job that analyzed cleanly and could not be *filed* hung.** `run_job`'s docstring promises it never raises, because it runs detached from any request — "every exit path writes a terminal status". Every *failure* path did. The success path did not: the `put_map` loop and the final `update_job` sat outside the try, so a dropped connection or a serialization error escaped, leaving the row at `analyzing` with progress 0.05, no message, and the charge spent. Under `ThreadJobRunner` there was not even a log line — the exception lands in a `Future` nobody reads. | ✅ persistence is inside the try; a store failure writes `failed` and refunds. `_finish_failed` now cannot raise either, so the promise holds on *every* path |
+| F2 | LOW–MED | **A tier render replayed the vote with the wrong key.** C1 established "a render reproduces the reference vote" by replaying over `vote_groups`. C3, in the same phase, started re-reading the key *after* the vote — so `model.key` is the post-vote reading, and `render` was replaying with it while `build` had voted with the pre-vote one. The vote's diatonic tie-break consumes the tonic, so on any song where the correction moves the reading, the replay breaks a contested bar the other way. Both are guarded on the same `consensus.touched`, so the two conditions never came apart. | ✅ the model carries `vote_key` — the reading the vote was taken with — and `render` replays with it, exactly as it replays over `vote_groups` |
+| F3 | LOW | **An upload's decode was measured, not bounded.** `gate()` refuses a long file on the duration **ffprobe claimed**, and a claim is not a measurement. ffmpeg then ran with no `-t`: a container understating its real length decoded unbounded into the scratch dir — tmpfs, so RAM on the worker — and was read into memory a second time by `_read_wav`. On a container with a 4 GB cap that is a dead worker rather than a clean 400. | ✅ `-t` bounds the decode itself, at `_DECODE_CEILING` — deliberately **above** `_LENGTH_TOLERANCE`, so an over-length file is still refused instead of truncated into legality |
+| F4 | LOW | **No lint gate.** ruff had been run locally (there is a cache) but was not in the `dev` extra and had no CI job, so its findings were nobody's. Eight of them, all cosmetic — one in production code (a dead `import numpy as np` in `librosa_beats.detect`), the rest unused imports and an unread local in tests and bench. | ✅ ruff in `[dev]`, a `Lint` step ahead of `Test` in CI, config in `pyproject.toml`, and the eight fixed |
+
+**F2 is a consistency fix, not a repaired chart, and that distinction is the
+honest one.** The inconsistency is structural and certain — the two calls are
+passed different keys, and the code says so. What could not be shown is it
+changing an actual song: a sweep of 25 fixtures where the vote fired found no
+case where re-reading the key moved the reading at all, because one or two
+corrected bars out of sixteen do not shift a key detection. So the test forces
+the re-read rather than finding it, and pins the property instead of a
+reproduction. That is the same footing C1's own second half ended up on, and for
+the same reason — which is worth noticing, since F2 *is* the gap C1 left.
+
+**On F1's severity.** The lease reaper (`_JOB_LEASE_S`, 900 s) already collects
+a row abandoned mid-flight and refunds it, so this was never permanent: the
+player saw fifteen minutes of `analyzing` and then a terminal answer. What the
+fix buys is answering **now**, for a job that had in fact succeeded, and — the
+part that mattered more — a log line where there had been silence.
+
+### Also looked at, and left alone
+
+- **The per-IP limiter reads the rightmost `X-Forwarded-For` entry.** Correct
+  behind exactly one trusted proxy, which is the deployed shape, and the safe
+  direction to be wrong in (over-limiting, not a free bypass). Worth revisiting
+  only if a second proxy is ever put in front.
+- **`hit_rate_limit` is not atomic across connections on Postgres.** Two
+  concurrent requests can both read under the limit and both insert, admitting
+  `limit + 1`. It is a burst limiter and the daily quota is the real budget;
+  making it atomic costs a lock on the hot path for one request.
+- **Both rate limits default to `0` (off).** Documented that way, and the README
+  tells the deployer to set them in the Modal secret. A default that is on would
+  be a limiter tuned for nobody's traffic.

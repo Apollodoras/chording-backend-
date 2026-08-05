@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 import statistics
 import subprocess
@@ -381,13 +380,13 @@ def align(pcm, sample_rate: int, spans: list[tuple[float, float, str]],
     if len(samples) >= 4:
         n = len(samples)
         mean_t = sum(t for t, _ in samples) / n
-        mean_lag = sum(l for _, l in samples) / n
+        mean_lag = sum(lag for _, lag in samples) / n
         variance = sum((t - mean_t) ** 2 for t, _ in samples)
         if variance > 0:
-            rate_error = sum((t - mean_t) * (l - mean_lag) for t, l in samples) / variance
+            rate_error = sum((t - mean_t) * (lag - mean_lag) for t, lag in samples) / variance
             offset = mean_lag - rate_error * mean_t
         residual_ms = 1000 * (
-            sum((l - (offset + rate_error * t)) ** 2 for t, l in samples) / n
+            sum((lag - (offset + rate_error * t)) ** 2 for t, lag in samples) / n
         ) ** 0.5
 
     drift_ms = abs(rate_error) * duration * 1000

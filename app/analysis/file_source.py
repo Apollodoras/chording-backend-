@@ -56,6 +56,28 @@ _SAMPLE_RATE = 22050
 _PROBE_TIMEOUT_S = 30
 _DECODE_TIMEOUT_S = 120
 
+# Two bounds on how much audio a decode may produce, and the gap between them is
+# deliberate.
+#
+# `_LENGTH_TOLERANCE` is the **policy** check: §18's cap plus enough slack that a
+# file whose declared duration is a second or two out is not refused over it.
+# Exceeding it raises `VideoTooLong`, which is an answer the player can act on.
+#
+# `_DECODE_CEILING` is the **memory** bound, and it is needed because the policy
+# check runs on samples that are already in this process. `gate()` decides on the
+# duration ffprobe *claimed*, and a claim is not a measurement — a container that
+# understates its real length decodes unbounded into the scratch dir (tmpfs, so
+# RAM on the worker) and is then read into memory a second time by `_read_wav`.
+# On a container with a 4 GB cap that is how a file that should have been a 400
+# becomes a dead worker instead. `-t` bounds what ffmpeg will emit at all.
+#
+# It sits **above** the tolerance on purpose. Clamping at the same number would
+# truncate an over-length file to exactly the limit, and the check below — which
+# asks whether the decode came out *longer* than the tolerance — would then never
+# fire: a refusal would have quietly become a shortened song.
+_LENGTH_TOLERANCE = 1.1
+_DECODE_CEILING = 1.25
+
 UPLOAD_PREFIX = "up_"
 UPLOAD_ID = re.compile(r"^up_[0-9a-f]{16}$")
 
@@ -147,12 +169,13 @@ class FileSource:
         source.write_bytes(self._data)
         wav = workdir / "decoded.wav"
 
-        result = _run([
-            self._ffmpeg, "-y", "-loglevel", "error",
-            "-i", str(source),
-            "-ac", "1", "-ar", str(sample_rate), "-c:a", "pcm_s16le",
-            str(wav),
-        ], timeout=_DECODE_TIMEOUT_S)
+        limit = getattr(self._settings, "max_video_seconds", None)
+        command = [self._ffmpeg, "-y", "-loglevel", "error", "-i", str(source)]
+        if limit:
+            command += ["-t", f"{limit * _DECODE_CEILING:.3f}"]
+        command += ["-ac", "1", "-ar", str(sample_rate), "-c:a", "pcm_s16le", str(wav)]
+
+        result = _run(command, timeout=_DECODE_TIMEOUT_S)
         try:
             source.unlink()
         except OSError:
@@ -171,9 +194,9 @@ class FileSource:
 
         # The cap re-checked against what actually decoded, for the same reason
         # the YouTube path does it: a container's metadata is a claim, and this
-        # is the measurement.
-        limit = getattr(self._settings, "max_video_seconds", None)
-        if limit and pcm.size / sample_rate > limit * 1.1:
+        # is the measurement. Still reachable with `-t` in place above, which is
+        # why the ceiling is the looser of the two numbers.
+        if limit and pcm.size / sample_rate > limit * _LENGTH_TOLERANCE:
             raise VideoTooLong(int(limit))
 
         return pcm, sample_rate

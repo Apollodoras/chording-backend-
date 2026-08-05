@@ -220,8 +220,6 @@ def recording(
             cursor += ms_per_beat
     downbeats_ms.append(cursor)
     beats_ms.append(cursor)
-    beat_count = len(beats_ms)
-
     chords: list[RawChordSpan] = []
     truth: list[tuple[int, int, str]] = []
     for index in range(len(downbeats_ms) - 1):

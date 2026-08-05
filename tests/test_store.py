@@ -19,7 +19,6 @@ from app.store import (
     RATE_SCOPE_UID,
     STATUS_QUEUED,
     STATUS_READY,
-    SQLiteStore,
 )
 
 
