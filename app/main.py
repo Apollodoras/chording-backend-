@@ -360,6 +360,24 @@ def _install_routes(app: FastAPI) -> None:
             # one to read for "would a new analysis be accepted" — it asks the
             # runner, which is what actually does the work.
             "fetch": "configured" if app.state.source is not None else "unconfigured",
+            # How THIS container leaves the network, on the same terms as
+            # `fetch` and `engines` above: `"proxy"`, `"direct"`, or `None` when
+            # there is no source to ask. `"direct"` is not a neutral answer — it
+            # means every analysis is drawing at YouTube's per-IP bot check at
+            # roughly 1-in-6 and paying for the misses in cold starts.
+            #
+            # **On the deployed two-container shape this is always `None`**, and
+            # that is correct rather than a gap: fetching lives in the worker,
+            # this image has `source=None` by design (§4), and the proxy
+            # credential is deliberately absent from this container's secret.
+            # Reporting the worker's posture from here would mean either holding
+            # a credential with no use for it or publishing config intent as
+            # though it were built reality — and this endpoint exists precisely
+            # because the second one is a lie that reads as a green tick.
+            # `scripts/smoke.py` says "cannot see from here" rather than
+            # guessing. Unlike `canAnalyze`, there is no runner-mediated channel
+            # to ask the worker down; if that is ever wanted, it needs one.
+            "egress": getattr(app.state.source, "egress", None),
             "engines": engines.available(),
             "enginesReady": engines.is_ready(settings),
             "canAnalyze": app.state.runner.can_analyze(),

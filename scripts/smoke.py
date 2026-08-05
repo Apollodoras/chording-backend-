@@ -129,6 +129,32 @@ def check_health(*, expect_production: bool) -> dict:
         check("per-IP rate limit set", bool(limits.get("ipPerMin")),
               "CHORDS_RATE_LIMIT_IP_PER_MIN=0 — an unauthenticated flood is uncapped",
               info=f"{limits.get('ipPerMin')}/min", fatal=False)
+        # Egress, *only when this container can see it*. On the two-container
+        # deployment it cannot: fetching lives in the worker and the API image
+        # has `source=None` by design (§4), so `egress` is null here no matter
+        # how the worker is configured — and the proxy credential deliberately
+        # is not in this container's secret, because a container with no use for
+        # a credential should not hold one.
+        #
+        # Asserting through that would be the exact failure this gate exists to
+        # catch, in reverse: a red mark on a correctly-configured deployment,
+        # which teaches an operator to ignore the gate. Same lesson as
+        # `canAnalyze` — ask the thing that knows, or say you cannot see.
+        egress = body.get("egress")
+        if egress is None:
+            print("[ info ] egress — not visible from the API container; "
+                  "check CHORDS_YTDLP_PROXY on the worker secret")
+        else:
+            # Not fatal: unproxied is a real deployment, it just is not a *good*
+            # one. It means roughly five jobs in six start by losing YouTube's
+            # per-IP lottery and clawing back through cold-start retries, so the
+            # success rate follows Google's datacentre policy rather than
+            # anything in this repo. Worth a warning, because the failure it
+            # predicts arrives as "analysis got flaky", not as an outage.
+            check("egress is proxied", egress == "proxy",
+                  "CHORDS_YTDLP_PROXY is unset — every fetch draws at the bot "
+                  "check (~1 in 6 IPs pass) and pays for the misses in cold starts",
+                  info="rotating residential proxy", fatal=False)
 
     return body
 

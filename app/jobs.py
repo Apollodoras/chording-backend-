@@ -33,17 +33,24 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .analysis import engines
 from .analysis.pipeline import analyze as run_pipeline
-from .errors import AnalysisError, CODE_ANALYSIS_FAILED, CODE_VIDEO_BLOCKED
+from .errors import AnalysisError, EgressBlocked, CODE_ANALYSIS_FAILED, CODE_VIDEO_BLOCKED
 from .store import (
     STATUS_ANALYZING,
     STATUS_BLOCKED,
     STATUS_FAILED,
+    STATUS_QUEUED,
     STATUS_READY,
     STATUS_UNAVAILABLE,
     Store,
 )
 
 log = logging.getLogger("chords.jobs")
+
+# What `run_job` did, for a caller that can act on it. Not job *statuses* — those
+# are the client's vocabulary and live in `store`; these are the runner's.
+OUTCOME_READY = "ready"
+OUTCOME_FAILED = "failed"
+OUTCOME_EGRESS_BLOCKED = "egress_blocked"
 
 # Failures that cost us nothing and are not the player's fault: the video was
 # blocked, private, region-locked, or too long — all decided from metadata,
@@ -67,13 +74,23 @@ _STATUS_FOR_CODE = {
 
 
 def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
-            settings, store: Store, source) -> None:
+            settings, store: Store, source, may_retry_elsewhere: bool = False) -> str:
     """Execute one analysis and record the outcome. Never raises.
 
     Never raises on purpose: this runs detached from any request, so an escaping
     exception would leave the job row stuck in `analyzing` forever and the client
     polling something that will never move. Every exit path writes a terminal
-    status.
+    status — except the one the caller has explicitly said it can do better than.
+
+    `may_retry_elsewhere` is that exception, and it exists because one failure is
+    a property of *where the job ran* rather than of the job: YouTube's bot check
+    refuses the container's egress IP (see `EgressBlocked`). A caller that can
+    place the next attempt on a different container passes `True`, and gets
+    `OUTCOME_EGRESS_BLOCKED` back with the job row left alive and un-refunded so
+    the retry inherits it. Whoever runs the *last* attempt must pass `False`, so
+    the failure still lands somewhere.
+
+    Returns one of the `OUTCOME_*` constants.
     """
     started = time.monotonic()
 
@@ -94,14 +111,25 @@ def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
             onset_detector=engines.build_onset_detector(settings),
             progress=progress,
         )
+    except EgressBlocked as exc:
+        if may_retry_elsewhere:
+            # Deliberately NOT terminal: no error written, no refund, status left
+            # back at `queued` so the client's poll loop reads "still working"
+            # rather than watching a job fail and un-fail.
+            store.update_job(job_id, status=STATUS_QUEUED, progress=0.0)
+            log.warning("job %s (%s): egress blocked, retrying on a fresh container",
+                        job_id, video_id)
+            return OUTCOME_EGRESS_BLOCKED
+        _finish_failed(store, job_id, uid, exc.code, exc.message)
+        return OUTCOME_FAILED
     except AnalysisError as exc:
         _finish_failed(store, job_id, uid, exc.code, exc.message)
-        return
+        return OUTCOME_FAILED
     except Exception:
         log.exception("job %s (%s) crashed", job_id, video_id)
         _finish_failed(store, job_id, uid, CODE_ANALYSIS_FAILED,
                        "That video couldn’t be analyzed.")
-        return
+        return OUTCOME_FAILED
 
     # One row per difficulty: all three tiers are computed from one analysis
     # (§5.5 — "compute once, store all three, let the client pick") and stored
@@ -119,6 +147,7 @@ def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
     store.update_job(job_id, status=STATUS_READY, progress=1.0)
     log.info("job %s ready: %s (%s) in %.1fs", job_id, video_id,
              ", ".join(sorted(outcome.songs)), time.monotonic() - started)
+    return OUTCOME_READY
 
 
 def _finish_failed(store: Store, job_id: str, uid: str, code: str, message: str) -> None:

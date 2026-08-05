@@ -72,6 +72,25 @@ class VideoUnavailable(AnalysisError):
         super().__init__(message, CODE_VIDEO_UNAVAILABLE, status=422)
 
 
+class EgressBlocked(VideoUnavailable):
+    """YouTube's bot check refused *this container's IP* — the video is fine.
+
+    A subclass of `VideoUnavailable` on purpose: to the player it is the same
+    calm "can't have this one" outcome, with the same code, status, message and
+    refund, so nothing on the wire needs to learn that this exists. What it adds
+    is a distinction the **worker** can act on, because the two failures want
+    opposite responses — a private video fails identically forever, while this
+    one is a property of the egress IP, and a fresh container is a fresh draw.
+
+    Measured 2026-08-04, six Modal containers × eight yt-dlp player clients: one
+    IP served every client, five refused every client. The check is per-IP, not
+    per-client — so retrying *elsewhere* is the fix and retrying *here* is not.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+
 class VideoTooLong(AnalysisError):
     def __init__(self, limit_seconds: int):
         minutes = limit_seconds // 60

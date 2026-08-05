@@ -33,7 +33,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ..errors import AnalysisError, VideoUnavailable
+from ..errors import AnalysisError, EgressBlocked, VideoUnavailable
 from .types import PCM, VideoMeta
 
 log = logging.getLogger("chords.fetch.ytdlp")
@@ -88,18 +88,32 @@ class FetchError(AnalysisError):
         super().__init__(message)
 
 
+def _is_bot_check(stderr: str) -> bool:
+    return any(marker in (stderr or "").lower() for marker in _BOT_CHECK_MARKERS)
+
+
 def _looks_unavailable(stderr: str) -> bool:
     lowered = (stderr or "").lower()
-    if any(marker in lowered for marker in _BOT_CHECK_MARKERS):
+    if _is_bot_check(lowered):
         log.error(
             "yt-dlp hit YouTube's bot check — nothing is wrong with this video. "
             "It is per egress IP, so a retry on a fresh container may well "
             "succeed; measured hit rate on Modal was ~20%% of IPs. Cookies do "
             "NOT fix it (measured: identical with and without) — the lever is "
-            "egress, i.e. a residential or rotating proxy."
+            "egress: set CHORDS_YTDLP_PROXY to a rotating residential pool. If "
+            "it is already set, this line means the pool itself was refused."
         )
         return True
     return any(marker in lowered for marker in _UNAVAILABLE_MARKERS)
+
+
+def _unavailable_error(stderr: str) -> VideoUnavailable:
+    """The right flavour of "can't have this one".
+
+    Identical on the wire either way; the difference is only whether a *retry on
+    a different container* has any chance of helping. See `EgressBlocked`.
+    """
+    return EgressBlocked() if _is_bot_check(stderr) else VideoUnavailable()
 
 
 def _run(command: list[str], *, timeout: int, cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -134,6 +148,42 @@ class YtDlpSource:
         self._cookies_path = os.environ.get("CHORDS_YTDLP_COOKIES") or None
         self._cookies_data = os.environ.get("CHORDS_YTDLP_COOKIES_CONTENT") or None
         self._materialized: str | None = None
+        # **The actual lever on the bot check**, and the only one measurement
+        # supports. Cookies changed nothing (6/30 both arms) and neither did the
+        # player client (six IPs × eight clients: the clean IP served all eight,
+        # the blocked ones refused all eight). The check is on the *address*, so
+        # the fix is to leave from somewhere else — a **rotating residential**
+        # proxy, as `scheme://user:pass@host:port`.
+        #
+        # Rotating and residential are both load-bearing words. A *static*
+        # datacentre address — which is what a cloud provider's static-egress
+        # feature sells you, Modal's `modal.Proxy` included — is the exact
+        # fingerprint this check exists to catch: one address fetching audio all
+        # day gets flagged once and then fails forever, with no fresh draw to
+        # retry into. That is strictly worse than the unproxied default.
+        #
+        # Unset is still a legitimate state — it costs money, so it is the
+        # owner's call — but it is no longer the *expected* one. When it is set,
+        # the first attempt is meant to work, and `modal_app` spends a much
+        # smaller retry budget accordingly (see `egress`).
+        self._proxy = os.environ.get("CHORDS_YTDLP_PROXY") or None
+
+    @property
+    def egress(self) -> str:
+        """`"proxy"` or `"direct"` — which way this container leaves the network.
+
+        Read by two callers that both need it and neither of which can see the
+        environment variable: `/healthz`, so an operator can tell a deployment
+        that is paying for clean egress from one that is drawing lots; and the
+        Modal worker, which sizes its retry budget from it. Twelve attempts is
+        the right number for a 1-in-6 lottery and pure waste when the first
+        attempt is bought and paid for.
+
+        A property rather than a field on the `VideoSource` protocol: only this
+        source leaves the network at all, and `FileSource` should not have to
+        answer a question about egress it does not have.
+        """
+        return "proxy" if self._proxy else "direct"
 
     @property
     def version(self) -> str:
@@ -191,6 +241,8 @@ class YtDlpSource:
         cookies = self._cookie_file()
         if cookies:
             args += ["--cookies", cookies]
+        if self._proxy:
+            args += ["--proxy", self._proxy]
         return args
 
     # -- metadata only ------------------------------------------------------
@@ -205,7 +257,7 @@ class YtDlpSource:
         )
         if result.returncode != 0:
             if _looks_unavailable(result.stderr):
-                raise VideoUnavailable()
+                raise _unavailable_error(result.stderr)
             log.warning("probe failed for %s: %s", video_id, (result.stderr or "").strip()[:400])
             raise FetchError("That video couldn’t be looked up.")
 
@@ -301,7 +353,7 @@ class YtDlpSource:
         )
         if result.returncode != 0:
             if _looks_unavailable(result.stderr):
-                raise VideoUnavailable()
+                raise _unavailable_error(result.stderr)
             log.warning("fetch failed for %s: %s", video_id, (result.stderr or "").strip()[:400])
             raise FetchError()
 

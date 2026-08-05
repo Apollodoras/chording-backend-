@@ -87,6 +87,45 @@ app = modal.App("rosetta-dechorder")
 _ON_POSTGRES = bool(os.environ.get("CHORDS_DATABASE_URL"))
 MAX_CONTAINERS = None if _ON_POSTGRES else 1
 
+# How many containers a single job may be handed to before its egress block is
+# reported as a failure. **Two budgets, because the retry is doing two different
+# jobs** depending on how the worker leaves the network (`YtDlpSource.egress`).
+#
+# Unproxied, a retry is a *lottery ticket*: each attempt is an independent draw
+# at a fresh Modal IP and ~1 in 6 clears YouTube's bot check, so twelve puts a
+# job's odds around 89% while bounding the worst case at twelve cold starts.
+# Raise it and the tail latency of a doomed job grows with no ceiling; lower it
+# and ordinary songs start failing for a reason that has nothing to do with them.
+#
+# Proxied, a retry is *insurance*: the first attempt is bought and paid for and
+# is supposed to work, so twelve attempts buys nothing and costs eleven cold
+# starts on the way to a failure that was never going to clear. Three covers a
+# transient miss in the provider's pool and gives up while the player is still
+# watching.
+#
+# This is a policy decision, not a tuning knob — the two numbers only make sense
+# next to the sentence explaining them, which is why they are here and not in
+# config. `tests/test_deployment.py` pins the relationship rather than the
+# values, by reading them out of this file (it cannot import it — see that
+# module's docstring).
+MAX_EGRESS_ATTEMPTS_DIRECT = 12
+MAX_EGRESS_ATTEMPTS_PROXIED = 3
+
+
+def egress_attempt_budget(source) -> int:
+    """The retry budget this source has earned.
+
+    `getattr` rather than an attribute on the `VideoSource` protocol: an upload
+    never leaves the network, and `FileSource` should not have to answer a
+    question about egress it does not have. Anything that cannot say gets the
+    lottery budget, which is the safe direction to be wrong in — it costs cold
+    starts rather than failing a song that a retry would have rescued.
+    """
+    return (MAX_EGRESS_ATTEMPTS_PROXIED
+            if getattr(source, "egress", "direct") == "proxy"
+            else MAX_EGRESS_ATTEMPTS_DIRECT)
+
+
 # MUST stay in step with `[project].dependencies` in pyproject.toml. This list is
 # a duplicate of it — Modal images are built from an explicit package list, not
 # from the local project — and `tests/test_deployment.py` asserts the two agree,
@@ -242,7 +281,8 @@ worker_secrets = [modal.Secret.from_name("chords-worker-secrets")]
     retries=0,          # a failed analysis is reported, never silently retried
 )
 def analysis_worker(job_id: str, video_id: str, difficulty: str, uid: str,
-                    audio: bytes | None = None, filename: str | None = None) -> None:
+                    audio: bytes | None = None, filename: str | None = None,
+                    attempt: int = 1) -> None:
     """One analysis, in its own container, with its own image and secret.
 
     Imports happen inside the function so the API image never has to satisfy
@@ -253,9 +293,25 @@ def analysis_worker(job_id: str, video_id: str, difficulty: str, uid: str,
     to put them — the worker mounts no Volume, and a recording parked anywhere
     durable is the invariant broken. They exist in this container's memory, get
     written only into the scratch directory, and die with the container.
+
+    **`attempt` is the answer to YouTube's bot check** (`EgressBlocked`). The
+    check is on the container's egress IP, and measurement put roughly one Modal
+    IP in six on the good side of it — for *every* yt-dlp player client, so no
+    amount of impersonation helps and only the address does. This container
+    cannot change its own address, so on a block it retires itself
+    (`stop_fetching_inputs`, otherwise a warm blocked container keeps drawing the
+    same dead IP) and re-spawns the same job.
+
+    How many times it is willing to do that depends on `CHORDS_YTDLP_PROXY` —
+    see `egress_attempt_budget`. Unproxied the retry *is* the mitigation and the
+    budget is twelve; proxied the first attempt is supposed to work and the
+    budget drops to three. The retry never became unnecessary, but once egress is
+    bought it stops being the plan.
     """
+    from modal.experimental import stop_fetching_inputs
+
     from app.config import load_settings
-    from app.jobs import run_job
+    from app.jobs import run_job, OUTCOME_EGRESS_BLOCKED
     from app.analysis.fetch import build_source
     from app.analysis.file_source import FileSource
     from app.analysis.scratch import assert_clean
@@ -266,9 +322,26 @@ def analysis_worker(job_id: str, video_id: str, difficulty: str, uid: str,
     source = (FileSource(audio, filename=filename, settings=settings)
               if audio is not None else build_source(settings))
 
+    # An upload never touches YouTube, so there is nothing for a retry to fix.
+    #
+    # No log line for the egress mode here, deliberately. It would be INFO on a
+    # container with no logging configuration, so it would not print — and a
+    # signal that silently does not exist is worse than no signal. The mode is
+    # visible where it is actually actionable: `ytdlp_source` logs the bot check
+    # at ERROR and names `CHORDS_YTDLP_PROXY` in the remedy, and `/healthz`
+    # reports `egress` on any container that can fetch at all.
+    retryable = audio is None and attempt < egress_attempt_budget(source)
+
     try:
-        run_job(job_id=job_id, video_id=video_id, difficulty=difficulty, uid=uid,
-                settings=settings, store=store, source=source)
+        outcome = run_job(job_id=job_id, video_id=video_id, difficulty=difficulty,
+                          uid=uid, settings=settings, store=store, source=source,
+                          may_retry_elsewhere=retryable)
+        if outcome == OUTCOME_EGRESS_BLOCKED:
+            # Order matters: retire this container *before* spawning, so the new
+            # input cannot be handed straight back to the IP that just failed.
+            stop_fetching_inputs()
+            analysis_worker.spawn(job_id, video_id, difficulty, uid,
+                                  attempt=attempt + 1)
     finally:
         # The check a per-job cleanup can't do: catches a crash between mkdir and
         # the `with`. The container is about to die and take its filesystem with

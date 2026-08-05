@@ -245,6 +245,12 @@ class FakeSource:
 
     name = "fake-source"
     version = "1.0.0"
+    # What the real source reports with no proxy configured, which is the
+    # deployment's default. Present so `/healthz`'s `egress` field is exercised
+    # by something other than the absent-source case — those two answers are
+    # different (`"direct"` vs `None`) and a fake that omitted this would make
+    # them look the same.
+    egress = "direct"
 
     def __init__(self, meta: VideoMeta | None = None, *, error: Exception | None = None):
         self.meta = meta or known_meta()

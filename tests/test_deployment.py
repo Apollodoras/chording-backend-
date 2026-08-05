@@ -367,3 +367,41 @@ def test_the_modal_image_installs_everything_pyproject_declares():
         f"the deployed image would be built without them, and the API container dies at "
         f"import rather than starting degraded"
     )
+
+
+def test_a_proxied_worker_retries_less_than_an_unproxied_one():
+    """The two egress retry budgets must not collapse into one number.
+
+    They encode different things. Unproxied, a retry is the *mitigation*: each
+    attempt is an independent draw at a fresh Modal IP, ~1 in 6 clears YouTube's
+    bot check, and twelve of them is what gets a job to ~89%. Proxied, the first
+    attempt is bought and paid for, so the same twelve buys nothing and spends
+    eleven cold starts arriving at a failure that was never going to clear.
+
+    Read out of the source for the same reason as BASE_PACKAGES above:
+    `modal_app.py` cannot be imported by this suite. The relationship is pinned
+    rather than the values — 12 and 3 are judgement calls and should stay
+    tunable; "proxied costs at least as much as unproxied" is the bug.
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / "modal_app.py").read_text())
+
+    budgets: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.startswith("MAX_EGRESS_ATTEMPTS"):
+                    budgets[target.id] = node.value.value
+
+    assert set(budgets) == {"MAX_EGRESS_ATTEMPTS_DIRECT", "MAX_EGRESS_ATTEMPTS_PROXIED"}, (
+        f"expected exactly the two egress budgets, found {sorted(budgets)} — a single "
+        f"MAX_EGRESS_ATTEMPTS means one of the two deployments is being charged the "
+        f"other's retry policy"
+    )
+    assert budgets["MAX_EGRESS_ATTEMPTS_PROXIED"] < budgets["MAX_EGRESS_ATTEMPTS_DIRECT"]
+    # Insurance, not abolition: a rotating pool can still miss, and a proxied
+    # deployment that never retries fails songs the second attempt would have got.
+    assert budgets["MAX_EGRESS_ATTEMPTS_PROXIED"] >= 2

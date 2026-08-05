@@ -19,7 +19,7 @@ mirrors deliberately — §16).
 
 **Working end to end, in the deployed shape, and now measured on the thing that
 actually matters.** A YouTube id (or an uploaded file) goes in; a linted
-`CompositionPayload` v2 and a `videoSync` sidecar come out. 336 tests, green, no
+`CompositionPayload` v2 and a `videoSync` sidecar come out. 348 tests, green, no
 audio and no network required to run them.
 
 That last clause is new and it was the important one. Every number this repo
@@ -32,8 +32,9 @@ engines so any error had to be the pipeline's own, the answer was **0.768** — 
 clean and all shipped a sidecar. It is **0.939** now. See
 [Measuring the deliverable](#measuring-the-deliverable-not-the-engine).
 
-The rights posture — what is stored, what is not, and which Chordify surfaces are
-deliberately not cloned — is [`RIGHTS.md`](RIGHTS.md).
+The rights posture — what is stored, what is not, which Chordify surfaces are
+deliberately not cloned, and the two rules the **client** repo has to keep so
+App Review 5.2.3 stays a non-event — is [`RIGHTS.md`](RIGHTS.md).
 
 | | |
 |---|---|
@@ -48,6 +49,7 @@ deliberately not cloned — is [`RIGHTS.md`](RIGHTS.md).
 | §16 API | ✅ Mo-shaped: Firebase bearer, `{message, code}` errors, job-id + poll |
 | §16.5 contract fixtures | ✅ emitted and byte-stable; the app-side test is a small follow-up (below) |
 | §5.1 fetch + decode | ✅ yt-dlp + ffmpeg, bounded, behind the §4 seam — **plus an upload path** with no YouTube-terms exposure ([`RIGHTS.md`](RIGHTS.md)) |
+| egress | ✅ per-IP bot check measured, retry across containers, and a proxy-aware retry budget — `CHORDS_YTDLP_PROXY` is unset and is the owner's call ([below](#the-bot-check-is-per-ip-and-cookies-do-not-fix-it)) |
 | the beat axis | ✅ one origin for chart, bars and anchors (`axis.py`) — the defect that cost 23 points |
 | §5.2/§5.3 engines | ✅ **BTC + Beat This!**, benchmarked against real recordings (below) |
 | §4 two-container shape | ✅ the API delegates to the worker; `tests/test_deployment.py` covers what `modal_app.py` relies on |
@@ -73,7 +75,7 @@ scratch root: empty
 ```bash
 python3.11 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 cp .env.example .env
-.venv/bin/python -m pytest              # 303 tests, ~20s, no network, no audio stack
+.venv/bin/python -m pytest              # 307 tests, ~20s, no network, no audio stack
 .venv/bin/uvicorn app.main:app --reload
 ```
 
@@ -590,20 +592,77 @@ reputation, not on the account**, so a session credential buys nothing — and a
 real credential you keep for no benefit is worse than one you never stored. The
 cookies were removed from the secret and the local copy deleted.
 
-Two consequences worth building on:
+Three consequences worth building on:
 
-1. **Retrying is the mitigation.** Each attempt lands on its own container and so
-   its own IP; six independent tries turn a 20% coin toss into ~74%. That is what
-   `scripts/real_song_check.py --attempts N` does, and it is the shape production
-   should copy. A losing attempt returns after `probe`, before any audio is
-   fetched, so it costs seconds and no bandwidth. The real fix is egress: a
-   residential or rotating proxy.
-2. **Label-owned music is a second, separate wall.** Every official Beatles
+1. **Retrying is the mitigation, and production does it now** (2026-08-04). Each
+   attempt lands on its own container and so its own IP, and a losing attempt
+   returns after `probe`, before any audio is fetched, so it costs seconds and no
+   bandwidth. `analysis_worker` raises `EgressBlocked` — a `VideoUnavailable`
+   subclass, so the wire contract is untouched and only the worker can tell the
+   difference — then retires its own container with
+   `modal.experimental.stop_fetching_inputs()` and re-spawns the job.
+   **The self-retirement is load-bearing:** without it a warm blocked container
+   keeps taking the retry and drawing the same dead IP. Between attempts the job
+   row is left alive, un-refunded and back at `queued`, so a polling client sees
+   "still working" and never a failure that un-fails
+   (`run_job(..., may_retry_elsewhere=True)`; the last attempt passes `False`, so
+   the failure still lands somewhere).
+
+   Verified live: nine blocked containers, then one through, and a real map
+   written — about five minutes, which is why the iOS client's poll deadline had
+   to move 240 s → 480 s.
+
+   **The player client is not a lever, and was measured before being dismissed.**
+   Six containers × eight clients (`default`, `web_safari`, `mweb`, `android`,
+   `ios`, `tv`, `tv_embedded`, `web_embedded`): the one clean IP served all eight,
+   the five blocked IPs refused all eight. So a `player_client` knob was
+   deliberately **not** added — it would only look like a lever.
+
+2. **The fix is egress, and the retry budget now says so** (2026-08-04). Set
+   **`CHORDS_YTDLP_PROXY`** to a *rotating residential* pool and the first
+   attempt is meant to work. `egress_attempt_budget()` reads
+   `YtDlpSource.egress` and spends accordingly:
+
+   | egress | budget | what a retry is |
+   |---|---|---|
+   | `direct` | `MAX_EGRESS_ATTEMPTS_DIRECT = 12` | the mitigation — twelve draws at ~1/6 gets a job to ~89% |
+   | `proxy` | `MAX_EGRESS_ATTEMPTS_PROXIED = 3` | insurance against a pool miss; twelve would just be eleven cold starts on the way to the same failure |
+
+   Both adjectives on "rotating residential" are load-bearing. A **static
+   datacentre** address — which is what a cloud provider's static-egress feature
+   sells you, `modal.Proxy` included — is the exact fingerprint the check looks
+   for, and is strictly worse than the unproxied default: it trades a 1-in-6
+   draw for a permanent no. The cost is bounded by the cache, which is the part
+   that makes it affordable: a map is stored per `videoId` and shared across
+   every user, so a proxied fetch is paid once per *song ever* — a few MB at
+   `-f worstaudio[abr>=64]`, roughly a cent at 2026 pricing — and nothing after.
+
+   `/healthz` reports `egress` — `"direct"`, `"proxy"`, or `null` on a container
+   with no audio stack — **which on the deployed shape means the API container
+   always answers `null`.** That is the honest answer, not a gap: fetching lives
+   in the worker, the API image has `source=None` by design (§4), and the proxy
+   credential is deliberately not in a container that has no use for it. So
+   `scripts/smoke.py` warns when it *can* see an unproxied deployment (a local
+   or single-container run) and prints "not visible from the API container"
+   otherwise, rather than marking a correctly-configured deployment red. Ask the
+   thing that knows, or say you cannot see — the same rule that made `canAnalyze`
+   ask the runner instead of this container's own capabilities.
+
+   Unproxied is a real deployment; it just means the success rate tracks
+   Google's datacentre policy rather than anything in this repo.
+
+3. **Label-owned music is a second, separate wall.** Every official Beatles
    upload in `bench/corpus.json` is refused in every player client. On the one
    occasion cookies *did* clear the bot check, YouTube answered with storyboard
    images (`sb0`–`sb3`, mhtml) and no audio format at all — the PO-token/SABR
    path, which needs a token provider, not a credential. The corpus ids are kept
    under `--songs isophonics` so the situation stays checkable.
+
+   A PO-token provider is **not** the missing piece, and it is worth not
+   spending a week finding that out: yt-dlp's own provider documentation now
+   states that passing PO tokens no longer clears the bot check in the majority
+   of cases. It is a moving target maintained against a service that keeps
+   changing it. Egress is the stable lever.
 
 `ytdlp_source` still accepts both cookie settings. They are the right mechanism
 for age-restricted and members-only video, and worth revisiting if egress ever
