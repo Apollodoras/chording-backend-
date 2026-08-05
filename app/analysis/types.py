@@ -101,7 +101,13 @@ class EnergyCurve:
     one.
     """
 
-    hop_ms: int
+    # **Float, and it has to be.** A hop is 1024 samples at 22.05 kHz, i.e.
+    # 46.44 ms, and rounding that to 46 is not a rounding error — it is a 0.95%
+    # *rate* error that accumulates. Three minutes in, the window read for a bar
+    # sat two seconds — most of a bar — away from the bar it claimed to measure,
+    # so the verse/chorus comparison this curve exists to make was quietly being
+    # taken over the wrong music.
+    hop_ms: float
     values: list[float]
 
     def mean_between(self, start_ms: float, end_ms: float) -> float:

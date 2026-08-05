@@ -170,6 +170,31 @@ def test_an_empty_curve_is_treated_as_no_curve():
     assert song_model.per_bar_energy(EnergyCurve(hop_ms=0, values=[1.0]), model.axis) is None
 
 
+def test_the_hop_is_a_real_duration_and_not_a_whole_millisecond():
+    """1024 samples at 22.05 kHz is 46.44 ms, and rounding it to 46 is a ~1%
+    *rate* error, not a rounding error. Three minutes in, the window read for a
+    bar sat two seconds — most of a bar — from the bar it claimed to measure, so
+    the verse/chorus comparison the curve exists for was taken over the wrong
+    music. Asserted at four minutes, where the drift is most of a bar."""
+    hop = 1000.0 * 1024 / 22050
+    assert hop != round(hop)
+
+    four_minutes_ms = 240_000
+    # One frame per hop for four minutes, silent except for a one-second burst
+    # starting at exactly four minutes in.
+    frames = int(four_minutes_ms / hop) + 100
+    values = [0.0] * frames
+    burst_first = int(four_minutes_ms / hop)
+    for i in range(burst_first, burst_first + int(1000 / hop)):
+        values[i] = 1.0
+
+    honest = EnergyCurve(hop_ms=hop, values=values)
+    rounded = EnergyCurve(hop_ms=float(round(hop)), values=values)
+    assert honest.mean_between(four_minutes_ms, four_minutes_ms + 1000) > 0.9
+    assert rounded.mean_between(four_minutes_ms, four_minutes_ms + 1000) < 0.1, \
+        "the rounded hop reads a window two seconds away and finds silence"
+
+
 # --- the consensus switch ----------------------------------------------------
 
 def test_the_vote_can_be_turned_off():

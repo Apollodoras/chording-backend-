@@ -101,11 +101,32 @@ def test_a_near_identical_neighbour_is_folded_in_rather_than_split_off():
     assert sections[0].total_bars == 8
 
 
-def test_no_section_is_shorter_than_the_floor():
+def test_a_runt_is_absorbed_into_a_neighbour_that_can_afford_it():
+    """§15's ~4-bar floor, where applying it costs nothing: the host here is a
+    single explicit pass, so swallowing the runt loses no encoding."""
+    verse = [_bar(7), _bar(2), _bar(4, MINOR), _bar(0)]
+    variant = [_bar(7), _bar(2), _bar(4, MINOR), _bar(9, MINOR)]
+    runt = [_bar(5), _bar(9, MINOR)]
+    sections = segment(verse + variant + runt)
+    assert len(sections) == 1
+    assert all(s.total_bars >= MIN_SECTION_BARS for s in sections)
+
+
+def test_the_floor_never_costs_a_collapsed_repeat():
+    """...and where it *would* cost something, the runt stands on its own.
+
+    The floor is a §15 preference; `repeats` is an encoding the container and the
+    player's rail both read. Absorbing a two-bar tag into a verse played twice
+    means flattening `repeats: 2` into eight explicit bars and pulling the tag
+    into the verse's group — which is how a two-bar intro used to turn a whole
+    song into one eighteen-bar section carrying the intro's strum pattern. A
+    short honest section is the cheaper lie, and lint has no minimum length.
+    """
     verse = [_bar(7), _bar(2), _bar(4, MINOR), _bar(0)]
     runt = [_bar(5), _bar(9, MINOR)]
     sections = segment(verse * 2 + runt)
-    assert all(s.total_bars >= MIN_SECTION_BARS for s in sections)
+    assert [(s.total_bars, s.repeats) for s in sections] == [(8, 2), (2, 1)]
+    assert sections[0].group != sections[1].group, "the tag is not part of the verse"
 
 
 def test_sections_tile_the_song_with_no_gaps():

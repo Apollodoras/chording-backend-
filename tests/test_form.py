@@ -100,6 +100,56 @@ def test_a_two_bar_intro_does_not_destroy_the_form():
     assert verses, f"the verse was not recovered: {[(g.label, g.occurrences) for g in groups]}"
 
 
+def test_a_two_bar_intro_does_not_destroy_the_form_at_section_level_either():
+    """The assertion above passed all along — and the song was still ruined.
+
+    Clustering got it right and *section assembly* threw the answer away: the
+    runt intro was merged forwards into the verse, the merged section was handed
+    the **intro's** group, and `repeats: 4` was flattened. The whole song came
+    out as one eighteen-bar section carrying two bars' worth of strum evidence,
+    while the verse group's pooled sixteen-bar pattern was computed and
+    referenced by nothing. Groups are not the deliverable; sections are.
+    """
+    intro = [_bar(F), _bar(F)]
+    sections, groups = detect(intro + VERSE * 4, bar_beats=4.0)
+
+    assert len(sections) == 2, "the intro is still its own section"
+    assert sections[0].total_bars == 2 and sections[0].repeats == 1
+    assert sections[1].repeats == 4, "the verse keeps its collapsed encoding"
+    assert sections[0].group != sections[1].group
+
+    verse_group = next(g for g in groups if g.label == sections[1].group)
+    assert len(verse_group.occurrences) == 4, "and the section points at the verse's group"
+
+
+def test_the_last_occurrence_stays_in_its_group_when_the_song_ends_on_a_tag():
+    """Real songs rarely end on an exact multiple of their own period, so this
+    was the *last section of most songs*: the short tail was merged into the
+    final block before clustering, that block no longer matched the group's
+    length, and `block_similarity` scores unequal lengths 0. The last verse
+    stopped being a verse — excluded from the consensus vote, its onsets never
+    pooled into the verse's pattern, and drawn on the rail as different music."""
+    tag = [_bar(F), _bar(F)]
+    sections, groups = detect(VERSE * 4 + tag, bar_beats=4.0)
+
+    verse_group = next(g for g in groups if g.length_bars == 4)
+    assert verse_group.occurrences == [0, 4, 8, 12], "all four passes, including the last"
+    assert [s.total_bars for s in sections] == [16, 2]
+    assert sections[0].repeats == 4
+
+
+def test_the_twelve_bar_blues_is_one_section_and_not_three():
+    """`CANDIDATE_UNITS` had no 12, so the core blues form was chopped at period
+    4 and its I/IV/V phrases scattered across groups that are not sections —
+    three choruses came out as `A B B A B B A B B`."""
+    blues = ([_bar(C)] * 4 + [_bar(F)] * 2 + [_bar(C)] * 2
+             + [_bar(G)] + [_bar(F)] + [_bar(C)] * 2)
+    assert period(blues * 3, 4.0) == 12
+    sections, groups = detect(blues * 3, bar_beats=4.0)
+    assert len(groups) == 1 and groups[0].length_bars == 12
+    assert len(sections) == 1 and sections[0].repeats == 3
+
+
 # --- the encoding ------------------------------------------------------------
 
 def test_identical_repeats_still_collapse_with_repeats():
@@ -177,3 +227,45 @@ def test_with_energy_the_loudest_repeated_group_is_the_chorus():
     sections = segment(SONG, energy=energy)
     assert [s.kind for s in sections] == ["verse", "chorus", "verse"]
     assert all(s.name == "" for s in sections), "empty name = use the kind's own label"
+
+
+def test_a_section_the_song_plays_once_in_the_middle_is_a_bridge():
+    """It was `verse` before — confidently wrong about the one section a
+    listener would never confuse with anything else."""
+    bridge = [_bar(F), _bar(C), _bar(F), _bar(C)]
+    bars = VERSE * 2 + CHORUS * 2 + bridge + CHORUS * 2
+    energy = [0.3] * 8 + [0.9] * 8 + [0.5] * 4 + [0.9] * 8
+    sections = segment(bars, energy=energy)
+    assert [s.kind for s in sections] == ["verse", "chorus", "bridge", "chorus"]
+
+
+def test_a_repeated_group_that_ends_on_the_dominant_before_the_chorus_is_a_prechorus():
+    """`harmony.is_dominant_of` was written for exactly this half-cadence cue and
+    then called by nothing — its docstring pointed at a `form.label` that does
+    not exist. In G, the section leaning on D before the chorus is the one the
+    player is being set up for."""
+    pre = [_bar(C), _bar(C), _bar(D), _bar(D)]      # … ends on V of G
+    bars = VERSE * 2 + pre * 2 + CHORUS * 2 + VERSE * 2 + pre * 2 + CHORUS * 2
+    energy = ([0.3] * 8 + [0.5] * 8 + [0.9] * 8) * 2
+    sections = segment(bars, energy=energy, tonic_pc=G)
+    assert [s.kind for s in sections] == ["verse", "preChorus", "chorus"] * 2
+
+
+def test_a_lone_verse_ending_on_the_dominant_is_still_a_verse():
+    """The guard that makes the cue safe. A verse ending on V to lead into the
+    chorus is the most ordinary thing in this repertoire — without requiring a
+    *second* repeated non-chorus group, every folk verse becomes a pre-chorus."""
+    verse = [_bar(G), _bar(E, MINOR), _bar(C), _bar(D)]     # ends on V of G
+    bars = verse * 2 + CHORUS * 2 + verse * 2
+    energy = [0.3] * 8 + [0.9] * 8 + [0.3] * 8
+    sections = segment(bars, energy=energy, tonic_pc=G)
+    assert [s.kind for s in sections] == ["verse", "chorus", "verse"]
+
+
+def test_without_a_key_the_prechorus_cue_is_simply_unavailable():
+    """`tonic_pc` is optional and only ever *adds* a label."""
+    pre = [_bar(C), _bar(C), _bar(D), _bar(D)]
+    bars = VERSE * 2 + pre * 2 + CHORUS * 2 + VERSE * 2 + pre * 2 + CHORUS * 2
+    energy = ([0.3] * 8 + [0.5] * 8 + [0.9] * 8) * 2
+    sections = segment(bars, energy=energy)
+    assert [s.kind for s in sections] == ["verse", "verse", "chorus"] * 2

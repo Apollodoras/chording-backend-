@@ -138,7 +138,8 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
 
     # First pass: find the groups. Fuzzy on purpose — this has to work on the
     # engine's mistakes, since removing them is what it is for.
-    _, groups = form.detect(bars, bar_beats=bar_beats, energy=bar_energy)
+    _, groups = form.detect(bars, bar_beats=bar_beats, energy=bar_energy,
+                            tonic_pc=key.tonic_pc)
 
     report = ConsensusReport()
     if vote:
@@ -149,7 +150,8 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
 
     # Second pass: encode them. Occurrences the vote brought into line can now
     # collapse with `repeats`, which they could not before.
-    sections, groups = form.detect(bars, bar_beats=bar_beats, energy=bar_energy)
+    sections, groups = form.detect(bars, bar_beats=bar_beats, energy=bar_energy,
+                                   tonic_pc=key.tonic_pc)
 
     # The song's own meter, not `f"{bar_beats}/4"`: `bar_beats` is quarter-note
     # beats, so synthesising a signature from it labelled every 6/8 song's

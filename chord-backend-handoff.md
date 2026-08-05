@@ -627,6 +627,9 @@ and it is also the cheapest place to be wrong-but-harmless.
   have lyrics at all (§2.4).
 - Practical floor: one section per structural segment, minimum ~4 bars. Merging
   near-identical adjacent segments reads better than a 14-section song.
+  *(Amended by §20.3: the floor yields when honouring it would flatten a
+  `repeats > 1` neighbour, and the tail-joins-previous rule moved to after
+  clustering. Both destroyed repeat groups on ordinary input.)*
 - `repeats` is your friend: a 4-bar progression played 4× is one section with
   `repeats: 4`, not 16 bars of explicit chords.
 
@@ -868,9 +871,42 @@ Bars are compared by **sound** (`harmony.similarity`), blocks are matched
 **phase** is chosen by how much repetition it exposes — a song opening with a
 two-bar intro used to put every boundary two bars out.
 
-The output is a set of **repeat groups** with rehearsal letters. §15's ~4-bar
-floor, its tail-joins-previous rule and its `Part N` fallback are unchanged.
-`repeats` is still only used for *identical* passes, never merely similar ones.
+The output is a set of **repeat groups** with rehearsal letters, and §15's
+`Part N` fallback is unchanged. `repeats` is still only used for *identical*
+passes, never merely similar ones.
+
+Two of §15's rules had to move, because both were written for a pipeline with no
+clustering step in it and both destroyed the groups on ordinary input
+(`app/analysis/form.py` carries the reasoning, `PIPELINE-AUDIT.md` the evidence):
+
+- **The tail no longer joins the previous block.** That rule is right at *section*
+  level and wrong before clustering: a four-bar verse with a two-bar tag stuck on
+  it is a six-bar block, and blocks of unequal length score 0, so the song's last
+  verse stopped being an occurrence of the verse — no consensus vote, onsets not
+  pooled into the verse's strum pattern, drawn on the rail as different music.
+  Since songs rarely end on an exact multiple of their own period, that was the
+  last section of most songs. The tail is now its own block and the floor is
+  applied afterwards.
+- **The ~4-bar floor yields to `repeats`.** Absorbing a runt into a neighbour
+  played 4× means flattening `repeats: 4` and pulling the runt's bars into
+  another group's section — which turned `2-bar intro + verse ×4` into one
+  eighteen-bar section carrying the *intro's* strum pattern. When the neighbour
+  is a collapsed repeat the runt now stays a short section of its own. The floor
+  is a preference; `repeats` is an encoding the client reads, and lint imposes no
+  minimum section length.
+
+`CANDIDATE_UNITS` also gained **12** — without it the twelve-bar blues, which is
+core repertoire, was chopped at period 4 and its I/IV/V phrases scattered across
+groups that are not sections — and 6, for six-bar phrases and the 12/8 blues.
+
+Section *kinds* now include `bridge` (a group the song plays once, mid-song) and
+`preChorus` (a repeated non-chorus group ending on the key's V immediately before
+the chorus — `harmony.is_dominant_of`, which existed for this and was called by
+nothing). The pre-chorus cue is gated on the song having **two or more** repeated
+non-chorus groups, because a lone verse ending on V to lead into the chorus is
+the most ordinary thing in this repertoire. `solo` stays unreachable: telling a
+solo from a verse is a question about timbre, and one loudness scalar per hop
+cannot answer it.
 
 ### 20.4 Consensus (`consensus.py`) — the dangerous part
 

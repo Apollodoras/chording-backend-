@@ -210,7 +210,9 @@ def is_dominant_of(root_pc: int, quality: str, tonic_pc: int) -> bool:
 
     A block that ends on the dominant is leaning on what comes next, which is
     the one structural cue that distinguishes a pre-chorus from a verse well
-    enough to be worth printing on the player's screen (`form.label`).
+    enough to be worth printing on the player's screen (`form._assign_labels`,
+    which gates it further — see the note there on why one repeated group is
+    never enough).
     """
     return (root_pc - tonic_pc) % 12 == 7 and quality in {MAJOR, DOMINANT7, SUS4}
 

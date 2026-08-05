@@ -34,11 +34,16 @@ blocks, matched nothing, and the whole form dissolved. The grid's offset is now
 chosen by how much repetition it exposes, which is exactly the thing a wrong
 offset destroys.
 
-What is deliberately unchanged: §15's ~4-bar floor, the tail-joins-previous
-rule, and the honest `Part N` fallback. Labels are player-visible — campfire's
-header prints them — and §15 is explicit that being wrong-but-harmless is
-cheaper than being confidently wrong. Naming still requires evidence, and
-`keyfinder`/`harmony` supply some of it now (see `label`).
+§15's honest `Part N` fallback is unchanged. Labels are player-visible —
+campfire's header prints them — and §15 is explicit that being wrong-but-harmless
+is cheaper than being confidently wrong. Naming still requires evidence, and
+`keyfinder`/`harmony` supply some of it now (see `_assign_labels`).
+
+**Two of §15's rules did have to move**, and both for the same reason: they were
+written for a pipeline with no clustering step in it, so both quietly destroyed
+the groups everything above depends on. The tail no longer joins the previous
+block (`_chunk`), and the ~4-bar floor yields rather than flatten a collapsed
+repeat (`_absorb_runts`). Each function carries the case that forced it.
 """
 
 from __future__ import annotations
@@ -48,10 +53,16 @@ from dataclasses import dataclass, field
 from . import harmony
 from .structure import MIN_SECTION_BARS, BarChord, Section
 
-# Progression lengths worth testing, most-likely first — §15's list, unchanged.
-# Four bars is the folk default; eight covers a long verse; two catches a vamp;
-# sixteen exists so a through-composed section isn't chopped into quarters.
-CANDIDATE_UNITS = (4, 8, 2, 16)
+# Progression lengths worth testing, most-likely first. Four bars is the folk
+# default; eight covers a long verse; **twelve is the blues**, which is core
+# campfire repertoire and was missing — without it the twelve-bar form is chopped
+# at period 4 and its I/IV/V phrases scatter across three groups that are not
+# really sections; two catches a vamp; six covers a six-bar phrase and the 12/8
+# blues; sixteen exists so a through-composed section isn't chopped into quarters.
+#
+# Order matters only for the fallbacks below (`CANDIDATE_UNITS[0]`) — the winner
+# is chosen shortest-first from the scores, not from this order.
+CANDIDATE_UNITS = (4, 8, 12, 2, 6, 16)
 
 # How alike two blocks must sound to be called the same section. Measured with
 # `harmony.similarity` now, so 0.75 means "three of four bars identical, or four
@@ -206,8 +217,20 @@ def _chunk(bars: list[list[BarChord]], unit: int, phase: int) -> list[Block]:
     """Split into blocks of `unit` bars, starting the grid at `phase`.
 
     The bars before `phase` become a block of their own — that is the intro the
-    phase exists to separate — and a short tail joins the previous block rather
-    than becoming a section of its own (§15, unchanged).
+    phase exists to separate — and **so do the bars after the last full block**.
+
+    §15's rule was that a short tail joins the previous block. That is right at
+    *section* level and wrong here, because clustering happens in between: a
+    four-bar verse with a two-bar tag stuck on its end is a six-bar block, and
+    `block_similarity` scores blocks of unequal length 0. So the song's last
+    verse stopped being an occurrence of the verse — it was excluded from the
+    consensus vote, its onsets never pooled into the verse's strum pattern, and
+    the rail labelled it as different music. Real songs rarely end on an exact
+    multiple of their own period, so this cost the *last section of most songs*.
+
+    The tail is now left standing as its own short block, clusters on its own
+    terms, and `_absorb_runts` applies the ~4-bar floor afterwards, at section
+    level, where it belongs.
     """
     unit = max(1, unit)
     edges = list(range(phase, len(bars), unit))
@@ -218,10 +241,6 @@ def _chunk(bars: list[list[BarChord]], unit: int, phase: int) -> list[Block]:
         end = edges[i + 1] if i + 1 < len(edges) else len(bars)
         if end > start:
             blocks.append(Block(start_bar=start, bars=tuple(tuple(b) for b in bars[start:end])))
-    if len(blocks) > 1 and blocks[-1].length < unit:
-        tail = blocks.pop()
-        merged = blocks[-1]
-        blocks[-1] = Block(start_bar=merged.start_bar, bars=merged.bars + tail.bars)
     return blocks
 
 
@@ -233,6 +252,13 @@ def _repetition_score(blocks: list[Block], bar_beats: float) -> float:
     misaligned grid destroys exactly this: chop a repeating 4-bar verse two bars
     late and every block becomes half of one verse and half of the next, which
     matches nothing.
+
+    Runt blocks are scored too, at the 0 they inevitably earn — and that is
+    deliberate, not an oversight. A runt is a bar the grid failed to explain, so
+    the penalty is real information about the offset. Excluding them (tried, and
+    reverted) hands the search a way to cheat: it can shift the grid until the
+    song's one misheard bar falls into the tail runt, score a perfect 1.0 on
+    what is left, and adopt an offset that is wrong everywhere.
     """
     if len(blocks) < 2:
         return 0.0
@@ -322,11 +348,16 @@ def _label_for(index: int) -> str:
 # --- assembling sections ----------------------------------------------------
 
 def detect(bars: list[list[BarChord]], *, bar_beats: float = 4.0,
-           energy: list[float] | None = None) -> tuple[list[Section], list[RepeatGroup]]:
+           energy: list[float] | None = None, tonic_pc: int | None = None
+           ) -> tuple[list[Section], list[RepeatGroup]]:
     """Bars → the song's sections and the repeat groups behind them.
 
     The sections are what goes on the wire; the groups are what `consensus.py`
     votes over and what makes two distant sections know they are the same music.
+
+    `tonic_pc` is optional and only ever *adds* a label: without it the half
+    cadence that distinguishes a pre-chorus cannot be read, and those sections
+    stay verses.
     """
     if not bars:
         return [], []
@@ -338,14 +369,14 @@ def detect(bars: list[list[BarChord]], *, bar_beats: float = 4.0,
     sections = _sections_from(blocks, assignment, groups)
     sections = _absorb_runts(sections)
     _assign_positions(sections)
-    _assign_labels(sections, groups, energy=energy, unit=unit)
+    _assign_labels(sections, groups, energy=energy, unit=unit, tonic_pc=tonic_pc)
     return sections, groups
 
 
 def segment(bars: list[list[BarChord]], *, energy: list[float] | None = None,
-            bar_beats: float = 4.0) -> list[Section]:
+            bar_beats: float = 4.0, tonic_pc: int | None = None) -> list[Section]:
     """`detect`, for callers that only want the sections (§15's old entry point)."""
-    return detect(bars, bar_beats=bar_beats, energy=energy)[0]
+    return detect(bars, bar_beats=bar_beats, energy=energy, tonic_pc=tonic_pc)[0]
 
 
 def _sections_from(blocks: list[Block], assignment: list[int],
@@ -387,22 +418,43 @@ def _expanded(section: Section) -> list[list[BarChord]]:
 
 
 def _absorb_runts(sections: list[Section]) -> list[Section]:
-    """§15's ~4-bar floor. A runt's bars are expanded into a neighbour rather
-    than dropped, so no bar of the song is ever lost."""
+    """§15's ~4-bar floor, applied only where it costs nothing.
+
+    A runt's bars are expanded into a neighbour rather than dropped, so no bar of
+    the song is ever lost. Two rules make that safe, and the absence of both is
+    what turned a two-bar intro into a song with no form at all:
+
+    **The host keeps its own group.** A head merge used to hand the merged
+    section the *runt's* group, so `intro + verse ×4` came out as one section
+    carrying the intro's letter — and `compile` then attached the intro's strum
+    pattern (two bars of evidence, so in practice the fallback) to sixteen bars
+    of verse, while the verse group's pooled pattern was computed and never
+    referenced by anything.
+
+    **A collapsed repeat is never expanded.** Absorbing into a host with
+    `repeats > 1` has to flatten it, which destroys the `repeats: 4` encoding
+    §15 wants on the wire, erases the repeat from the player's rail, and — the
+    real cost — merges bars belonging to one group into a section belonging to
+    another. So when the neighbour is a collapsed repeat the runt simply stays a
+    short section of its own. The ~4-bar floor is a §15 *preference*; the
+    container has no such rule, and a standalone two-bar intro is a far smaller
+    lie than an eighteen-bar section that claims to be one piece of music.
+    """
     if len(sections) <= 1:
         return sections
     out: list[Section] = []
     for section in sections:
-        if section.total_bars >= MIN_SECTION_BARS or not out:
+        if section.total_bars >= MIN_SECTION_BARS or not out or out[-1].repeats > 1:
             out.append(section)
             continue
         out[-1].bars = _expanded(out[-1]) + _expanded(section)
         out[-1].repeats = 1
-    if len(out) > 1 and out[0].total_bars < MIN_SECTION_BARS:
+    # The head has no previous section to join, so it merges forwards instead —
+    # under the same two rules.
+    if len(out) > 1 and out[0].total_bars < MIN_SECTION_BARS and out[1].repeats == 1:
         head = out.pop(0)
         out[0].bars = _expanded(head) + _expanded(out[0])
         out[0].repeats = 1
-        out[0].group = head.group
     return out
 
 
@@ -416,7 +468,8 @@ def _assign_positions(sections: list[Section]) -> None:
 # --- naming -----------------------------------------------------------------
 
 def _assign_labels(sections: list[Section], groups: list[RepeatGroup], *,
-                   energy: list[float] | None, unit: int) -> None:
+                   energy: list[float] | None, unit: int,
+                   tonic_pc: int | None = None) -> None:
     """Give each section a `kindRaw`, and a name when we can't justify a kind.
 
     Without an energy hint everything is `custom` + "Part N" — §15's fallback,
@@ -426,9 +479,30 @@ def _assign_labels(sections: list[Section], groups: list[RepeatGroup], *,
     section's, so the same music carries the same name wherever it returns; the
     player reading the rail can see that part 1 has come back.
 
-    With an energy hint the loudest repeated group is the chorus, other repeated
-    groups are verses, and a short unique block at either end is the
-    intro/outro.
+    With an energy hint the loudest repeated group is the chorus, a unique
+    mid-song group is the bridge, a repeated group leaning on the chorus is the
+    pre-chorus, a short unique block at either end is the intro/outro, and
+    everything else is a verse.
+
+    The last two of those are new, and they are here because the vocabulary was
+    unfinished rather than because it was deliberately small: `preChorus` and
+    `bridge` are both in the container's `SECTION_KINDS`, and
+    `harmony.is_dominant_of` was written for the pre-chorus cue and then called
+    by nothing. Each is gated on a structural fact rather than a guess —
+
+    - **bridge**: a group the song plays *once*, in the middle. That is what the
+      word means, and calling it `verse` (which is what happened before) is
+      confidently wrong about the one section a listener would never confuse.
+    - **preChorus**: a repeated non-chorus group that sits immediately before the
+      chorus and ends on the key's V — a half cadence leaning on what follows.
+      Guarded on the song having *more than one* repeated non-chorus group,
+      because a lone verse ending on the dominant to lead into the chorus is the
+      most ordinary thing in this repertoire, and without that guard every folk
+      verse in the corpus would be relabelled.
+
+    `solo` stays unreachable on purpose. Telling a solo from a verse is a
+    question about *timbre* — who is playing the melody — and nothing that
+    crosses the audio boundary here (one loudness scalar per hop) can answer it.
     """
     if not sections:
         return
@@ -449,17 +523,41 @@ def _assign_labels(sections: list[Section], groups: list[RepeatGroup], *,
     # several passes, which is what happens when its occurrences were adjacent.
     repeated |= {s.group for s in sections if s.repeats > 1}
     chorus = max(repeated, key=lambda g: (means.get(g, 0.0), g), default=None)
+    # The song's other repeated material — what a pre-chorus has to be one of.
+    siblings = repeated - {chorus}
 
     for index, section in enumerate(sections):
         section.name = ""   # "" = use the kind's own display name
+        following = sections[index + 1] if index + 1 < len(sections) else None
+        mid_song = 0 < index < len(sections) - 1
         if section.group == chorus:
             section.kind = "chorus"
         elif index == 0 and section.repeats == 1 and section.total_bars <= unit:
             section.kind = "intro"
         elif index == len(sections) - 1 and section.repeats == 1 and section.total_bars <= unit:
             section.kind = "outro"
+        elif _leans_on(section, following, chorus, siblings, tonic_pc):
+            section.kind = "preChorus"
+        elif section.group not in repeated and mid_song:
+            section.kind = "bridge"
         else:
             section.kind = "verse"
+
+
+def _leans_on(section: Section, following: Section | None, chorus: str | None,
+              siblings: set[str], tonic_pc: int | None) -> bool:
+    """Whether this section is a pre-chorus: repeated, before the chorus, on V."""
+    if tonic_pc is None or chorus is None or following is None:
+        return False
+    if following.group != chorus or section.group == chorus:
+        return False
+    if len(siblings) < 2 or section.group not in siblings:
+        return False
+    last_bar = section.bars[-1] if section.bars else []
+    if not last_bar:
+        return False
+    final = last_bar[-1]
+    return harmony.is_dominant_of(final.root_pc, final.quality, tonic_pc)
 
 
 def _mean_energy(energy: list[float], section: Section) -> float:
