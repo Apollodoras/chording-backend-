@@ -432,7 +432,35 @@ POST /v1/analyze/upload   {file}     ──┘        (free — §16.4, id is a 
                                        │
                        §12 compile ──► lint ──► Postgres: chord_maps
 GET /v1/analyze/{jobId} ──► status / {song, videoSync}
+
+GET /v1/catalog          ──► chord_maps, newest first ──► the app's home screen
+GET /v1/catalog/version  ──► "<count>:<newest analyzed_at>"
 ```
+
+**The catalog is what makes the app's home screen exist** (added 2026-08-06). It
+lists every analyzed song, newest first, so a player who has analyzed nothing
+still has something to play — the cold-start problem solved by sharing, since
+every row is a cache hit and costs no quota, no egress and no wait. Three things
+about it are load-bearing:
+
+- **Blocked videos and channels are excluded in SQL**, not filtered afterwards.
+  §3's takedown has to hold on a listing as firmly as on `GET /v1/maps/{id}`; a
+  blocked video that vanishes from the detail route but still sits on a home
+  screen is a takedown that did not happen.
+- **One row per video.** A video analyzed at three difficulties is three rows in
+  `chord_maps` and one *song* in the catalog, so the listing collapses to the
+  newest per video id and pages after collapsing.
+- **Readable without signing in** (`_principal_browsing`). Every other route needs
+  an identity because it spends quota or starts work; this one only reads rows
+  that already exist, and refusing it would empty the home screen for exactly the
+  person it is for — someone deciding whether to sign up at all. Anonymous callers
+  still get an IP-keyed uid, so both rate limiters apply.
+
+`/v1/catalog/version` is the cheap half: the client polls it and pulls the list
+only when the token moves, so "a song someone else added shows up" costs one short
+string rather than the whole catalog. Rows carry the chords, key and tempo read
+straight off the stored `CompositionPayload`, so a card needs no second round
+trip; artwork is the video's own poster, which the client derives from the id.
 
 Two input paths, and the difference is legal rather than technical: `/v1/analyze`
 fetches a YouTube recording (which §2 concedes contravenes the API terms as

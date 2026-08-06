@@ -5,6 +5,8 @@
 | `POST /v1/analyze` | `{videoId \\| url, difficulty?}` | `{song, videoSync}` or `{jobId, status}` |
 | `GET /v1/analyze/{jobId}` | — | `{status, progress, song?, videoSync?, message?}` |
 | `GET /v1/maps/{videoId}` | — | cached result or 404 |
+| `GET /v1/catalog` | `limit`, `offset` | `{results, version}` — every analyzed song, newest first |
+| `GET /v1/catalog/version` | — | `{version}` — changes whenever the catalog does |
 | `GET /v1/me` | — | identity + quota (Mo's shape) |
 | `GET /healthz` | — | `{"status": "ok", …}` |
 | `POST /v1/admin/block` | `{videoId \\| channelId, reason}` | purge + block |
@@ -331,6 +333,37 @@ def _principal_polling(request: Request) -> Principal:
     return principal
 
 
+def _principal_browsing(request: Request) -> Principal:
+    """Identity if there is one, **anonymous if there isn't** — for the catalog.
+
+    Every other route needs to know who is asking, because it either spends the
+    caller's quota or starts work on their behalf. Reading the catalog does
+    neither: it is one indexed read of rows that already exist, and refusing it
+    without a sign-in would empty the app's home screen for exactly the person
+    the home screen is for — someone who has not signed up yet and is deciding
+    whether this app is worth it. Seeing what you could play is what makes an
+    account worth making.
+
+    Anonymous callers are still rate-limited twice over: the per-IP middleware
+    already runs on every request, and they get an IP-keyed synthetic uid here so
+    the per-uid budget applies to them too rather than being silently skipped.
+    """
+    header = request.headers.get("Authorization")
+    principal = Principal(uid=f"anon:{client_ip(request)}", display_name=None)
+    if header:
+        # A bad token on a public route is still just an anonymous read — the
+        # player gets the catalog rather than an error about a session they
+        # weren't using.
+        try:
+            principal = request.app.state.authenticator(header)
+        except HTTPException:
+            pass
+    settings: Settings = request.app.state.settings
+    _guard(request, principal, scope=RATE_SCOPE_POLL,
+           limit=settings.rate_limit_poll_per_min)
+    return principal
+
+
 def _admin(request: Request) -> str:
     """Authorize a takedown.
 
@@ -620,6 +653,58 @@ def _install_routes(app: FastAPI) -> None:
             raise fail(403, "That video isn’t available for chord analysis.", CODE_VIDEO_BLOCKED)
         return _result(cached)
 
+    @app.get("/v1/catalog")
+    async def get_catalog(limit: int = 60, offset: int = 0,
+                          principal: Principal = Depends(_principal_browsing)):
+        """The shared catalog — every song anyone has analyzed, newest first.
+
+        This is the app's home screen. It exists because the alternative was an
+        empty app: a player who has analyzed nothing has nothing to look at, and
+        "paste a link to find out what this does" is not an opening move. Every
+        row is a cache hit, so browsing it costs no quota, no egress and no wait.
+
+        **Read-only and free**, on the polling budget rather than the analysis
+        one: it is a single indexed read that cannot start work or spend quota,
+        and the client is *expected* to ask for it repeatedly (see
+        `/v1/catalog/version`). Sign-in is not required to read it for the same
+        reason the client doesn't gate search — seeing what you could play is what
+        makes an account worth making.
+
+        The row shape is the client's `SearchResultBody`, so the app's existing
+        decoder reads it unchanged:
+
+            {"results": [{videoId, title, channel, durationMs, songId,
+                          chords, tempo, tonic, mode, analyzedAt,
+                          lowConfidence, embeddable}],
+             "version": "<count>:<newest analyzed_at>"}
+
+        `embeddable` is reported `true` throughout: the store doesn't record it
+        (nothing ever needed it), and every row here is already analyzed, so the
+        client's `SongPlayability` reads `ready` regardless. Saying `true` is
+        therefore not a claim about the video — it is the field that keeps the
+        shared shape, and `ready` wins over it in the client's own ordering.
+        """
+        store: Store = app.state.store
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        rows = store.list_catalog(limit=limit, offset=offset)
+        return {
+            "results": [_catalog_row(row) for row in rows],
+            "version": store.catalog_version(),
+        }
+
+    @app.get("/v1/catalog/version")
+    async def get_catalog_version(principal: Principal = Depends(_principal_browsing)):
+        """Has the catalog changed? One aggregate, so the client can ask often.
+
+        The catalog is **shared**: a song analyzed by one player belongs on
+        everyone's home screen, and nobody should have to relaunch the app to see
+        it. Polling the whole listing to find that out would move the entire list
+        every time; this moves a short string.
+        """
+        store: Store = app.state.store
+        return {"version": store.catalog_version()}
+
     # -- Admin: §3's takedown surface ----------------------------------------
 
     @app.post("/v1/admin/block")
@@ -751,6 +836,38 @@ def _result(cached) -> dict:
     if sync is not None and cached.offset_ms is not None:
         sync["offsetMs"] = cached.offset_ms
     return {"song": cached.song, "videoSync": sync}
+
+
+def _catalog_row(cached) -> dict:
+    """One catalog entry, in the shape the client's search decoder already reads.
+
+    Everything here is derived from the stored `CompositionPayload` rather than
+    from new columns: the payload is the song, and duplicating its chords or
+    tempo into `chord_maps` would be two sources of truth for one fact.
+
+    The title falls back to the payload's own when the column is empty — older
+    rows predate `chord_maps.title`, and a catalog entry with no name is worse
+    than one named by the song it holds.
+    """
+    song = cached.song if isinstance(cached.song, dict) else {}
+    title = (cached.title or song.get("title") or "").strip()
+    return {
+        "videoId": cached.video_id,
+        "title": title or "Untitled",
+        "channel": song.get("artist") or "",
+        "durationMs": cached.duration_ms or 0,
+        # The client keys its Library on this and it is how a catalog row is
+        # recognized as "already analyzed" (`SongPlayability.ready`).
+        "songId": song.get("id"),
+        "chords": song.get("chordNames") or [],
+        "tempo": song.get("tempo"),
+        "tonic": song.get("tonic"),
+        "mode": song.get("mode"),
+        "difficulty": cached.difficulty,
+        "analyzedAt": cached.analyzed_at,
+        "lowConfidence": bool(cached.low_confidence),
+        "embeddable": True,
+    }
 
 
 def effective_quota(settings: Settings, principal: Principal) -> int:

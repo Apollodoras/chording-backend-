@@ -376,3 +376,91 @@ def test_a_malformed_body_still_gets_the_message_shape(client):
     response = client.post("/v1/analyze", json={"videoId": 12345}, headers=AUTH)
     assert response.status_code == 400
     assert response.json()["message"]
+
+
+# --- catalog ----------------------------------------------------------------
+
+def test_the_catalog_lists_what_has_been_analyzed(client):
+    """Home's whole reason to exist: a player who has analyzed nothing still has
+    something to play, because everyone else's analyses are cache hits."""
+    analyze(client)
+
+    response = client.get("/v1/catalog", headers=AUTH)
+    assert response.status_code == 200
+    body = response.json()
+
+    assert [row["videoId"] for row in body["results"]] == [VIDEO]
+    row = body["results"][0]
+    # The row carries what a card needs without a second round trip: the chords
+    # are the whole reason to pick one song over another.
+    assert row["chords"]
+    assert row["title"]
+    assert row["songId"]
+    assert body["version"]
+
+
+def test_an_empty_catalog_is_an_empty_list_not_an_error(client):
+    """Before anyone has analyzed anything. The shelf is absent, not broken."""
+    response = client.get("/v1/catalog", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json()["results"] == []
+
+
+def test_a_blocked_video_never_appears_in_the_catalog(client):
+    """§3's takedown has to hold on the listing as firmly as on the detail route
+    — a blocked video still sitting on the home screen is a takedown that didn't
+    happen."""
+    analyze(client)
+    client.app.state.store.block(BLOCK_VIDEO, VIDEO, reason="DMCA", actor="agent")
+
+    assert client.get("/v1/catalog", headers=AUTH).json()["results"] == []
+
+
+def test_a_video_analyzed_twice_is_one_song_in_the_catalog(client):
+    """Two difficulties are two analyses of one song, and the catalog lists
+    songs."""
+    analyze(client, difficulty="easy")
+    analyze(client, difficulty="hard")
+
+    results = client.get("/v1/catalog", headers=AUTH).json()["results"]
+    assert [row["videoId"] for row in results] == [VIDEO]
+
+
+def test_the_version_moves_when_a_song_is_added(client):
+    """What the client polls so a song analyzed by anyone shows up for everyone
+    without a relaunch."""
+    before = client.get("/v1/catalog/version", headers=AUTH).json()["version"]
+    analyze(client)
+    after = client.get("/v1/catalog/version", headers=AUTH).json()["version"]
+
+    assert before != after
+    # And it agrees with the listing's own token, so one poll answers for both.
+    assert after == client.get("/v1/catalog", headers=AUTH).json()["version"]
+
+
+def test_the_catalog_pages(client):
+    analyze(client)
+    body = client.get("/v1/catalog?limit=1&offset=1", headers=AUTH).json()
+    assert body["results"] == []
+
+
+def test_the_catalog_is_readable_without_signing_in(client):
+    """Home is the landing screen, and it must not be empty for the one person it
+    exists for: someone who hasn't signed up and is deciding whether to. Every
+    other route needs an identity because it spends quota or starts work; this
+    one only reads rows that already exist."""
+    analyze(client)
+
+    anonymous = client.get("/v1/catalog")
+    assert anonymous.status_code == 200
+    assert [row["videoId"] for row in anonymous.json()["results"]] == [VIDEO]
+    assert client.get("/v1/catalog/version").status_code == 200
+
+
+def test_a_stale_token_still_gets_the_catalog(client):
+    """An expired session shouldn't turn the home screen into an error about a
+    session the player wasn't using."""
+    analyze(client)
+    response = client.get("/v1/catalog", headers={"Authorization": "Bearer not-a-real-token"})
+    assert response.status_code == 200
+    assert response.json()["results"]

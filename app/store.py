@@ -585,6 +585,90 @@ class Store:
             channel_id=row[9], title=row[10], duration_ms=row[11] or 0,
         )
 
+    def list_catalog(self, *, limit: int = 60, offset: int = 0,
+                     difficulty: str | None = None) -> list[ChordMap]:
+        """The **catalog**: everything analyzed so far, newest first.
+
+        This is what the app's Home screen is built from. Every row here is a
+        cache hit — already analyzed, free to open, instant — which is exactly why
+        the client leads with it and treats YouTube as the long tail.
+
+        Two things it must get right, and both are about not serving something we
+        shouldn't:
+
+        - **Blocked videos and channels are excluded in SQL**, not filtered after.
+          §3's takedown surface has to hold on a *listing* as firmly as it does on
+          ``GET /v1/maps/{id}``; a blocked video that vanishes from the detail
+          endpoint but still sits on the home screen is a takedown that didn't
+          happen.
+        - **One row per video.** A video analyzed at two difficulties has two
+          rows, and the catalog is a list of *songs*, not of analyses — so it
+          collapses to the newest per video id.
+
+        ``song_json`` is returned whole. It is the same ``CompositionPayload`` the
+        client already knows how to read, so the caller can take the chords, key
+        and tempo off it without this table growing columns that duplicate it.
+        """
+        sql = """
+            SELECT video_id, difficulty, song_json, sync_json, offset_ms, low_confidence,
+                   engine_chords, engine_beats, analyzed_at, channel_id, title, duration_ms
+            FROM chord_maps m
+            WHERE NOT EXISTS (
+                      SELECT 1 FROM blocklist b
+                      WHERE (b.kind = ? AND b.key = m.video_id)
+                         OR (b.kind = ? AND b.key = m.channel_id)
+                  )
+        """
+        params: list = [BLOCK_VIDEO, BLOCK_CHANNEL]
+        if difficulty is not None:
+            sql += " AND difficulty = ?"
+            params.append(difficulty)
+        sql += " ORDER BY analyzed_at DESC, video_id DESC"
+
+        with self._cursor() as cur:
+            cur.execute(self._sql(sql), tuple(params))
+            rows = cur.fetchall()
+
+        # Collapse to one row per video (newest wins — the ORDER BY above already
+        # put it first), then page. Paging after the collapse is what makes the
+        # page size mean "songs", which is what the caller asked for.
+        seen: set[str] = set()
+        maps: list[ChordMap] = []
+        for row in rows:
+            if row[0] in seen:
+                continue
+            seen.add(row[0])
+            maps.append(ChordMap(
+                video_id=row[0], difficulty=row[1],
+                song=json.loads(row[2]), sync=json.loads(row[3]) if row[3] else None,
+                offset_ms=row[4], low_confidence=bool(row[5]),
+                engine_chords=row[6], engine_beats=row[7], analyzed_at=row[8],
+                channel_id=row[9], title=row[10], duration_ms=row[11] or 0,
+            ))
+        return maps[offset:offset + limit]
+
+    def catalog_version(self) -> str:
+        """A cheap token that changes whenever the catalog does.
+
+        The client polls this to answer "has anyone added a song?" without
+        pulling the whole list — the catalog is shared, so a song analyzed by one
+        player should appear for everyone without anybody restarting anything.
+
+        It is ``<count>:<newest analyzed_at>``, which moves on an addition (count)
+        **and** on a re-analysis of an existing video (timestamp, since ``put_map``
+        upserts and refreshes ``analyzed_at``). A deletion moves the count too.
+        Deliberately not a hash of the whole table: this is the endpoint that gets
+        called most often, so it has to stay one aggregate.
+        """
+        with self._cursor() as cur:
+            cur.execute(self._sql(
+                "SELECT COUNT(*), COALESCE(MAX(analyzed_at), '') FROM chord_maps"
+            ))
+            row = cur.fetchone()
+        count = row[0] if row else 0
+        newest = row[1] if row and row[1] else ""
+        return f"{count}:{newest}"
+
     def set_offset(self, video_id: str, offset_ms: int | None) -> int:
         """The §6 admin knob: shift every difficulty of this video's chart against
         the recording. Returns how many rows moved."""
