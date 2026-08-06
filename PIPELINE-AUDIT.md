@@ -24,13 +24,28 @@ is. `HIGH` means the user notices.
 | 3 | Meter/tempo (D1–D2) | **Done** — branch `structure-audit` |
 | 4 | Hygiene (C1–C3, E1–E4) | **Done** — branch `structure-audit` |
 | 5 | The service half (F1–F4) | **Done** — branch `structure-audit` |
+| 6 | The theory layer's blind spot (G1–G3) | **Done** |
+| — | Seeded catalog (H1–H3) | **Open** — found, characterised, not fixed |
 
 Tests: 414 at the start of the audit → 423 after Phase 1 → 432 after Phase 2 →
-443 after Phase 3 → 458 after Phase 4 → 466 after Phase 5.
+443 after Phase 3 → 458 after Phase 4 → 466 after Phase 5 → 511 after Phase 6.
 
 Phase 5 is a **second audit**, run over the half the first one never looked at:
 `main` / `jobs` / `store` / `auth` / `modal_app` and the upload path. The
 pipeline findings above were re-checked first and all hold.
+
+Phase 6 is a **reported defect** rather than an audit: chord noise the theory
+layer was supposed to remove and doesn't. It is the first phase whose findings
+came from someone using the app, and the first where the fix needed a new
+measurement before it could be judged at all.
+
+H1–H3 are **open**, and listed here rather than folded into a phase because they
+were not found by reading code. They came from seeding the catalog with twelve
+known songs and grading the emitted charts against published transcriptions
+(`scripts/seed_catalog.py`). Nine came back correct; the three below did not.
+None has a fix yet — they are written up because a characterised defect is worth
+more than an unrecorded one, and because two of them are invisible to every
+metric this repo already collects.
 
 ---
 
@@ -282,3 +297,230 @@ part that mattered more — a log line where there had been silence.
 - **Both rate limits default to `0` (off).** Documented that way, and the README
   tells the deployer to set them in the Modal secret. A default that is on would
   be a limiter tuned for nobody's traffic.
+
+---
+
+## Phase 6 — the theory layer's blind spot ✅
+
+The first phase that started with a **report from using the app** rather than with
+a read of the code:
+
+> the chord analysis has "noise" like some wrong chords — The Silence by
+> Manchester Orchestra has only Ebm and the app displays Ebm7 and Eb — the purpose
+> of the intelligent layer is to avoid this problem, and obviously it's not
+> working.
+
+Both symptoms reproduce, and the reproduction is the finding. The song is
+Ebm–Db–Ab–Ebm (Eb dorian; the Ab major rather than Ab minor is what makes it
+dorian). Fed a verse played four times with the tonic misheard as `Ebm7` in one
+pass and `Eb` in another — a 12% per-bar error rate, which is *better* than BTC
+manages on the corpus — the chart shipped both mistakes at every difficulty, and
+the sidecar reported the slot as `contested`, meaning "this song's verses
+genuinely differ".
+
+| # | Sev | Finding | State |
+|---|---|---|---|
+| G1 | HIGH | **The vote was defeated by the ordinary noise rate.** Gate 1 required two-thirds of a group's occurrences to agree *exactly*. Two mistakes in four passes is a 2-of-4 plurality, which fails that, so the slot was contested and **both** mistakes shipped — and each additional bad reading pushed the share further down, so the repetition that is supposed to be the evidence counted against it. Two errors in four passes is not a corner case; at BTC's measured per-bar rate it is the common case. | ✅ gate 1 is now a **plurality with a floor**: at least `MIN_AGREEING` (2) occurrences reading the slot identically, and no other reading agreed by as many. Gates 2 and 3 are unchanged and still applied to every dissenter individually, so one confident or harmonically distant reading still contests the whole slot |
+| G2 | HIGH | **The vote was the only corrector, and it can only speak where a section repeats *and* its passes disagree.** Three ordinary situations fell straight through: a section that occurs twice (one reading against one), a section that occurs once (intro, bridge, tag), and a mistake the engine made identically in every pass — errors are only independent when the audio differs. Nothing anywhere in the pipeline consulted **the song's own chord vocabulary**, which is the evidence a musician would use and which is available over minutes rather than over one bar. | ✅ new `app/analysis/vocabulary.py` (§20.8), run before the bars are cut: islands filled, minority readings of a root snapped onto the one the song plays, seven gates, same root always, `CHORDS_THEORY_VOCABULARY` to turn it off |
+| G3 | MED | **The layer could not be judged.** `--theory` is the only harness that scores it, and the population any quality rule may touch is a few dozen spans across nine tracks — far too little to resolve a half-point effect, and enough that one track's idiomatic sevenths swamp the mean. So "is this rule right?" had no answer, in either direction. | ✅ two new bench modes. `--calibration` measures the engine's actual confusions, which is what `SNAP_TO` is built from; `--noise` injects those measured mistakes into ground truth, so the same nine songs carry hundreds of errors whose correct answers are known |
+
+### Measured
+
+`bench/run_bench.py --theory`, delivered accuracy, as the harness now prints it —
+three columns, because the two correcting layers answer with different evidence:
+
+```
+run     track                     off   cons   both   delta rewrit  snap  isle
+truth   REAL MEAN               0.939  0.939  0.939  +0.000      0     0     0
+btc     REAL MEAN               0.796  0.800  0.803  +0.007     16    10     2
+btc     ALL MEAN                0.822  0.826  0.827  +0.005     16    10     2
+```
+
+The truth run is exactly a no-op — the property both layers are built to have, and
+it holds by construction rather than by luck (every gate that can open needs a
+*gap* in confidence, and ground truth has none).
+
+On the engine run, **no track regresses against consensus-only**, and the three
+that move go up: Something +0.015, Here Comes The Sun +0.005, Norwegian Wood
++0.002. Read precisely: off → both clears `MATERIAL_GAIN` and the harness prints
+PASS, but §20.8's own marginal contribution over the vote is +0.003 — *below* that
+bar, and reported as marginal rather than dressed up. Which is also why G3
+mattered: nine tracks cannot resolve +0.003 in either direction.
+
+Two mean rows now, real and synthetic split, which this harness's own docstring
+always required and `bench_theory` was quietly not doing — it averaged the two
+corpora together. Correcting it moves the printed numbers (0.822 → 0.796 for the
+same run) without changing any analysis.
+
+`--noise`, 12 seeds × 9 tracks, which is where the population is big enough to
+resolve. `fixed` is the share of *injected* errors removed; `broke` the share of
+*correct* chords destroyed. They are never summed:
+
+```
+layers          in     out    delta   fixed   broke
+consensus      0.797  0.808  +0.010   0.070   0.003
+vocabulary     0.797  0.810  +0.012   0.100   0.009
+both           0.797  0.815  +0.017   0.138   0.011
+```
+
+The two layers are close to additive (7.0% + 10.0% ≈ 13.8%), which is the design
+claim holding up: they answer with different evidence and therefore fix different
+mistakes. Twelve errors removed for every one introduced.
+
+The run is **seeded from the track name**, not from `hash()`, and that was a bug
+worth recording: Python randomizes string hashing per process, so two runs of
+identical code drew different corpora and printed numbers ±0.005 apart. A
+benchmark whose answer depends on which process it ran in cannot be quoted, and
+this one was being quoted.
+
+### What the corpus overruled
+
+Four things that looked right and were wrong, each caught by measurement rather
+than by argument. They are the reason `SNAP_TO` is a table of measured moves
+rather than "anything `harmony.is_near_miss` admits":
+
+- **A generic near-miss rule cost accuracy.** Near-miss says two chords are close
+  enough for a recognizer to slide between them; it says nothing about *which
+  direction it slides*, which is the only fact that decides whether an edit pays.
+  Flattening every doubtful seventh took In My Life down 0.031 (four real,
+  hedged A7s) and Let It Be down 0.003 (the opening Fmaj7). Measured, a reported
+  `dominant7` is the plain triad 60% of the time and a seventh 31% — worth doing —
+  while a reported `major7` is the plain triad **never**. `major7`, `augmented`,
+  `diminished` and `diminished7` are excluded on that evidence.
+- **Duration could not tell vocabulary from noise.** In My Life plays A for
+  seventy beats and A7 for nine, doubtfully, in four passes; Something reports G7
+  twice, just as briefly and doubtfully, and the record plays plain G both times.
+  No measure of *amount* separates them. What does is **occasions**:
+  `MAX_OCCASIONS = 2`. Swept — 1, 2, 3, 4, unlimited — the damage all lives at 4
+  and above, which is where In My Life's A7 enters. Counting every edit on the nine
+  tracks: at ≤ 2, six corrected, one damaged, four neutral; unlimited, seven
+  corrected, **five** damaged, eight neutral.
+- **Islands could not be allowed to cross roots.** Fm | Caug | Fm looks like a
+  hole in a held chord, and Michelle's augmented chord was *right*: an augmented
+  triad is one set of notes under three names, so a rule reasoning about labels
+  cannot tell Caug from Eaug. Same root only, and the edit is a spelling
+  correction rather than a new chord.
+- **The strict mass gates are free.** `MASS_DOMINANCE` (6×) and `MINORITY_SHARE`
+  (0.15) were swept down to 2× / 0.35 on both harnesses: the delivered mean does
+  not move at any setting, and the real corpus prefers the strict end. So they
+  stay strict, and the cost of that is stated rather than hidden — on a very short
+  song, or a root the song only plays a few times, the rule declines to speak.
+
+### The one thing left alone, deliberately
+
+The **relative-major/minor confusion** — hearing Gb where the song plays Ebm — is
+the largest single bucket of engine error in the corpus (5.1% of minor chords come
+back a third up) and is out of scope for §20.8. Both chords are usually in the
+same song's vocabulary; they are in The Silence, whose chorus opens on Gb. Mass
+cannot tell which one belongs in a given bar, so deciding it needs the same bar in
+another pass — `consensus`'s evidence, not this module's. Guessing it from mass
+would put a chord nobody played into the chart, which is what the whole layer
+exists to avoid.
+
+### And a caveat on the new harness
+
+`--noise` draws its mistakes independently per chord, so it **cannot** reproduce a
+mistake the engine makes identically in every pass — real, common, and the thing
+that defeats the vote. It also inherits whatever its model leaves out, and that is
+not hypothetical: the first version of the model had no rows for the sevenths, so
+every genuine seventh arrived fully believed, no confidence gate could open on
+one, and the run was structurally incapable of seeing the damage the real corpus
+had already caught on In My Life. `broke` read 0.004 instead of 0.011. A synthetic
+benchmark answers exactly the question its noise model asks — which is the same
+lesson as the exact fixtures at the top of this document, one level up.
+
+---
+
+## Seeded catalog — H1–H3 ⚠️ open
+
+Not an audit and not a bug report: twelve songs with published transcriptions,
+run through the deployed worker image, the emitted chart graded against the
+transcription. `scripts/seed_catalog.py` carries the ground truth and the
+reasoning for each entry. Nine of twelve came back correct on key, meter, chord
+vocabulary and the defining cycle. These three did not.
+
+Severity keeps the meaning it has above — how much of what the player sees is
+wrong.
+
+### H1 — compound meter is unanalyzable, not inaccurate · HIGH
+
+House of the Rising Sun (6/8) produces **no chart at all**. The beat tracker
+locks onto the eighth-note triplets instead of the dotted-quarter pulse, reports
+231 BPM, and `meter`'s 40–220 guard rejects the whole analysis as
+`tempo_unreadable`.
+
+231 is ≈3× the 77 BPM the recording is actually in, so this is not a tracker
+that lost the song — it is a tracker that found the subdivision and called it the
+beat. `tempoOctaveSuspect`/`tempoOctaveShift` already exist for exactly this
+shape of error at 2×; the ternary case has no path through them, and the guard
+fires before anything downstream could reconcile it against the harmony.
+
+Worth noting what it costs: a 6/8 song is not *slightly* wrong here, it is a
+failed job with a user-facing error. Every other defect in this document
+degrades the chart. This one withholds it.
+
+### H2 — dominant harmony reads as minor · HIGH
+
+The 12-bar blues in E is the one wrong chart in the set, and the way it is wrong
+is the finding. The **roots are perfect** — E, A and B account for every chord
+in the song. The **qualities flip**, on the same root, in a song that contains no
+minor chord: `E` 64 spans against `Em` 35, `A` 11 against `Am` 30, `B` 19
+against `Bm` 3.
+
+Checked against the recording rather than against our own engine — a CQT chroma,
+averaged over the track — the major third wins on all three roots, and narrowly:
+
+| root | major third | minor third |
+|---|---|---|
+| E | G# 0.080 | G 0.071 |
+| A | C# 0.064 | C 0.061 |
+| B | D# 0.085 | D 0.057 |
+
+So the minor readings are errors, and the thin margins say why: a blues plays the
+minor third *as a blue note* over a dominant chord, so the pitch that
+distinguishes E from Em is genuinely present in the audio. The engine is not
+hallucinating, it is resolving a real ambiguity the wrong way, bar by bar,
+inconsistently.
+
+Two things follow, and the second is the uncomfortable one:
+
+- §20.8's vocabulary rule cannot reach this. Both readings are *in* the song's
+  own vocabulary by mass — that is precisely the situation the module declines
+  to speak in, for the same reason it declines on relative major/minor.
+- **Root-only accuracy scores this 100%.** It is reported beside per-beat
+  accuracy in `bench/run_bench.py` specifically as the "right harmony, wrong
+  quality" signal, and here it reports nothing at all. `real_song_check.py`
+  grades roots only, passed this song, and the README recorded the major/minor
+  split as "genuinely ambiguous, not an error" — which is how a wrong chart sat
+  behind a green gate and a written-down explanation.
+
+### H3 — the key model is weakest where the chords are right · MEDIUM
+
+Hey Joe: 100% of chords inside C–G–D–A–E, the cycle found in order, and the key
+reported as **Am**. The blues: roots perfect, key reported as **Am**. Both are
+songs whose chords are all major and whose tonal centre is unambiguous by ear.
+
+Two other key mismatches in the set are *not* defects and are recorded here so
+the ratio is not overstated: Sweet Home Alabama reported G against a truth of D
+(D Mixolydian and G major are the same seven notes — the uploader's own title
+says "in G (D Mixolydian)"), and Autumn Leaves reported Gm against a truth of Bb
+(the relative pair; the tune resolves to Gm). A key label that picks the wrong
+member of a relative or modal pair is a convention disagreement. Calling a
+five-major-chord song A minor is not.
+
+### The method's own failure mode, recorded
+
+Zombie first graded 50% and read like an engine failure. It was not. The cover
+used is **up a fifth** from the record — Bm–G–D–A where every published chart
+says Em–C–G–D — and the truth entry, not the chart, was wrong.
+
+The recording settles it independently of anything in this repo: over a CQT
+chroma, **C is the least present of the twelve pitch classes** (0.042), and
+Zombie in Em spends a quarter of its length on C.
+
+This is the standing hazard of grading against covers, and the reason the ids in
+`seed_catalog.py` are ordinary uploads in the first place (the label-owned
+originals answer a datacentre IP with the bot check). A chart that disagrees with
+the songbook is always two hypotheses — the engine misheard, or the performance
+is not in the songbook's key — and the second one has to be excluded with a
+measurement before the first is written down as a defect.

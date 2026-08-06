@@ -112,6 +112,7 @@ def analyze_one(name: str) -> dict:
     import time
     import traceback
 
+    from app.chords import NORMAL
     from app.config import load_settings
     from app.analysis import engines, pipeline
     from app.analysis.fetch import build_source
@@ -180,7 +181,14 @@ def analyze_one(name: str) -> dict:
     # Read everything below off the wire payload the client would actually
     # receive, not off internal state, so a field that fails to serialize shows
     # up here rather than on someone's phone.
-    wire = outcome.songs.get("intermediate") or outcome.songs[sorted(outcome.songs)[0]]
+    # `NORMAL`, not "intermediate" — the tiers are `easy`/`normal`/`hard`
+    # (`app.chords.DIFFICULTIES`), and there has never been a tier by that name.
+    # The `or` fallback meant this never failed: it silently took
+    # `sorted(...)[0]`, which is **easy**, so every chord count and root
+    # histogram this gate has ever printed described the simplified tier while
+    # the code read as though it described the middle one.
+    wire = outcome.songs[NORMAL]
+    report["tierRead"] = NORMAL
     report["payloadKeys"] = sorted(wire)
     report["payloadBytes"] = len(json.dumps(wire))
 

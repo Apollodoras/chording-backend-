@@ -965,6 +965,50 @@ content, and is never persisted; §2.1 is unaffected. A probe failure **must not
 fail the analysis**: without it, sections are `Part N`, which §15 calls the
 honest answer.
 
+### 20.8 The song's own vocabulary (`vocabulary.py`) — added 2026-08-05
+
+§20.4's vote can only speak where a section **repeats** and its passes
+**disagree**, and that is narrower than §20 assumed. A section that occurs twice
+is one reading against one; a section that occurs once — intro, bridge, tag — has
+nothing to compare against; and a mistake the engine made in *every* pass leaves
+nothing to disagree with, because errors are only independent when the audio
+differs. Reported from use, on a song whose chart is Ebm–Db–Ab throughout: one bar
+showed `Ebm7`, another `Eb`, neither of them played, in a four-pass verse where two
+passes had been misheard — which the two-thirds share filed as `contested` and
+shipped unchanged.
+
+So there is a second corrector, using a different kind of evidence: **the rest of
+the song.** A song has a small chord vocabulary, and that is a fact measured over
+minutes rather than over one bar. Two rules, on the span timeline, before bars are
+cut and before the vote:
+
+- **islands** — a brief, doubtful near-miss flanked by *the same chord on both
+  sides and on the same root* is filled in. §5.4's `drop_short` is this rule with a
+  one-beat floor and no harmonic test;
+- **snap** — a minority reading of a root is pulled onto the quality the song plays
+  on that root, when seven conditions hold: the move is one `SNAP_TO` allows, the
+  chords are near neighbours, the reading appears on no more than two separate
+  occasions, the song's reading is overwhelmingly the other one, this reading holds
+  a sliver of the root's evidence, it was believed less than the song's answer, and
+  the move is not away from the key.
+
+**The root is never moved**, so every edit is a spelling correction. The
+relative-major/minor confusion is therefore out of scope and stays there: both
+chords are usually in the same song's vocabulary, so only bar-position evidence
+can settle it, and that is §20.4's.
+
+**`SNAP_TO` is measured, not reasoned**, and this is the part to preserve.
+`is_near_miss` says two chords are confusable; it does not say which direction the
+engine errs, which is the only fact that decides whether an edit pays.
+`bench/run_bench.py --calibration` prints the table: a reported `dominant7` is the
+plain triad 60% of the time and a seventh 31%, so flattening a doubtful one pays;
+a reported `major7` is the plain triad *never*, so the same edit only loses.
+`major7`, `augmented`, `diminished` and `diminished7` are excluded on that
+evidence.
+
+Like §20.4 it is **a provable no-op on perfect input** (the confidence condition),
+and like §20.4 it has a flag: `CHORDS_THEORY_VOCABULARY`.
+
 ## 21. How this is measured, and what it actually bought
 
 A layer that edits the chords an engine reported cannot be judged by one number,
@@ -976,13 +1020,31 @@ because the two ways it can be wrong pull in opposite directions. So
   unchanged `delivered`. This is the regression guard.
 - **Run B — the deployed engines.** Requirement: `delivered` goes *up*.
 
-Measured on the nine-track real corpus, 2026-08-04:
+Measured on the nine-track real corpus (2026-08-04, and again 2026-08-05 with
+§20.8 — `--theory` now prints three delivered columns and keeps the real and
+synthetic means apart, which it previously did not):
 
-| | delivered |
-|---|---|
-| Run A, consensus off / on | **0.939 / 0.939**, 0 bars rewritten |
-| Run B, consensus off / on | **0.796 / 0.799**, 15 bars rewritten |
-| Run B at the pre-§20 commit | **0.796** |
+| | off | consensus | + vocabulary |
+|---|---|---|---|
+| Run A, ground truth as both engines | **0.939** | **0.939** | **0.939** |
+| Run B, the deployed engines | **0.796** | **0.800** | **0.803** |
+| Run B at the pre-§20 commit | **0.796** | — | — |
+
+Nine tracks cannot resolve an effect that size, which §20.8 had to solve before it
+could be judged at all. `--noise` injects the engine's *measured* mistakes into
+ground truth over the same nine songs and counts both sides of every edit — 12
+seeds, `fixed` = share of injected errors removed, `broke` = share of correct
+chords destroyed:
+
+| layers | in | out | fixed | broke |
+|---|---|---|---|---|
+| consensus | 0.797 | 0.808 | 0.070 | 0.003 |
+| vocabulary | 0.797 | 0.810 | 0.100 | 0.009 |
+| both | 0.797 | 0.815 | **0.138** | **0.011** |
+
+The two are nearly additive, which is the design claim holding: they answer with
+different evidence and so fix different mistakes. They are never summed into one
+score.
 
 Read honestly:
 
@@ -994,6 +1056,11 @@ Read honestly:
   and Let It Be *down* 0.014. That is real but within noise on nine tracks,
   which is why `CHORDS_THEORY_CONSENSUS` exists and why the benchmark prints
   MARGINAL rather than PASS below half a point.
+- **§20.8 is the same size on the corpus and much larger on injected noise**:
+  +0.003 delivered with no track regressing, and 10% of injected errors removed
+  against 0.9% of correct chords damaged. On the song it was reported for it is the
+  difference between a chart carrying `Ebm7` and `Eb` and one that reads
+  Ebm–Db–Ab throughout.
 - **Key detection is a wash**: 5/9 exact tonics before and after, with the
   mixolydian fix and the endpoint cap both correct on their own terms.
 
@@ -1003,3 +1070,12 @@ changed — without yet making it much *more accurate*. Anyone extending this
 should assume the accuracy win, if there is one, is in the engines and in
 §20.2's phase check on tracks where the tracker is genuinely wrong, not in
 voting harder.
+
+**Amended 2026-08-05.** That last sentence held for a year of corpus numbers and
+was still incomplete, because the corpus could not see what a user could: the
+noise that survives §20.4 is not a residue but the ordinary case, and it is
+visible on screen. The place to look for the next win is therefore neither the
+engines nor harder voting but **the largest remaining measured confusion** — the
+relative major/minor, 5.1% of minor chords coming back a third up. It needs
+bar-position evidence, so it belongs to §20.4, and it is the one edit §20.8 is
+forbidden from making.
