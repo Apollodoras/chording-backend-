@@ -115,6 +115,14 @@ class TheoryReport(BaseModel):
     groups: int = 0
     rewrittenBars: int = 0
     contestedBars: int = 0
+    # §20.8's two counts, and they are the ones that move on a song whose
+    # sections do *not* repeat enough for the vote to speak: spans pulled onto the
+    # quality the song plays on that root everywhere else, and brief near-misses
+    # absorbed back into the chord they interrupted (`vocabulary.py`). Like
+    # ``rewrittenBars`` these are edits nothing downstream can see, which is why
+    # they are published rather than logged.
+    snappedSpans: int = 0
+    absorbedIslands: int = 0
     # Beats the downbeat grid was rotated by against the tracker's own answer
     # (§20.2). Non-zero means the harmony and the pulse disagreed about where
     # the bar started, and the harmony won.

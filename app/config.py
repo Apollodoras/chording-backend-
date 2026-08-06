@@ -98,6 +98,14 @@ class Settings:
     # reconciliation, the form detection, the pooled patterns — only ever
     # rearranges or re-derives; this one overwrites.
     theory_consensus: bool = True
+    # §20.8 — let the song's own chord vocabulary correct a brief, doubtful
+    # reading of a root the rest of the song contradicts. A flag for the same
+    # reason as `theory_consensus`, and it is the other half of the same job:
+    # the vote speaks where a section repeats and the passes disagree, this
+    # speaks where they don't — an intro, a bridge, a section that occurs twice,
+    # or a mistake the engine made identically in every pass. Measured the same
+    # way, by `bench/run_bench.py --theory`.
+    theory_vocabulary: bool = True
     # §20.2 — let a tempo that reads an octave out be halved (or doubled) instead
     # of only reported. **Off** by default, and for the opposite reason to
     # `theory_consensus`: this one is unmeasured. Correcting the octave rewrites
@@ -181,6 +189,7 @@ def load_settings() -> Settings:
         scratch_root=os.environ.get("CHORDS_SCRATCH_ROOT", "/tmp/chords-scratch"),
         confidence_floor=float(os.environ.get("CHORDS_CONFIDENCE_FLOOR", "0.5")),
         theory_consensus=_bool("CHORDS_THEORY_CONSENSUS", True),
+        theory_vocabulary=_bool("CHORDS_THEORY_VOCABULARY", True),
         theory_tempo_octave=_bool("CHORDS_THEORY_TEMPO_OCTAVE", False),
         chord_engine=os.environ.get("CHORDS_CHORD_ENGINE") or "btc",
         beat_tracker=os.environ.get("CHORDS_BEAT_TRACKER") or "beat_this",

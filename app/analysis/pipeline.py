@@ -190,6 +190,7 @@ def assemble(
     model = song_model.build(
         grid=grid, raw=raw, onsets=onsets, energy=energy,
         vote=getattr(settings, "theory_consensus", True),
+        consolidate=getattr(settings, "theory_vocabulary", True),
         correct_octave=getattr(settings, "theory_tempo_octave", False),
     )
     if model is None or not grid.is_usable:
@@ -232,6 +233,8 @@ def assemble(
         groups=len(model.groups),
         rewrittenBars=model.consensus.rewritten_bars,
         contestedBars=model.consensus.contested_bars,
+        snappedSpans=model.vocabulary.snapped_spans,
+        absorbedIslands=model.vocabulary.absorbed_islands,
         phaseShift=model.meter.phase_shift,
         meterSource=model.meter.meter_source,
         tempoOctaveSuspect=model.meter.tempo_octave_suspect,

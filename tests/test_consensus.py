@@ -10,9 +10,17 @@ tests.
 So the tests here are mostly about what consensus **refuses** to do. Each gate
 gets its own case, stated as the musical situation it exists to protect:
 
-1. one reading against one reading teaches nothing (support),
+1. one reading against one reading teaches nothing, and neither does an even
+   split (the plurality, with its floor of two agreeing passes),
 2. a distant chord is the music changing, not a mishearing (near-miss),
 3. an engine that was *confident* is telling us something (confidence).
+
+Gate 1 has a second set of cases below the ones it refuses, because it is the
+gate that was **wrong** rather than merely strict: as a two-thirds share it threw
+away the slot whenever the engine misheard the same bar in two passes of four,
+which is the ordinary noise rate and the reason this layer was reported as not
+working. Every extra bad reading pushed the share further down, so repetition —
+the whole evidence the vote runs on — counted against it.
 
 And the property the whole design rests on: **on perfect input, consensus is a
 no-op** — provable from gate 3 rather than observed, and asserted here as well as
@@ -52,6 +60,9 @@ def verse(last=(C, MAJOR), confidence=1.0) -> list[list[BarChord]]:
 # F shares one (a chord change).
 NEAR = (A, MINOR)
 DISTANT = (F, MAJOR)
+# A *second* near-miss of C, for the cases about two dissenters who disagree with
+# each other as well as with the majority: Em shares E and G with C.
+OTHER_NEAR = (E, MINOR)
 
 
 # --- the property the design rests on ----------------------------------------
@@ -135,6 +146,47 @@ def test_only_the_offending_bar_moves():
     bars = verse() + verse() + verse() + verse(NEAR, confidence=0.2)
     out, _ = consensus.apply(bars, [group(0, 4, 8, 12)], bar_beats=4.0)
     assert [b[0].root_pc for b in out[12:16]] == [G, D, E, C]
+
+
+# --- gate 1, the other half: a plurality, not a share ------------------------
+
+def test_two_agreeing_passes_carry_against_two_dissenters_who_disagree():
+    """The case the old two-thirds share got wrong, and the one the layer was
+    reported for. Four verses, and the engine misheard the same bar in two of
+    them — Am once, Em the other time, hedging on both. A share rule counts that
+    as 2-of-4 and files the slot as contested, so *both* mistakes ship; and every
+    additional bad reading pushes the share further down, which means the
+    repetition that was supposed to be the evidence counts against it.
+
+    Two passes agreeing exactly while the dissenters disagree with the majority
+    and with each other is the signature of noise: a song that really changes its
+    fourth verse changes it the same way every time it plays it."""
+    bars = verse() + verse(NEAR, confidence=0.2) + verse() + verse(OTHER_NEAR, confidence=0.3)
+    out, report = consensus.apply(bars, [group(0, 4, 8, 12)], bar_beats=4.0)
+    assert report.rewritten_bars == 2
+    assert report.contested_bars == 0
+    assert [b[3][0].root_pc for b in (out[0:4], out[4:8], out[8:12], out[12:16])] == [C] * 4
+
+
+def test_an_even_split_is_still_contested():
+    """Two passes end on C and two on Am, all four believed the same. That is not
+    a mishearing with a majority against it — it is a song with two versions of
+    its verse, and the plurality rule has to see the difference."""
+    bars = verse() + verse(NEAR) + verse() + verse(NEAR)
+    out, report = consensus.apply(bars, [group(0, 4, 8, 12)], bar_beats=4.0)
+    assert report.rewritten_bars == 0
+    assert report.contested_bars == 1
+    assert out == bars
+
+
+def test_a_lone_agreeing_pass_is_not_a_vote():
+    """Three passes, three different readings. Nothing agrees with anything, so
+    there is no majority to speak with however doubtful the others are."""
+    bars = verse() + verse(NEAR, confidence=0.2) + verse(OTHER_NEAR, confidence=0.2)
+    out, report = consensus.apply(bars, [group(0, 4, 8)], bar_beats=4.0)
+    assert report.rewritten_bars == 0
+    assert report.contested_bars == 1
+    assert out == bars
 
 
 def test_a_group_with_one_occurrence_is_left_alone():

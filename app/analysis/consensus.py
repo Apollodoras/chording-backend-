@@ -20,9 +20,27 @@ delivered accuracy behind three hundred green tests — and
 So overwriting one occurrence with another is gated on **three** independent
 conditions, and all three must hold:
 
-1. **The vote is decisive** — at least `SUPPORT` of the occurrences agree.
-   Two occurrences that disagree can never satisfy this, which is correct:
-   with one reading against one reading there is nothing to learn from counting.
+1. **The vote is decisive** — at least `MIN_AGREEING` occurrences read the slot
+   *identically*, and no other reading is agreed by as many. Two occurrences that
+   disagree can never satisfy this, which is correct: with one reading against one
+   reading there is nothing to learn from counting.
+
+   This used to be a share — two-thirds of the occurrences had to agree — and that
+   is the wrong shape for the thing being counted, in a way that made the layer
+   fail on exactly the input it exists for. Errors do not arrive one per song. A
+   verse played four times with the engine mishearing the same bar in *two* of
+   them, differently each time, gave a 2-of-4 majority and was filed as
+   `contested`, so both mistakes shipped — and the fourfold repetition that was
+   supposed to be the evidence counted against it, because every extra bad
+   reading pushed the share further down. Yet two passes agreeing exactly while
+   the dissenters disagree with the majority *and with each other* is the
+   signature of noise, not of music: a song that really changes its fourth verse
+   changes it the same way every time it plays it.
+
+   So the requirement is a **plurality with a floor**, and the safety is carried
+   where it belongs — by gates 2 and 3, which every dissenter must still clear
+   individually. Any single occurrence a fifth away from the winner, or believed
+   as much as it, still contests the whole slot for every occurrence.
 
 2. **The disagreement is a near-miss** (`harmony.is_near_miss`). C against Am is
    the mix being ambiguous about a third; C against F is the music changing. The
@@ -63,10 +81,12 @@ from .types import Onset
 
 log = logging.getLogger("chords.consensus")
 
-# Share of a group's occurrences that must agree before the majority may
-# overwrite the minority. Two-thirds, so a 2-of-3 vote carries and a 1-of-2
-# split never does.
-SUPPORT = 2 / 3
+# How many occurrences must read a slot identically before their reading may
+# overwrite another. Two, which is the smallest number that is evidence at all:
+# one pass agreeing with itself is not a vote, and a 1-of-2 split has nothing to
+# count. It has to be a *plurality* as well (see `_vote`), so 2-of-4 carries only
+# while no other reading also has two.
+MIN_AGREEING = 2
 
 # How much less believed a dissenting bar must be before the majority may
 # replace it. Small on purpose: the requirement is that the winner was believed
@@ -184,7 +204,8 @@ def _vote(candidates: list[list[BarChord]], *, bar_beats: float,
         reverse=True,
     )
     winning_signature, winning_indices = ranked[0]
-    if len(winning_indices) / len(candidates) < SUPPORT:
+    runner_up = len(ranked[1][1]) if len(ranked) > 1 else 0
+    if len(winning_indices) < MIN_AGREEING or len(winning_indices) <= runner_up:
         return None                                          # gate 1
 
     winner = candidates[winning_indices[0]]

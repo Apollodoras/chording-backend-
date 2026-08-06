@@ -1,5 +1,6 @@
 {
   "analysis": {
+    "absorbedIslands": 0,
     "contestedBars": 0,
     "exactRatio": 1.0,
     "groups": 1,
@@ -8,6 +9,7 @@
     "rewrittenBars": 0,
     "scale": "ionian",
     "sections": 1,
+    "snappedSpans": 0,
     "tempoOctaveShift": 0,
     "tempoOctaveSuspect": false
   },

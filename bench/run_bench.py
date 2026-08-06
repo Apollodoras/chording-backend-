@@ -43,20 +43,32 @@ Usage:
 from __future__ import annotations
 
 import json
+import random
 import statistics
 import sys
 import time
 import wave
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.analysis import engines  # noqa: E402
+from app.analysis import engines, postprocess  # noqa: E402
+from app.analysis.axis import build_axis  # noqa: E402
+from app.analysis.meter import reconcile  # noqa: E402
 from app.analysis.pipeline import assemble  # noqa: E402
 from app.analysis.types import BeatGrid, EngineInfo, RawChordSpan, VideoMeta  # noqa: E402
-from app.chords import HARD, NORMAL, normalize, prefers_flats, render  # noqa: E402
+from app.chords import (  # noqa: E402
+    HARD,
+    MAJOR,
+    MINOR,
+    NORMAL,
+    normalize,
+    prefers_flats,
+    render,
+)
 from app.config import Settings  # noqa: E402
 from app.lint import lint, lint_sync  # noqa: E402
 from app.payload import CompositionPayload  # noqa: E402
@@ -399,8 +411,10 @@ def truth_spans(truth: dict) -> list[RawChordSpan]:
             for c in truth["chords"]]
 
 
-def _analyze(case: Case, grid: BeatGrid, raw: list[RawChordSpan], *, vote: bool):
-    settings = Settings(scratch_root="/tmp/chords-scratch", theory_consensus=vote)
+def _analyze(case: Case, grid: BeatGrid, raw: list[RawChordSpan], *,
+             vote: bool, vocab: bool = False):
+    settings = Settings(scratch_root="/tmp/chords-scratch", theory_consensus=vote,
+                        theory_vocabulary=vocab)
     meta = VideoMeta(video_id="bench0000000", title=case.name,
                      duration_s=case.truth["duration_ms"] / 1000.0)
     return assemble(meta=meta, grid=grid, raw=raw, onsets=[], settings=settings,
@@ -420,22 +434,29 @@ def bench_theory(cases: list[Case]) -> None:
     number, because the two ways it can be wrong pull in opposite directions:
 
     **Run A — ground truth as both engines.** Every span arrives correct and
-    fully believed, so there is nothing to fix and anything consensus changes it
-    changes *away from the truth*. The requirement is `rewritten = 0` and a
-    `delivered` identical to the vote-off run. This is the regression guard, and
-    it is the run that would have caught the alignment defect: it isolates the
+    fully believed, so there is nothing to fix and anything either layer changes
+    it changes *away from the truth*. The requirement is that every edit count is
+    zero and every `delivered` column is identical. This is the regression guard,
+    and it is the run that would have caught the alignment defect: it isolates the
     pipeline's own arithmetic from any engine's mistakes.
 
     **Run B — the deployed engines.** Now the spans are wrong in the way real
-    spans are wrong, and the layer has to earn its place. The requirement is
-    that `delivered` goes *up*. If it does not, consensus is not paying for the
-    risk it carries and `CHORDS_THEORY_CONSENSUS=off` is the correct posture.
+    spans are wrong, and each layer has to earn its place. The requirement is
+    that `delivered` goes *up*. If it does not, the layer is not paying for the
+    risk it carries and turning it off is the correct posture.
 
-    Nothing here averages the two. They answer different questions.
+    Three delivered columns rather than two, because the two correcting layers
+    answer with different evidence and a song can be helped by one and not at all
+    by the other: `off` is neither, `cons` is §20.4's vote alone, `both` adds
+    §20.8's vocabulary. The per-track rows matter more than the mean — nine tracks
+    cannot resolve a half-point effect, which is what `--noise` exists for.
+
+    Nothing here averages the truth run with the engine run. They answer
+    different questions.
     """
-    print("THEORY LAYER  (§20 — consensus off vs on)")
-    print(f"{'run':<8}{'track':<22}{'off':>8}{'on':>8}{'delta':>8}"
-          f"{'rewrit':>8}{'contest':>9}{'sects':>7}{'key':>16}")
+    print("THEORY LAYER  (§20 — the two correcting layers, off vs on)")
+    print(f"{'run':<8}{'track':<22}{'off':>7}{'cons':>7}{'both':>7}{'delta':>8}"
+          f"{'rewrit':>7}{'snap':>6}{'isle':>6}{'contest':>8}{'key':>15}")
 
     runs: list[tuple[str, list[tuple[Case, BeatGrid, list[RawChordSpan]]]]] = []
     runs.append(("truth", [(c, grid_from(c.truth), truth_spans(c.truth)) for c in cases]))
@@ -447,35 +468,57 @@ def bench_theory(cases: list[Case]) -> None:
                                         chords_for(chord_name, c)[0]) for c in cases]))
 
     for label, prepared in runs:
-        off_all: list[float] = []
-        on_all: list[float] = []
-        rewritten_total = 0
+        # Real and synthetic kept apart, per this module's own rule: the synthetic
+        # specimens prove the plumbing and nothing else, and a mean over both
+        # dilutes the only evidence about a dense mix. Averaged together they read
+        # 0.822 → 0.827 where the real corpus reads 0.796 → 0.803, and the second
+        # pair is the one that describes the product.
+        columns: dict[str, list[float]] = {"off": [], "cons": [], "both": []}
+        real_columns: dict[str, list[float]] = {"off": [], "cons": [], "both": []}
+        edits = {"rewritten": 0, "snapped": 0, "islands": 0}
         for case, grid, raw in prepared:
             try:
-                off = _analyze(case, grid, raw, vote=False)
-                on = _analyze(case, grid, raw, vote=True)
+                outcomes = {
+                    "off": _analyze(case, grid, raw, vote=False, vocab=False),
+                    "cons": _analyze(case, grid, raw, vote=True, vocab=False),
+                    "both": _analyze(case, grid, raw, vote=True, vocab=True),
+                }
             except Exception as exc:
-                print(f"{label:<8}{case.name:<22}{'—':>8}{'—':>8}"
-                      f"{'':>8}{'':>8}{'':>9}{'':>7}  {type(exc).__name__}")
+                print(f"{label:<8}{case.name:<22}{'—':>7}{'—':>7}{'—':>7}"
+                      f"{'':>8}{'':>7}{'':>6}{'':>6}{'':>8}  {type(exc).__name__}")
                 continue
-            off_score, on_score = _delivered(off, case.truth), _delivered(on, case.truth)
-            report = on.theory
-            rewritten_total += report.rewrittenBars
-            delta = on_score - off_score
-            key = f"{CompositionPayload.model_validate(on.songs[HARD]).tonic} {report.scale}"
-            print(f"{label:<8}{case.name:<22}{off_score:>8.3f}{on_score:>8.3f}"
-                  f"{delta:>+8.3f}{report.rewrittenBars:>8}{report.contestedBars:>9}"
-                  f"{report.sections:>7}{key:>16}")
-            if off_score == off_score:
-                off_all.append(off_score)
-                on_all.append(on_score)
+            delivered = {name: _delivered(outcome, case.truth)
+                         for name, outcome in outcomes.items()}
+            report = outcomes["both"].theory
+            edits["rewritten"] += report.rewrittenBars
+            edits["snapped"] += report.snappedSpans
+            edits["islands"] += report.absorbedIslands
+            tonic = CompositionPayload.model_validate(outcomes["both"].songs[HARD]).tonic
+            print(f"{label:<8}{case.name:<22}{delivered['off']:>7.3f}"
+                  f"{delivered['cons']:>7.3f}{delivered['both']:>7.3f}"
+                  f"{delivered['both'] - delivered['off']:>+8.3f}"
+                  f"{report.rewrittenBars:>7}{report.snappedSpans:>6}"
+                  f"{report.absorbedIslands:>6}{report.contestedBars:>8}"
+                  f"{tonic + ' ' + report.scale:>15}")
+            if delivered["off"] == delivered["off"]:
+                for name, value in delivered.items():
+                    columns[name].append(value)
+                    if case.is_real:
+                        real_columns[name].append(value)
 
-        if off_all:
-            mean_off, mean_on = statistics.mean(off_all), statistics.mean(on_all)
-            verdict = _verdict(label, mean_off, mean_on, rewritten_total)
-            print(f"{label:<8}{'MEAN':<22}{mean_off:>8.3f}{mean_on:>8.3f}"
-                  f"{mean_on - mean_off:>+8.3f}{rewritten_total:>8}"
-                  f"{'':>9}{'':>7}  {verdict}")
+        for name, table in (("REAL MEAN", real_columns), ("ALL MEAN", columns)):
+            if not table["off"]:
+                continue
+            means = {key: statistics.mean(values) for key, values in table.items()}
+            # The verdict is read off the real corpus only, for the same reason the
+            # means are split: a synthetic specimen the layer cannot touch drags
+            # every gain toward zero and would make a real win look marginal.
+            verdict = (_verdict(label, means["off"], means["both"], sum(edits.values()))
+                       if table is real_columns else "")
+            print(f"{label:<8}{name:<22}{means['off']:>7.3f}{means['cons']:>7.3f}"
+                  f"{means['both']:>7.3f}{means['both'] - means['off']:>+8.3f}"
+                  f"{edits['rewritten']:>7}{edits['snapped']:>6}{edits['islands']:>6}"
+                  f"{'':>8}  {verdict}")
         print()
 
 
@@ -498,10 +541,296 @@ def _verdict(label: str, off: float, on: float, rewritten: int) -> str:
                 else "FAIL — edited a correct chart")
     gain = on - off
     if gain >= MATERIAL_GAIN:
-        return "PASS — consensus earns its place"
+        return "PASS — the correcting layers earn their place"
     if gain > 0:
         return f"MARGINAL (+{gain:.3f}) — real but within noise on {label}; read the per-track rows"
-    return "no gain — ship with CHORDS_THEORY_CONSENSUS=off"
+    return "no gain — ship with the two theory flags off"
+
+
+# --- §20.8's two measurements ------------------------------------------------
+#
+# The theory layer's problem as a *measurement* problem: the real corpus is nine
+# tracks, and the population any quality rule is allowed to touch is a few dozen
+# spans inside them. That is far too little to resolve a half-point effect, and
+# `bench_theory`'s per-track rows are the only honest read of it. So §20.8 is
+# measured two further ways, and both are here rather than in a notebook because a
+# rule whose justification cannot be re-run is a rule nobody can revisit.
+
+def bench_calibration(cases: list[Case]) -> None:
+    """Given what the engine says, what does the record actually play?
+
+    This is the table `analysis/vocabulary.py`'s `SNAP_TO` is built from, and it
+    is the whole reason that table is not simply "anything `is_near_miss`
+    admits". Near-miss says two chords are close enough for a recognizer to slide
+    between them. It says nothing about **which direction it slides**, and that is
+    the only fact that decides whether flattening a doubtful reading pays.
+
+    Read the `as read` and `as triad` columns as a wager. A `dominant7` this engine
+    reports is the plain major triad about twice as often as it is a seventh, so
+    flattening a doubtful one is a bet at 2:1 on. A `major7` is *never* the plain
+    triad, so the same edit there can only lose — which is what it did to "Let It
+    Be"'s opening Fmaj7 while the rule was still generic.
+    """
+    chord_name, beat_name = Settings().chord_engine, Settings().beat_tracker
+    if chord_name not in engines._CHORD_ENGINES or beat_name not in engines._BEAT_TRACKERS:
+        print("CALIBRATION — needs the configured engines installed; skipped.\n")
+        return
+
+    print("CALIBRATION  (given the engine says X, what does the record play?)")
+    stats: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"spans": 0.0, "beats": 0.0, "conf": 0.0,
+                 "as_read": 0.0, "as_triad": 0.0, "root_wrong": 0.0})
+    for case in cases:
+        if not case.is_real:
+            continue
+        grid, _ = grid_for(beat_name, case)
+        raw, _ = chords_for(chord_name, case)
+        axis = build_axis(reconcile(grid, raw).grid)
+        if axis is None:
+            continue
+        for span in postprocess.process(raw, axis, difficulty=HARD):
+            played = _truth_chord_at(case.truth, axis, span)
+            if played is None:
+                continue
+            entry = stats[span.quality]
+            entry["spans"] += 1
+            entry["beats"] += span.length_beats
+            entry["conf"] += span.confidence * span.length_beats
+            if played[0] != span.root_pc:
+                entry["root_wrong"] += span.length_beats
+            elif played[1] == span.quality:
+                entry["as_read"] += span.length_beats
+            elif played[1] == _plain_triad(span.quality):
+                entry["as_triad"] += span.length_beats
+    print(f"{'engine says':<16}{'spans':>7}{'beats':>7}{'conf':>7}"
+          f"{'as read':>9}{'as triad':>10}{'root wrong':>12}{'other':>8}")
+    for quality, entry in sorted(stats.items(), key=lambda kv: -kv[1]["beats"]):
+        beats = entry["beats"] or 1.0
+        other = beats - entry["as_read"] - entry["as_triad"] - entry["root_wrong"]
+        print(f"{quality:<16}{entry['spans']:>7.0f}{beats:>7.0f}{entry['conf'] / beats:>7.2f}"
+              f"{entry['as_read'] / beats:>9.2f}{entry['as_triad'] / beats:>10.2f}"
+              f"{entry['root_wrong'] / beats:>12.2f}{other / beats:>8.2f}")
+    print()
+
+
+def _plain_triad(quality: str) -> str:
+    return MINOR if quality in {"minor", "minor7", "diminished", "diminished7",
+                                "halfDiminished7"} else MAJOR
+
+
+def _truth_chord_at(truth: dict, axis, span) -> tuple[int, str] | None:
+    """The chord the record plays for most of a quantized span's stretch."""
+    times = axis.times_ms
+    start = times[min(span.start_beat, len(times) - 1)]
+    end = times[min(span.end_beat, len(times) - 1)]
+    best, best_overlap = None, 0
+    for chord in truth["chords"]:
+        overlap = min(end, chord["endMs"]) - max(start, chord["startMs"])
+        if overlap > best_overlap:
+            parsed = normalize(chord["name"])
+            if parsed is not None:
+                best, best_overlap = (parsed[0], parsed[1]), overlap
+    return best
+
+
+# The engine's mistakes, as measured rather than as imagined: for each quality the
+# record plays, what this engine reports instead, how often, and how sure it
+# sounds when it does. Produced by `--calibration` (the conditional form of the
+# table it prints), beats-weighted over the nine real tracks, entries below 1%
+# folded into the correct reading.
+#
+# `rootN` means "the same quality, N semitones off" — the mistakes no rule in
+# §20.8 can touch, and they are in the model precisely for that reason. A noise
+# benchmark containing only the errors the layer is good at is not a measurement.
+#
+# The seventh rows matter for the same reason and are easy to leave out, which
+# would quietly rig the whole run. A song's *genuine* sevenths have to be in the
+# injected corpus, because the population §20.8 is most dangerous to is a real
+# extension the engine heard correctly and **hedged on** — and this engine hedges
+# on all of them (`CORRECT_CONFIDENCE`). Without these rows every seventh in the
+# corpus arrives fully believed, the confidence gate closes on all of them, and
+# the benchmark cannot see the one kind of damage the real corpus actually caught.
+NOISE_MODEL: dict[str, tuple[tuple[str, float, float], ...]] = {
+    MAJOR: (
+        ("dominant7", 0.032, 0.60),      # the spurious seventh — the biggest bucket
+        ("root-5", 0.030, 0.77),         # heard the IV/V instead
+        ("root+5", 0.018, 0.85),
+        ("root+2", 0.014, 0.75),
+        ("root-3", 0.011, 0.65),         # the relative minor, a third down
+        ("minor", 0.007, 0.71),          # the third the mix buried
+    ),
+    MINOR: (
+        ("root+3", 0.051, 0.81),         # the relative major
+        ("minor7", 0.047, 0.54),         # the spurious seventh again
+        ("root-4", 0.046, 0.69),
+        ("root-5", 0.016, 0.69),
+        ("root+5", 0.014, 0.81),
+        ("major", 0.010, 0.70),          # the third, the other way
+    ),
+    "dominant7": (
+        ("major", 0.363, 0.64),          # the seventh dropped — nothing here can add it back
+        ("root-3", 0.047, 0.62),
+        ("root-5", 0.028, 0.35),
+        ("root-2", 0.026, 0.67),
+    ),
+    "minor7": (
+        ("minor", 0.372, 0.60),
+        ("dominant7", 0.217, 0.65),
+        ("root+3", 0.038, 0.71),
+        ("root-5", 0.026, 0.72),
+    ),
+    "major7": (
+        ("major", 0.730, 0.70),
+        ("root-3", 0.206, 0.62),
+        ("root+4", 0.048, 0.70),
+    ),
+}
+
+# What the engine sounds like when it is **right**, per quality — measured, and
+# the spread matters more than the mean. A flat 1.0 would make every confidence
+# gate in §20 trivially open, which is the one way to rig this test; and a flat
+# high value for the sevenths would do the same thing more subtly, since a
+# correctly-heard seventh this engine was sure of is not a case any rule here has
+# to survive. It is the hedged ones that are the test.
+CORRECT_CONFIDENCE: dict[str, tuple[float, float]] = {
+    MAJOR: (0.72, 0.95),                 # measured mean 0.86
+    MINOR: (0.62, 0.92),                 # 0.78
+    "dominant7": (0.48, 0.80),           # 0.64 — In My Life's A7 lives here
+    "minor7": (0.40, 0.72),              # 0.55
+    "major7": (0.36, 0.62),              # 0.48 — Let It Be's Fmaj7
+    "diminished7": (0.16, 0.34),         # 0.24, and right 90% of the time
+}
+DEFAULT_CORRECT_CONFIDENCE = (0.55, 0.85)
+
+
+def corrupt(truth: dict, rng: random.Random) -> list[RawChordSpan]:
+    """Ground truth, mistaken the way this engine is measured to mistake it.
+
+    One draw per annotated chord, from `NOISE_MODEL`. The confidence travels with
+    the mistake, because that is the correlation the whole theory layer runs on:
+    the engine is measurably less sure when it is wrong, and every gate in §20.4
+    and §20.8 is built on being able to see that.
+    """
+    spans: list[RawChordSpan] = []
+    for chord in truth["chords"]:
+        parsed = normalize(chord["name"])
+        if parsed is None:
+            continue
+        root, quality = parsed[0], parsed[1]
+        confidence = rng.uniform(*CORRECT_CONFIDENCE.get(
+            quality, DEFAULT_CORRECT_CONFIDENCE))
+        roll = rng.random()
+        for said, probability, said_confidence in NOISE_MODEL.get(quality, ()):
+            if roll < probability:
+                if said.startswith("root"):
+                    root = (root + int(said[4:])) % 12
+                else:
+                    quality = said
+                # Jittered around the measured mean, so the run is not decided by
+                # one number sitting a hair either side of a threshold.
+                confidence = min(0.99, max(0.05, rng.gauss(said_confidence, 0.08)))
+                break
+            roll -= probability
+        spans.append(RawChordSpan(start_ms=int(chord["startMs"]), end_ms=int(chord["endMs"]),
+                                  label=render(root, quality), confidence=confidence))
+    return spans
+
+
+def bench_noise(cases: list[Case], seeds: int = 12) -> None:
+    """The measurement with enough noise in it to see the layers work.
+
+    Ground truth supplies the harmony, the timing and the form; `corrupt` supplies
+    the engine's *measured* mistakes, at the measured rates and confidences. That
+    combination is what the real corpus cannot offer: the same nine songs, with
+    hundreds of injected errors instead of a few dozen, and every error's correct
+    answer known exactly.
+
+    Three columns, because a layer that edits chords has to be judged on both
+    sides at once and a single mean hides one of them:
+
+        in       delivered accuracy of the corrupted chart, layers off
+        out      the same chart with the layers on
+        fixed    share of the *injected* errors the layers removed
+        broke    share of the *correct* chords the layers destroyed
+
+    `broke` is the column that would condemn this. A layer that fixes a third of
+    the noise and breaks a twentieth of the music is not worth having, however
+    well the mean reads — which is why the two are never summed here.
+
+    **What this run cannot tell you**, and the reason `bench_theory`'s nine
+    per-track rows stay the column of record: the noise is drawn independently per
+    chord, so it cannot reproduce a mistake the engine makes *identically* in every
+    pass of a section — which is real, common, and the thing that defeats the vote.
+    It also inherits whatever the model leaves out. That is not a small caveat: the
+    first version of this model had no rows for the sevenths at all, so every
+    genuine seventh arrived fully believed, no confidence gate could open on one,
+    and the run was structurally incapable of seeing the damage the real corpus
+    caught on "In My Life". A synthetic benchmark answers exactly the question its
+    noise model asks.
+    """
+    print(f"NOISE INJECTION  (truth + the engine's measured mistakes, {seeds} seeds)")
+    print(f"{'layers':<22}{'in':>7}{'out':>7}{'delta':>8}{'fixed':>8}{'broke':>8}")
+
+    real = [case for case in cases if case.is_real]
+    if not real:
+        print("  no real tracks — the noise model is measured against them.\n")
+        return
+
+    modes = (("consensus", True, False), ("vocabulary", False, True),
+             ("both", True, True))
+    for label, vote, vocab in modes:
+        rows: list[tuple[float, float, float, float]] = []
+        for seed in range(seeds):
+            for case in real:
+                # Seeded from the *string*, not from `hash()`: Python randomizes
+                # string hashing per process, so `hash((name, seed))` drew a
+                # different corpus on every run and the printed numbers moved by
+                # ±0.005 between two runs of the same code. A benchmark whose
+                # answer depends on the process it ran in cannot be quoted.
+                rng = random.Random(f"{case.name}:{seed}")
+                raw = corrupt(case.truth, rng)
+                grid = grid_from(case.truth)
+                try:
+                    before = _analyze(case, grid, raw, vote=False, vocab=False)
+                    after = _analyze(case, grid, raw, vote=vote, vocab=vocab)
+                except Exception:
+                    continue
+                clean, dirty = _per_beat(before, case.truth), _per_beat(after, case.truth)
+                if clean is None or dirty is None:
+                    continue
+                fixed = sum(1 for a, b in zip(clean, dirty) if not a and b)
+                broke = sum(1 for a, b in zip(clean, dirty) if a and not b)
+                wrong = sum(1 for a in clean if not a) or 1
+                right = sum(1 for a in clean if a) or 1
+                rows.append((sum(clean) / len(clean), sum(dirty) / len(dirty),
+                             fixed / wrong, broke / right))
+        if not rows:
+            continue
+        means = [statistics.mean(column) for column in zip(*rows)]
+        print(f"{label:<22}{means[0]:>7.3f}{means[1]:>7.3f}{means[1] - means[0]:>+8.3f}"
+              f"{means[2]:>8.3f}{means[3]:>8.3f}")
+    print()
+
+
+def _per_beat(outcome, truth: dict) -> list[bool] | None:
+    """Right/wrong at every sampled millisecond of the delivered chart.
+
+    The same reconstruction `delivered_accuracy` scores, kept as the vector rather
+    than the mean, so the two sides of an edit can be counted separately.
+    """
+    if outcome.sync is None or not outcome.sync.beatAnchors:
+        return None
+    payload = CompositionPayload.model_validate(outcome.songs[HARD])
+    flats = prefers_flats(payload.tonic, payload.mode)
+    out: list[bool] = []
+    for chord in truth["chords"]:
+        target = normalize(chord["name"])
+        if target is None:
+            continue
+        expected = render(target[0], target[1], flats=flats)
+        for t in range(int(chord["startMs"]), int(chord["endMs"]), FRAME_STEP_MS):
+            out.append(chord_at_video_ms(payload, outcome.sync, t) == expected)
+    return out or None
 
 
 def summarise(chord_tallies: dict[str, Tally], beat_tallies: dict[str, Tally],
@@ -559,10 +888,24 @@ def main() -> int:
         bench_theory(cases)
         return 0
 
+    if "--noise" in sys.argv:
+        # §20.8's measurement: injected mistakes, so the population is big enough
+        # to resolve. Needs no engines either — the noise model *is* the engine.
+        bench_noise(cases)
+        return 0
+
+    if "--calibration" in sys.argv:
+        # Where `vocabulary.SNAP_TO` and `NOISE_MODEL` come from. Needs the real
+        # engines, since it is a measurement *of* them.
+        bench_calibration(cases)
+        return 0
+
     chord_tallies = bench_chords(cases)
     beat_tallies = bench_beats(cases)
     bench_pipeline(cases)
     bench_theory(cases)
+    bench_noise(cases)
+    bench_calibration(cases)
     summarise(chord_tallies, beat_tallies, real, synthetic)
     return 0
 

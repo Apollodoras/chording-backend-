@@ -347,6 +347,72 @@ def test_a_vote_that_changed_nothing_does_not_re_read_the_key(monkeypatch):
     assert len(calls) == 1
 
 
+# --- §20.8's cleanup, and its place in the order -----------------------------
+
+def _noisy_chords(passes: int = 8) -> list[RawChordSpan]:
+    """Am–F–C–G, played `passes` times, with the tonic misheard as `Am7` in one
+    pass and as `A` in another — the shape the layer was reported for, and one no
+    vote can settle: the passes disagree two ways, so there is no majority.
+
+    Eight passes rather than four because the rule wants the song to contradict
+    the reading *overwhelmingly* (`vocabulary.MASS_DOMINANCE`), and four bars of a
+    root is not a song's worth of evidence about it. That is the intended
+    behaviour and the thing worth knowing about the layer: on a very short song it
+    declines to speak.
+    """
+    labels = ["A:min", "F:maj", "C:maj", "G:maj"] * passes
+    labels[4], labels[8] = "A:min7", "A:maj"
+    return [RawChordSpan(start_ms=i * BAR_MS, end_ms=(i + 1) * BAR_MS, label=label,
+                         confidence=0.5 if i in (4, 8) else 0.9)
+            for i, label in enumerate(labels)]
+
+
+def test_the_cleanup_runs_before_the_bars_are_cut():
+    """Both readings of the tonic are corrected, and the correction happens while
+    the timeline is still spans — which is what lets `form` cluster identical
+    passes and the vote find nothing left to do."""
+    model = song_model.build(grid=_grid(32), raw=_noisy_chords(), onsets=[])
+    qualities = {c.quality for s in model.sections for bar in s.bars for c in bar
+                 if c.root_pc == 9}
+    assert model.vocabulary.snapped_spans == 2
+    assert qualities == {"minor"}, "the song plays Am, and now so does the chart"
+
+
+def test_a_tier_render_replays_the_cleanup():
+    """`hard` is the tier the model was built at, so its render has to come back
+    with the model's own bars — the same discipline as the vote replay, and it
+    needs the same stored key (`seed_key`) to be a replay rather than a new
+    decision."""
+    raw = _noisy_chords()
+    model = song_model.build(grid=_grid(32), raw=raw, onsets=[])
+    assert _shape(song_model.render(model, raw, HARD)) == _shape(model.sections)
+
+
+def test_every_tier_gets_the_cleanup_not_only_the_one_that_needed_it():
+    """A tier's spans are not the reference tier's, so "did it change anything at
+    `hard`" is the wrong question to gate the replay on. `easy` has to be cleaned
+    too, or one tier ships noise the others do not."""
+    raw = _noisy_chords()
+    model = song_model.build(grid=_grid(32), raw=raw, onsets=[])
+    for difficulty in DIFFICULTIES:
+        rendered = song_model.render(model, raw, difficulty)
+        tonic = {c.quality for s in rendered for bar in s.bars for c in bar
+                 if c.root_pc == 9}
+        assert tonic == {"minor"}, difficulty
+
+
+def test_the_cleanup_can_be_turned_off():
+    """`CHORDS_THEORY_VOCABULARY=off`, for the same reason the vote has a switch:
+    this edits chords the engine reported, and a posture that can only be judged
+    by measurement has to be reversible without a deploy."""
+    model = song_model.build(grid=_grid(32), raw=_noisy_chords(), onsets=[],
+                             consolidate=False, vote=False)
+    assert not model.vocabulary.touched
+    qualities = {c.quality for s in model.sections for bar in s.bars for c in bar
+                 if c.root_pc == 9}
+    assert qualities == {"minor", "minor7", "major"}, "the noise is still there"
+
+
 # --- how much of `hard` is real ----------------------------------------------
 
 def test_the_model_measures_how_much_of_the_reference_tier_survived_intact():

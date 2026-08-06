@@ -44,7 +44,7 @@ from dataclasses import dataclass, field, replace
 
 from ..chords import HARD
 from ..errors import AnalysisError
-from . import consensus, form, postprocess
+from . import consensus, form, postprocess, vocabulary
 from .axis import BeatAxis, build_axis
 from .consensus import ConsensusReport
 from .keyfinder import DetectedKey, detect_key
@@ -52,6 +52,7 @@ from .meter import Meter, reconcile
 from .strumming import ExtractedPattern, fallback
 from .structure import BarChord, Section, bars_from_spans, spans_from_bars
 from .types import BeatGrid, EnergyCurve, Onset, RawChordSpan
+from .vocabulary import VocabularyReport
 
 log = logging.getLogger("chords.model")
 
@@ -85,6 +86,18 @@ class SongModel:
     # also why the pooled extraction had more evidence to work from.
     patterns: dict[str, ExtractedPattern] = field(default_factory=dict)
     consensus: ConsensusReport = field(default_factory=ConsensusReport)
+    # §20.8's edits — what the song's own vocabulary corrected before the vote
+    # ever ran. Separate from `consensus` because the two answer with different
+    # evidence (the rest of the song, versus the same bar in another pass) and a
+    # song can be helped a lot by one and not at all by the other.
+    vocabulary: VocabularyReport = field(default_factory=VocabularyReport)
+    # Whether the cleanup **ran**, which is not the same as whether it changed
+    # anything. `render` needs the first: a tier's spans are not the reference
+    # tier's, so a stage that found nothing to do at `hard` can still have work at
+    # `easy`, and skipping it there would leave one tier holding noise the others
+    # do not. Default False so a hand-assembled model renders exactly as it did
+    # before this stage existed.
+    consolidated: bool = False
     confidence: float = 0.0
     total_bars: int = 0
     # How much of the reference tier survived normalization exactly (§5.4) —
@@ -106,6 +119,12 @@ class SongModel:
     # disagree about. Stored rather than recomputed because the reading that
     # matters here is a historical fact about a decision already made.
     vote_key: DetectedKey | None = None
+    # And the key §20.8's consolidation ran with, which is one reading earlier
+    # still: taken off the engine's own spans, before either the cleanup or the
+    # vote had touched them. `render` replays the cleanup with it for exactly the
+    # reason it replays the vote with `vote_key` — a tier is a render of the
+    # reference decisions, not a fresh chance to decide differently.
+    seed_key: DetectedKey | None = None
 
     @property
     def bar_beats(self) -> int:
@@ -137,6 +156,7 @@ def per_bar_energy(curve: EnergyCurve | None, axis: BeatAxis) -> list[float] | N
 
 def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
           energy: EnergyCurve | None = None, vote: bool = True,
+          consolidate: bool = True,
           correct_octave: bool = False) -> SongModel | None:
     """Features → the song model. **Pure**, and the half worth testing directly.
 
@@ -152,11 +172,31 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
         return None
 
     spans = postprocess.process(raw, axis, difficulty=REFERENCE)
+
+    # §20.8, before anything is cut into bars and before the vote. The order is
+    # not incidental: the vote reasons about a bar as a *unit* — one disagreement
+    # anywhere in it contests the whole bar — so a two-beat wobble that the song
+    # itself contradicts is better removed while the timeline is still spans.
+    # Cleaning first also means the form detection that follows is looking at the
+    # song rather than at the engine's stutter, and it is `form` that decides
+    # which bars the vote gets to compare at all.
+    seed_key = detect_key(spans)
+    vocab = VocabularyReport()
+    if consolidate and spans:
+        spans, vocab = vocabulary.consolidate(
+            spans, tonic_pc=seed_key.tonic_pc, mode=seed_key.scale,
+            bar_beats=axis.bar_beats,
+        )
+
     bars = bars_from_spans(spans, axis.bar_beats) if spans else []
     if not bars:
         raise AnalysisError("No chords could be read from that video.")
 
-    key = detect_key(spans)
+    # Re-read only if the cleanup moved something, on the same principle the vote
+    # follows below: with nothing changed, this is the reading `seed_key` already
+    # is, and re-running it could differ only for reasons that are not about the
+    # song.
+    key = detect_key(spans) if vocab.touched else seed_key
     bar_beats = float(axis.bar_beats)
     bar_energy = per_bar_energy(energy, axis)
 
@@ -201,11 +241,12 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
 
     return SongModel(
         meter=meter, axis=axis, key=key, sections=sections, groups=groups,
-        patterns=patterns, consensus=report,
+        patterns=patterns, consensus=report, vocabulary=vocab,
+        consolidated=consolidate,
         confidence=postprocess.mean_confidence(spans),
         total_bars=sum(s.total_bars for s in sections),
         exact_ratio=postprocess.exact_ratio(spans),
-        vote_groups=vote_groups, vote_key=vote_key,
+        vote_groups=vote_groups, vote_key=vote_key, seed_key=seed_key,
     )
 
 
@@ -234,6 +275,15 @@ def render(model: SongModel, raw: list[RawChordSpan], difficulty: str) -> list[S
     spans = postprocess.process(raw, model.axis, difficulty=difficulty)
     if not spans:
         return []
+    if model.consolidated:
+        # Replayed with the model's `seed_key` for the same reason the vote is
+        # replayed with `vote_key`: this is a render of decisions already taken.
+        # `or model.key` for a model assembled by hand rather than by `build`.
+        seed_key = model.seed_key or model.key
+        spans, _ = vocabulary.consolidate(
+            spans, tonic_pc=seed_key.tonic_pc, mode=seed_key.scale,
+            bar_beats=model.axis.bar_beats,
+        )
     bars = bars_from_spans(spans, model.axis.bar_beats)
     if not bars:
         return []
