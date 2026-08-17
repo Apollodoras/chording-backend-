@@ -39,6 +39,12 @@ so a key mismatch is reported with the cover's own key rather than treated as
 proof the engine is broken.
 """
 
+# The **local** half of this file is imported by the `modal` CLI, which runs on
+# whatever Python is on PATH — 3.9 on this machine, where `dict | None` in a
+# signature is evaluated eagerly and raises. Deferring annotations costs nothing
+# and takes the version question off the table.
+from __future__ import annotations
+
 import json
 import re
 
@@ -346,11 +352,26 @@ def _chart(song: dict) -> dict:
         # anonymous, it is *unnamed*, and its structural role still lives in
         # `kindRaw` (verse/chorus/…). Falling straight through to the UUID
         # prints a hex string where the form should be.
+        # A section with no `bars` is not empty — it is the **flat** encoding
+        # (`chordNames` + `beatsPerChord`) that `compile._section` emits when the
+        # section is one chord per N beats. Printing "0 bars" for it reads as a
+        # dropped section, which is a different and far more alarming thing.
+        length = len(bars)
+        if not bars and labels and section.get("beatsPerChord"):
+            length = max(1, int(len(labels) * section["beatsPerChord"] / 4))
         sections.append({
             "name": section.get("name") or section.get("kindRaw") or section.get("id") or "?",
-            "bars": len(bars),
+            "bars": length,
+            "flat": not bars,
             "chords": len(labels),
             "progression": _dedupe(_triad(l) for l in labels)[:16],
+            # Which strum this section points at, and how many times it plays.
+            # The pair is the whole of "if a pattern doesn't repeat it isn't a
+            # pattern", stated as data: two sections on the same progression
+            # that name different patterns is the defect, and it is invisible in
+            # any summary that only counts patterns.
+            "patternID": section.get("patternID"),
+            "repeats": section.get("repeats", 1),
         })
 
     # `chordNames` at song level is always the whole song, so it is the honest
@@ -364,7 +385,24 @@ def _chart(song: dict) -> dict:
     for triad in triads:
         histogram[triad] = histogram.get(triad, 0) + 1
 
+    # The embedded patterns themselves, as strokes rather than ids — "1 pattern"
+    # is not the claim worth checking; "one D-DU-UD-U, and every verse points at
+    # it" is.
+    strokes = {}
+    for pattern in song.get("patterns") or []:
+        if not isinstance(pattern, dict):
+            continue
+        strokes[pattern.get("id")] = {
+            "name": pattern.get("name"),
+            "tags": pattern.get("tags") or [],
+            "strokes": ["%g%s" % (s.get("beat", 0),
+                                  "d" if s.get("direction") == "down" else "u")
+                        for s in (pattern.get("strokes") or [])
+                        if isinstance(s, dict)],
+        }
+
     return {
+        "patternStrokes": strokes,
         "sections": sections,
         "sectionCount": len(sections),
         "chordCount": len(flat),
@@ -374,6 +412,59 @@ def _chart(song: dict) -> dict:
         "firstChords": flat[:24],
         "songLevelFlatCount": len(song_flat),
     }
+
+
+# The same two numbers `app.lint` withholds a sidecar on, restated here rather
+# than imported: everything in this half of the script runs on the laptop, where
+# `app` and its dependencies are deliberately not imported (see the note above
+# `seed_one`, whose imports are all function-local for that reason).
+ANCHOR_GAP_TOLERANCE = 0.25
+ANCHOR_GAP_CLUSTER = 0.10
+
+
+def _modal_gap(gaps: list[int]) -> int:
+    """The song's own bar length in ms — a mode with a tolerance, because no two
+    bars of a real recording are the same length to the millisecond and a median
+    is dragged by exactly the anomalies this is looking for."""
+    best: list[int] = []
+    for candidate in gaps:
+        cluster = [g for g in gaps if abs(g - candidate) <= candidate * ANCHOR_GAP_CLUSTER]
+        if len(cluster) > len(best):
+            best = cluster
+    return int(sorted(best)[len(best) // 2]) if best else 0
+
+
+def _beatmap(sync: dict | None) -> dict:
+    """The sidecar's bar grid, as numbers this script can grade.
+
+    Until the beat audit, everything here graded the *chords* and nothing graded
+    the beat map — so a song could seed with a perfect progression while one bar
+    in five was the wrong length, and the report would call it CORRECT. The
+    player could see it plainly; this script could not see it at all.
+
+    The measurement is the one `lint_sync` makes: consecutive anchors, against
+    the song's own modal gap. Not against the payload tempo — the tempo comes
+    from beat intervals and is right even when the bars are wrong.
+    """
+    if not sync:
+        return {"anchors": 0}
+    anchors = sync.get("beatAnchors") or []
+    gaps = [b["tMs"] - a["tMs"] for a, b in zip(anchors, anchors[1:])
+            if isinstance(a, dict) and isinstance(b, dict)]
+    out: dict = {"anchors": len(anchors), "bars": len(gaps)}
+    if gaps:
+        modal = _modal_gap(gaps)
+        off = [g for g in gaps if abs(g - modal) > modal * ANCHOR_GAP_TOLERANCE]
+        out["modalBarMs"] = modal
+        out["irregularBars"] = len(off)
+        out["irregularShare"] = round(len(off) / len(gaps), 3)
+        out["worstBarMs"] = max(gaps, key=lambda g: abs(g - modal))
+    analysis = sync.get("analysis") or {}
+    repaired = analysis.get("downbeatsRepaired") or {}
+    out["repaired"] = {"dropped": repaired.get("dropped", 0),
+                       "inserted": repaired.get("inserted", 0)}
+    out["reportedIrregular"] = analysis.get("irregularBars", 0)
+    return out
 
 
 def _contains_cycle(sequence, cycle) -> bool:
@@ -480,6 +571,10 @@ def seed_one(name: str) -> dict:
 
     song = stored.song
     report["chart"] = _chart(song)
+    report["beatmap"] = _beatmap(stored.sync)
+    report["patterns"] = sorted(
+        {p.get("id") for p in (song.get("patterns") or []) if isinstance(p, dict)}
+    )
     # `tonic` + `mode`, not `key`: CompositionPayload v2 carries the two
     # separately because the app's transposition needs the tonic on its own.
     for key in ("tonic", "mode", "tempo", "timeSignature", "beatsPerChord", "repeats"):
@@ -522,6 +617,31 @@ def _grade(report: dict) -> dict:
     reported_meter = report.get("timeSignature")
     grade["meter"] = {"got": reported_meter, "want": truth["meter"],
                       "match": str(reported_meter) == truth["meter"]}
+
+    # The beat map, which nothing here used to grade. A song whose bars are not
+    # all about the same length is one the player experiences as "beat-map
+    # anomalies" and "it changes tempo mid song", and it can hold a perfect
+    # chord chart while doing it — so this is scored separately and reported
+    # separately, and it is deliberately not folded into the chord verdict.
+    beatmap = report.get("beatmap") or {}
+    share = beatmap.get("irregularShare")
+    grade["beatmap"] = {
+        "bars": beatmap.get("bars", 0),
+        "irregularShare": share,
+        "repaired": beatmap.get("repaired"),
+        "verdict": "no sidecar" if not beatmap.get("anchors")
+        else "GOOD" if share is not None and share <= 0.05
+        else "OK" if share is not None and share <= 0.10
+        else "BROKEN",
+    }
+
+    # And how many strumming patterns the song ended up with. The user's rule is
+    # "if a pattern doesn't repeat, it isn't a pattern", and the target is one to
+    # three per song — the stored catalog was emitting seventeen.
+    patterns = report.get("patterns") or []
+    grade["patterns"] = {"count": len(patterns),
+                         "verdict": "GOOD" if 1 <= len(patterns) <= 3
+                         else "MANY" if patterns else "none"}
 
     bpm = report.get("tempo")
     tempo = {"got": round(bpm, 1) if bpm else None, "want": truth["tempo"]}
@@ -584,11 +704,34 @@ def _report(reports: list[dict]) -> int:
             print(f"               unexpected : {grade['extra'][:8]}")
         print(f"  progression: {'FOUND' if grade['progressionFound'] else 'not found'} "
               f"{grade['progressionWanted']}")
+        beatmap, beats = grade["beatmap"], report.get("beatmap") or {}
+        repaired = beatmap["repaired"] or {}
+        print(f"  beat map   : {beatmap['verdict']} — "
+              f"{beats.get('irregularBars', 0)}/{beatmap['bars']} bars off this song's "
+              f"own {beats.get('modalBarMs', 0)} ms bar"
+              + (f"; repaired {repaired.get('dropped', 0)} spurious / "
+                 f"{repaired.get('inserted', 0)} missing downbeats"
+                 if repaired.get("dropped") or repaired.get("inserted") else ""))
+        print(f"  patterns   : {grade['patterns']['count']} "
+              f"({grade['patterns']['verdict']}) — one to three is the target, "
+              f"each backed by a section that repeats")
         print(f"  sections   : {chart['sectionCount']} — "
               f"{[s['name'] for s in chart['sections']][:8]}")
-        for section in chart["sections"][:6]:
-            print(f"      {section['name']:<12} {section['bars']:>3} bars  "
+        # `pat` is a short local alias per pattern id, so the eye can check the
+        # thing that matters — two sections on the same chords naming the same
+        # strum — without reading twelve hex characters twice.
+        alias = {pattern_id: chr(ord("a") + index)
+                 for index, pattern_id in enumerate(chart.get("patternStrokes") or {})}
+        for section in chart["sections"][:8]:
+            print(f"      {section['name']:<12} {section['bars']:>3} bars "
+                  f"×{section.get('repeats', 1):<2} "
+                  f"[{alias.get(section.get('patternID'), '?')}] "
                   f"{'-'.join(section['progression'][:12])}")
+        for pattern_id, pattern in (chart.get("patternStrokes") or {}).items():
+            snapped = " (snapped to an idiom)" if "snapped-to-idiom" in pattern["tags"] \
+                else " (fallback)" if "fallback" in pattern["tags"] else ""
+            print(f"      strum [{alias[pattern_id]}] {' '.join(pattern['strokes'])}"
+                  f"  — {pattern['name']}{snapped}")
 
     for report in failed:
         print(f"\n{report['song']}  ({report['videoId']})  — FAILED\n  {report['ERROR']}")

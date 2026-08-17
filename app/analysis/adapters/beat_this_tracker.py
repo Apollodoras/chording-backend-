@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import statistics
 
+from ..downbeats import modal_bar_beats
 from ..types import PCM, BeatGrid
 
 log = logging.getLogger("chords.engines.beat_this")
@@ -69,9 +70,18 @@ class BeatThisTracker:
         # steady pulse, and bars that are consistently the same length. A song
         # can have one without the other, and only the pair is worth anchoring
         # a video cursor to.
+        #
+        # **Multiplied, not averaged**, and that is a fix rather than a taste.
+        # `regularity` is computed from beat intervals and is near 1.0 on
+        # essentially every song; `meter_agreement` is the bar-length half. Under
+        # the old mean, a song with a flawless pulse and *zero* bar agreement
+        # scored 0.5·1.0 + 0.5·0.0 = 0.5, and `pipeline.assemble` tests
+        # `< confidence_floor` against a floor of 0.5 — so a song whose bars were
+        # entirely wrong could not be flagged by this path at all, and shipped a
+        # sidecar. A product is the truth: no bars, no confidence.
         spread = statistics.pstdev(intervals) / median_interval if len(intervals) > 1 and median_interval else 1.0
         regularity = max(0.0, 1.0 - min(1.0, spread))
-        confidence = max(0.0, min(1.0, 0.5 * regularity + 0.5 * meter_agreement))
+        confidence = max(0.0, min(1.0, regularity * meter_agreement))
 
         return BeatGrid(
             beats_ms=beats_ms,
@@ -89,15 +99,30 @@ def _meter(beats_ms: list[int], downbeats_ms: list[int]) -> tuple[int, float]:
     duration ratio, so a tempo change inside the song doesn't invent a meter
     change. The agreement figure is what feeds confidence: a song whose bars are
     4,4,4,3,4,5 is not a 4/4 song we should be anchoring to.
+
+    **Every bar counts against the agreement.** The sample used to be filtered
+    to `1 < counted <= 13`, which threw away the strongest evidence a grid is
+    broken: single-beat "bars" — a spurious downbeat fired one beat into a real
+    one. So What has 37 of them across 179 bars and shipped at confidence 0.842
+    with 42% of its bars malformed, because none of the 37 ever entered the
+    denominator. They are in it now.
+
+    **The meter itself is `downbeats.modal_bar_beats`.** A plain mode over the
+    same sample answers the question badly in the one case it is being asked
+    about: a spurious downbeat turns a 4 into a 1 and a 3, so a grid corrupted
+    in half its bars holds more 3s than 4s and elects 3/4. §20.2a's estimator
+    tries each candidate and keeps whichever leaves the fewest bars disagreeing
+    with themselves, and it is the same function the repair downstream uses — so
+    the meter this reports and the bars that repair chooses cannot diverge.
     """
     if len(downbeats_ms) < 3:
         return 4, 0.0
-    counts = []
-    for start, end in zip(downbeats_ms, downbeats_ms[1:]):
-        counted = sum(1 for t in beats_ms if start <= t < end)
-        if 1 < counted <= 13:
-            counts.append(counted)
-    if not counts:
-        return 4, 0.0
-    mode = statistics.mode(counts)
+    counts = [sum(1 for t in beats_ms if start <= t < end)
+              for start, end in zip(downbeats_ms, downbeats_ms[1:])]
+    mode = modal_bar_beats(beats_ms, downbeats_ms)
+    if mode is None:
+        plausible = [c for c in counts if 1 < c <= 13]
+        if not plausible:
+            return 4, 0.0
+        mode = statistics.mode(plausible)
     return mode, counts.count(mode) / len(counts)

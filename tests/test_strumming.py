@@ -261,3 +261,80 @@ def test_strokes_never_fall_outside_one_bar():
     for bar_beats, signature in ((4, "4/4"), (3, "3/4")):
         result = fallback(bar_beats=bar_beats, tempo=120, name="x", time_signature=signature)
         assert all(0 <= s.beat < bar_beats for s in result.pattern.strokes)
+
+
+# --- one to few strokes, and musical ones -----------------------------------
+#
+# Support is a share of *bars*, and on a full mix nearly every cell is supported:
+# `LibrosaOnsetDetector` fires on the kit, the kit plays in every bar, and so
+# "keep every cell over the threshold" kept fifteen of the sixteen 16th cells on
+# a recording whose guitar plays six. The three rules below are what stands
+# between the grid and the pattern now.
+
+def drum_kit(*, bars: int = 16) -> list[tuple[int, float, float]]:
+    """A guitar playing D-DU-UD-U with a hi-hat on every 8th behind it.
+
+    The hi-hat is quiet and perfectly reliable, which is exactly the combination
+    support cannot see through: it is present in *every* bar, so every cell it
+    touches is fully supported.
+    """
+    folded: list[tuple[int, float, float]] = []
+    for bar in range(bars):
+        for position in DDUUDU:
+            folded.append((bar, position, 1.6 if position == 0.0 else 1.0))
+        for eighth in range(8):
+            folded.append((bar, eighth * 0.5, 0.35))
+    return folded
+
+
+def test_a_kit_behind_the_guitar_does_not_become_the_pattern():
+    """The measured case, and the complaint: fifteen strokes where the recording
+    has six. What separates them is not support — both are in every bar — but
+    how hard the cell is struck."""
+    result = extract(drum_kit(), bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
+    assert [s.beat for s in result.pattern.strokes] == DDUUDU
+
+
+def test_a_bar_with_an_onset_on_everything_reads_as_the_skeleton_underneath():
+    """Sixteen equally-struck cells carry no groove at all — there is nothing to
+    contrast — so the honest reading is the eight-note skeleton, not sixteen
+    strokes. Two per beat is the ceiling and this is the case it exists for."""
+    saturated = [(bar, cell / 4, 1.0) for bar in range(16) for cell in range(16)]
+    result = extract(saturated, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
+    assert len(result.pattern.strokes) == 8
+    assert [s.direction for s in result.pattern.strokes[:2]] == ["down", "up"], \
+        "and the directions are re-read off the grid the strokes actually landed on"
+
+
+def test_an_extraction_one_cell_short_of_an_idiom_is_snapped_onto_it():
+    """The direct answer to "patterns should be more musical", and the same
+    measure-then-snap discipline `vocabulary.SNAP_TO` follows for chords: an
+    extraction that lands a cell short of D-DU-UD-U almost certainly *is*
+    D-DU-UD-U with one stroke under the support threshold."""
+    short = [(bar, position, 1.0) for bar in range(16)
+             for position in (0.0, 1.0, 1.5, 2.5, 3.0)]
+    result = extract(short, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
+    assert [s.beat for s in result.pattern.strokes] == DDUUDU
+
+
+def test_a_snapped_pattern_says_so_out_loud():
+    """A snap is not a measurement, and every emitted pattern has to be readable
+    as which of the two it is — the rule the direction tags already follow."""
+    short = [(bar, position, 1.0) for bar in range(16)
+             for position in (0.0, 1.0, 1.5, 2.5, 3.0)]
+    snapped = extract(short, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
+    measured = extract([(bar, p, 1.0) for bar in range(16) for p in DDUUDU],
+                       bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
+    assert "snapped-to-idiom" in snapped.pattern.tags
+    assert "snapped-to-idiom" not in measured.pattern.tags
+
+
+def test_a_groove_that_is_nothing_like_an_idiom_is_left_as_measured():
+    """The library corrects; it does not overwrite. A real 16th feel is two
+    thirds of the way to plain quarters by the similarity measure, and it is not
+    plain quarters."""
+    positions = (0.0, 0.75, 1.0, 1.75, 2.0, 3.0)
+    folded = [(bar, position, 1.0) for bar in range(16) for position in positions]
+    result = extract(folded, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
+    assert [s.beat for s in result.pattern.strokes] == list(positions)
+    assert "snapped-to-idiom" not in result.pattern.tags

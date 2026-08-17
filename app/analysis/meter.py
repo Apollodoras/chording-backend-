@@ -27,6 +27,12 @@ share is genuinely poor *and* the challenger is decisively better. Everything
 else — including every case where the two are merely close — leaves the
 tracker's answer alone.
 
+**What runs before the vote.** The vote reasons about chord-change residues
+modulo the bar, so it assumes the bars are the right length — and on real
+recordings they often are not. `downbeats.repair` (§20.2a) therefore runs first
+and settles which of the tracker's beats are bar starts; only then is it
+meaningful to ask which residue class the "one" belongs to.
+
 Tempo and meter get a lighter touch on purpose. A meter override changes how
 many beats are in a bar, and a tempo octave correction changes what a beat *is*;
 both rewrite the axis wholesale, and neither has the clean "chord changes are on
@@ -53,11 +59,13 @@ from __future__ import annotations
 
 import logging
 from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..chords import normalize
 from ..payload import PLAUSIBLE_TEMPO_MAX, PLAUSIBLE_TEMPO_MIN
 from ..payload import bar_beats as parse_bar_beats
+from .downbeats import DownbeatReport
+from .downbeats import repair as repair_downbeats
 from .types import BeatGrid, RawChordSpan
 
 log = logging.getLogger("chords.meter")
@@ -111,6 +119,10 @@ class Meter:
     # (the default, and the only value reachable without `correct_octave`).
     tempo_octave_shift: int = 0
     meter_source: str = "tracker"
+    # What §20.2a's downbeat repair found and did, before the phase vote below
+    # ever ran. Empty on a grid it declined to touch, which is also what a
+    # hand-assembled `Meter` reports.
+    downbeats: DownbeatReport = field(default_factory=DownbeatReport)
 
 
 def reconcile(grid: BeatGrid, raw: list[RawChordSpan], *,
@@ -159,6 +171,12 @@ def reconcile(grid: BeatGrid, raw: list[RawChordSpan], *,
             log.info("tempo octave corrected: %.1f → %.1f bpm (%s)", grid.bpm, working.bpm,
                      "halved" if octave_shift < 0 else "doubled")
 
+    # §20.2a, and it has to run **here**: after the octave, which decides which
+    # beats exist at all, and before the phase vote, which assumes the bars are
+    # right — a vote taken over a grid holding half-bars is counting residues
+    # modulo a bar the song does not have.
+    working, downbeat_report = repair_downbeats(working, bar_beats=bar_beats)
+
     shift, evidence = _phase(working, raw, bar_beats)
     corrected = working
     if shift:
@@ -193,6 +211,7 @@ def reconcile(grid: BeatGrid, raw: list[RawChordSpan], *,
         tempo_octave_suspect=suspect,
         tempo_octave_shift=octave_shift,
         meter_source=source,
+        downbeats=downbeat_report,
     )
 
 

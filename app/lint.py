@@ -23,6 +23,8 @@ the payload's own embedded ``patterns``.
 
 from __future__ import annotations
 
+from statistics import median
+
 from .chords import is_valid_chord, pitch_class
 from .payload import (
     MODES,
@@ -54,6 +56,20 @@ _EPS = 1e-6
 # `TEMPO_MIN`/`TEMPO_MAX` are imported above rather than defined here — callers
 # still find them on this module, but the number now lives next to the two other
 # tempo ranges it has to nest with (see `payload.py`).
+
+# How far one bar's anchor gap may sit from the song's own modal bar before it
+# counts as a different length bar. A quarter is wide: the failures this catches
+# are half-bars and double-bars, and the width is what keeps rubato, a ritardando
+# and a live drummer out of it.
+ANCHOR_GAP_TOLERANCE = 0.25
+# ...and how many bars may be off before the map is not worth publishing. A real
+# song is allowed the odd inserted bar; a song where one bar in five is a
+# different length has a beat map, not a bar grid.
+ANCHOR_GAP_SHARE = 0.10
+# How close two gaps must be to be "the same bar length" when the mode is taken.
+ANCHOR_GAP_CLUSTER = 0.10
+# Below this many bars there is no mode to speak of, and the check stands down.
+ANCHOR_GAP_MIN_BARS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +290,26 @@ def lint_sync(payload: CompositionPayload, sync: VideoSync) -> list[str]:
             )
             break
 
+    # --- Bars that are about as long as the other bars ----------------------
+    # Every check in this function until now compared the song against *itself*,
+    # and a chart that is uniformly wrong about its own bar lengths is perfectly
+    # self-consistent: the anchors increase, they land on bar boundaries, they
+    # cover the song, and bar 9 is still half the length of bar 8. That is the
+    # blindness that let "beat-map anomalies" and "it changes tempo mid song"
+    # reach the player — the client reads its cursor speed off these gaps, so
+    # anchors a half-bar apart *are* a tempo change as far as it is concerned.
+    #
+    # Two things about how this is measured, both load-bearing:
+    #
+    #   compare against the modal gap, not the payload tempo. The tempo is
+    #   derived from beat intervals and is right even when the bars are wrong, so
+    #   comparing to it would pass exactly the songs that are broken.
+    #
+    #   withhold on a share, not on one bar. Real recordings have rubato and real
+    #   songs have the occasional inserted bar; a single-bar trigger would
+    #   withhold the sidecar from songs that are fine.
+    _lint_anchor_gaps(anchors, add)
+
     # Anchors are downbeats, so each must land on a bar boundary of the axis the
     # chart produces — that IS the §13.2 invariant, stated as a check.
     for anchor in anchors:
@@ -327,6 +363,51 @@ def lint_sync(payload: CompositionPayload, sync: VideoSync) -> list[str]:
         add(f"videoSync: patternConfidence {sync.patternConfidence} must be between 0 and 1")
 
     return problems
+
+
+def _lint_anchor_gaps(anchors: list, add) -> None:
+    """Consecutive anchors must sit about one modal bar apart. See `lint_sync`.
+
+    Silent on short songs: a mode taken over five bars is not a mode, and a
+    32-second demo with one inserted bar is not the failure this is looking for.
+    """
+    gaps = [b.tMs - a.tMs for a, b in zip(anchors, anchors[1:])]
+    if len(gaps) < ANCHOR_GAP_MIN_BARS:
+        return
+    modal = _modal_gap(gaps)
+    if modal is None or modal <= 0:
+        return
+
+    off = [g for g in gaps if abs(g - modal) > modal * ANCHOR_GAP_TOLERANCE]
+    share = len(off) / len(gaps)
+    if share > ANCHOR_GAP_SHARE:
+        worst = max(off, key=lambda g: abs(g - modal))
+        add(
+            f"videoSync: {len(off)} of {len(gaps)} bars ({share:.0%}) are more than "
+            f"{ANCHOR_GAP_TOLERANCE:.0%} away from this song's own bar of {modal} ms "
+            f"(worst: {worst} ms) — the beat map has bars the recording does not, "
+            f"and the cursor would change speed at each one"
+        )
+
+
+def _modal_gap(gaps: list[int]) -> int | None:
+    """The song's own bar length in milliseconds, as a **mode** with a tolerance.
+
+    A plain mode is useless on millisecond timings — no two bars are the same
+    length to the millisecond — and a median is dragged by the very anomalies
+    this is looking for: a song with 40% half-bars can have a median between the
+    two. So each gap is scored by how many other gaps sit within
+    `ANCHOR_GAP_CLUSTER` of it, and the winner's cluster is summarized by its
+    median. That is the length most of this song's bars actually are.
+    """
+    if not gaps:
+        return None
+    best: list[int] = []
+    for candidate in gaps:
+        cluster = [g for g in gaps if abs(g - candidate) <= candidate * ANCHOR_GAP_CLUSTER]
+        if len(cluster) > len(best):
+            best = cluster
+    return int(median(best)) if best else None
 
 
 def _lint_section(

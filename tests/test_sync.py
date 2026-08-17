@@ -230,6 +230,46 @@ def test_an_anchor_on_the_songs_final_barline_is_not_past_the_end():
     assert lint_sync(payload, sync) == []
 
 
+# --- bars that are about as long as the other bars --------------------------
+#
+# The check that would have caught every case in the beat audit. Every other rule
+# in `lint_sync` compares the song against *itself*, and a chart that is
+# uniformly wrong about its own bar lengths passes all of them: the anchors
+# increase, they sit on bar boundaries, they cover the song — and bar 9 is half
+# the length of bar 8, which the client reads as the song doubling in tempo.
+
+def test_a_half_length_bar_in_the_middle_of_the_song_is_refused():
+    payload = known_song()
+    times = known_downbeats()
+    times[9] -= 1000                          # bar 8 half as long, bar 9 half again
+    sync = make_sync(beatAnchors=anchors_for(times, bar_beats=4))
+    assert any("bars the recording does not" in p for p in lint_sync(payload, sync))
+
+
+def test_one_odd_bar_in_a_long_song_is_not_enough_to_withhold_the_sidecar():
+    """Real songs have the occasional inserted bar and real recordings have
+    rubato. Withholding on a single bar would take video sync away from songs
+    that are fine, which trades a wrong sync for no sync."""
+    payload = known_song()
+    times = known_downbeats()
+    times[9] -= 200                           # one bar 10% short, one 10% long
+    sync = make_sync(beatAnchors=anchors_for(times, bar_beats=4))
+    assert lint_sync(payload, sync) == []
+
+
+def test_the_check_is_against_the_songs_own_bar_and_not_the_payload_tempo():
+    """The tempo is derived from *beat* intervals and is right even when the bars
+    are wrong, so comparing anchors to it would pass exactly the songs that are
+    broken. Here every bar is 25% longer than the payload's 120 bpm implies — a
+    song charted at one tempo and anchored at another, uniformly — and that is a
+    consistent bar grid, which is what this rule is about."""
+    payload = known_song()
+    times = [int(t * 1.25) for t in known_downbeats()]
+    sync = make_sync(beatAnchors=anchors_for(times, bar_beats=4),
+                     durationMs=40_000)
+    assert lint_sync(payload, sync) == []
+
+
 def test_anchors_that_stop_short_of_the_song_are_refused():
     """Short coverage isn't fatal — the client extrapolates — but it means the
     tail runs on an assumed tempo, which is exactly what anchors exist to

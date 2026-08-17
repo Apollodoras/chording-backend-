@@ -242,6 +242,52 @@ def recording(
     return Recording(grid=grid, chords=chords, meta=meta, truth=truth)
 
 
+# --- grids a real tracker produces ------------------------------------------
+#
+# Every beat grid above lays downbeats at `beats[::bar_beats]`, and so did every
+# grid in the suite — `known_downbeats`, `test_model`, `test_meter`,
+# `test_pipeline`, all of them. A perfectly regular downbeat sequence appeared in
+# 519 green tests and an irregular one appeared in none, which is exactly why a
+# defect that put 15–20% of the catalog's bars at the wrong length was invisible
+# here while the player could see it plainly.
+#
+# `beat_this` gets the pulse right and the bar wrong, in both directions: an
+# extra downbeat one beat into a real bar (a half-bar, then a short one) and a
+# missing one (a bar of double length). Both are below.
+
+def broken_downbeats(*, spurious: tuple[int, ...] = (),
+                     dropped: tuple[int, ...] = (),
+                     beat_into_bar: int = 1) -> list[int]:
+    """`known_downbeats` with tracker mistakes in it.
+
+    `spurious` names bars that get an **extra** downbeat `beat_into_bar` beats
+    after their real one; `dropped` names bars whose downbeat the tracker missed.
+    Both are given as bar indices, so a test reads as "bar 10 is broken" rather
+    than as an arithmetic puzzle about milliseconds.
+    """
+    downbeats = [t for i, t in enumerate(known_downbeats()) if i not in dropped]
+    extra = [bar * BAR_BEATS * MS_PER_BEAT + beat_into_bar * MS_PER_BEAT
+             for bar in spurious]
+    return sorted(set(downbeats + extra))
+
+
+def broken_grid(**kwargs) -> BeatGrid:
+    """`known_grid` with a downbeat sequence a real tracker might have produced.
+
+    The **beats** are untouched, which is the point: the pulse is the half a
+    tracker gets right, and the repair in `downbeats.py` is allowed to choose
+    among these beats but never to invent a time that isn't one of them.
+    """
+    grid = known_grid()
+    return BeatGrid(
+        beats_ms=grid.beats_ms,
+        downbeats_ms=broken_downbeats(**kwargs),
+        bpm=grid.bpm,
+        confidence=grid.confidence,
+        time_signature=grid.time_signature,
+    )
+
+
 # --- fakes ------------------------------------------------------------------
 
 @dataclass

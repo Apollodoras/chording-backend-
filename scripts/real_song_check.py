@@ -114,6 +114,7 @@ def analyze_one(name: str) -> dict:
 
     from app.chords import NORMAL
     from app.config import load_settings
+    from app.payload import bar_beats
     from app.analysis import engines, pipeline
     from app.analysis.fetch import build_source
     from app.analysis.scratch import assert_clean
@@ -175,8 +176,27 @@ def analyze_one(name: str) -> dict:
     report["stages"] = stages
     report["engines"] = {"chords": outcome.engine_chords, "beats": outcome.engine_beats}
     report["lowConfidence"] = outcome.low_confidence
+    report["lowConfidenceReasons"] = list(outcome.low_confidence_reasons)
     report["difficulties"] = sorted(outcome.songs)
     report["hasSync"] = outcome.sync is not None
+
+    # The beat map, which this gate never looked at. A song can run end to end,
+    # lint clean and hold a good chart while its bars are the wrong length —
+    # that is the whole finding of the beat audit, and "the pipeline ran" is
+    # exactly the claim that cannot see it.
+    theory = outcome.theory
+    report["beatmap"] = {
+        "irregularBars": theory.irregularBars,
+        "downbeatsDropped": theory.downbeatsRepaired.dropped,
+        "downbeatsInserted": theory.downbeatsRepaired.inserted,
+        "phaseShift": theory.phaseShift,
+        "meterSource": theory.meterSource,
+    }
+    if outcome.sync is not None:
+        gaps = [b.tMs - a.tMs for a, b in
+                zip(outcome.sync.beatAnchors, outcome.sync.beatAnchors[1:])]
+        report["beatmap"]["bars"] = len(gaps)
+        report["beatmap"]["tempoConfidence"] = round(outcome.sync.tempo.confidence, 3)
 
     # Read everything below off the wire payload the client would actually
     # receive, not off internal state, so a field that fails to serialize shows
@@ -221,6 +241,43 @@ def analyze_one(name: str) -> dict:
     report["sectionCount"] = len(sections)
     report["sectionNames"] = [s.get("name") or s.get("id") or "?"
                               for s in sections if isinstance(s, dict)][:8]
+
+    # Which strum each section points at, and what those strums are. "How many
+    # patterns" is not the claim worth checking — "the same music plays the same
+    # strum, and every strum is played more than once" is, and it needs the
+    # mapping rather than the count.
+    # A section with no `bars` is not empty — it is the **flat** encoding
+    # (`chordNames` + `beatsPerChord`), which `compile._section` emits whenever
+    # the section is one chord per N beats. Reporting it as "0 bars" reads as a
+    # dropped section, which is a different and much more alarming thing.
+    def _bars_of(section: dict) -> int:
+        bars = section.get("bars") or []
+        if bars:
+            return len(bars)
+        names = [n for n in (section.get("chordNames") or []) if n]
+        per_chord = section.get("beatsPerChord") or 0
+        beats = bar_beats(wire.get("timeSignature") or "4/4") or 4
+        return int(len(names) * per_chord / beats) if names and per_chord else 0
+
+    report["sectionPatterns"] = [
+        {"name": s.get("name") or s.get("kindRaw") or "?",
+         "bars": _bars_of(s),
+         "flat": not (s.get("bars") or []),
+         "repeats": s.get("repeats", 1),
+         "patternID": s.get("patternID")}
+        for s in sections if isinstance(s, dict)
+    ]
+    report["patterns"] = {
+        p.get("id"): {
+            "name": p.get("name"),
+            "tags": [t for t in (p.get("tags") or [])
+                     if t in ("fallback", "snapped-to-idiom")],
+            "strokes": ["%g%s" % (s.get("beat", 0),
+                                  "d" if s.get("direction") == "down" else "u")
+                        for s in (p.get("strokes") or []) if isinstance(s, dict)],
+        }
+        for p in (wire.get("patterns") or []) if isinstance(p, dict)
+    }
     report["barsMode"] = bars_mode
     report["barCount"] = sum(len(s.get("bars") or []) for s in sections if isinstance(s, dict))
 
@@ -314,9 +371,38 @@ def _verdict(reports: list[dict]) -> int:
             notes.append(f"{name}: {report['wallSeconds']}s wall for "
                          f"{report['durationS']}s audio ({report['realtimeRatio']}x realtime)")
         if report.get("lowConfidence"):
-            notes.append(f"{name}: flagged lowConfidence")
+            # With the reason, because there are four of them and they call for
+            # four different responses.
+            why = "; ".join(report.get("lowConfidenceReasons") or []) or "unstated"
+            notes.append(f"{name}: flagged lowConfidence — {why}")
         if not report.get("hasSync"):
             notes.append(f"{name}: no sync sidecar (beat grid too weak to align)")
+        # The rhythm half of the deliverable, which this gate has never looked
+        # at either. One line per strum, and the sections that play it — so
+        # "the verses all strum the same way" is checkable by eye rather than
+        # by trust.
+        patterns = report.get("patterns") or {}
+        if patterns:
+            alias = {pid: chr(ord("a") + i) for i, pid in enumerate(patterns)}
+            played = {}
+            for section in report.get("sectionPatterns") or []:
+                played.setdefault(section["patternID"], []).append(
+                    f"{section['name']}×{section['repeats']}")
+            notes.append(f"{name}: {len(patterns)} strum(s) for "
+                         f"{report['sectionCount']} sections")
+            for pid, pattern in patterns.items():
+                tags = f" [{','.join(pattern['tags'])}]" if pattern["tags"] else ""
+                notes.append(f"    {alias[pid]}: {' '.join(pattern['strokes'])}"
+                             f"{tags} — played by {', '.join(played.get(pid, ['nothing']))}")
+
+        beatmap = report.get("beatmap") or {}
+        if beatmap:
+            notes.append(
+                f"{name}: beat map — {beatmap.get('irregularBars', 0)} irregular bars, "
+                f"repaired {beatmap.get('downbeatsDropped', 0)} spurious / "
+                f"{beatmap.get('downbeatsInserted', 0)} missing downbeats, "
+                f"phase shift {beatmap.get('phaseShift', 0)}"
+            )
 
     for note in notes:
         print(f"[ note ] {note}")

@@ -470,3 +470,97 @@ def test_the_vote_can_be_turned_off():
     model = song_model.build(grid=_grid(), raw=_chords(), onsets=[], vote=False)
     assert model.consensus.rewritten_bars == 0
     assert model.consensus.groups_voted == 0
+
+
+# --- "if a pattern doesn't repeat, it isn't a pattern" ------------------------
+#
+# The user's phrasing, kept verbatim as the acceptance criterion. Measured on the
+# stored catalog, one extraction per repeat group emitted 17 patterns for Let It
+# Be — every one of them `repeats: 1` — and 23 for Assima. Clustering those by
+# what they actually contain collapses them to 3 and 6, which is the order of
+# magnitude a song has.
+
+def _onsets(per_bar, *, strong=1.5):
+    """One list of onsets from a `{bar: positions}` map — bar-local beats."""
+    from app.analysis.types import Onset
+    out = []
+    for bar, positions in per_bar.items():
+        for position in positions:
+            out.append(Onset(t_ms=int(bar * BAR_MS + position * BEAT_MS),
+                             strength=strong if position == 0.0 else 1.0))
+    return sorted(out, key=lambda o: o.t_ms)
+
+
+DDUUDU = (0.0, 1.0, 1.5, 2.5, 3.0, 3.5)
+
+
+def test_a_section_that_never_repeats_does_not_get_a_groove_of_its_own():
+    """`RepeatGroup.is_repeat` has existed since §20.4 and was never consulted,
+    and this is the question it was written for: a group with one occurrence has
+    one section's worth of onsets behind it, and emitting it as a distinct
+    pattern tells the player the song has two strums when it has one."""
+    labels = ["C", "G", "Am", "F"] * 2 + ["D", "A", "Bm", "E"] + ["C", "G", "Am", "F"] * 2
+    raw = [RawChordSpan(start_ms=i * BAR_MS, end_ms=(i + 1) * BAR_MS, label=label,
+                        confidence=0.9) for i, label in enumerate(labels)]
+    # The verse strums D-DU-UD-U; the section that plays once plays something
+    # else, and its extraction is the one that must not survive on its own.
+    once = (0.0, 0.75, 1.75, 2.25, 3.25)
+    onsets = _onsets({bar: once if 8 <= bar < 12 else DDUUDU
+                      for bar in range(len(labels))})
+
+    model = song_model.build(grid=_grid(len(labels)), raw=raw, onsets=onsets)
+    assert model is not None
+    assert any(not g.is_repeat for g in model.groups), "a group that plays once"
+    assert len({p.pattern.id for p in model.patterns.values()}) == 1, \
+        "one song, one groove — the section that plays once inherits it"
+
+
+def test_a_group_that_repeats_keeps_the_groove_it_measured():
+    """The rule cuts one way only. A song whose sections genuinely repeat and
+    genuinely differ is allowed to say so — this is not "collapse everything"."""
+    labels = ["C", "G", "Am", "F"] * 4 + ["D", "A", "Bm", "E"] * 4
+    raw = [RawChordSpan(start_ms=i * BAR_MS, end_ms=(i + 1) * BAR_MS, label=label,
+                        confidence=0.9) for i, label in enumerate(labels)]
+    eighths = (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)
+    onsets = _onsets({bar: (0.0, 2.0) if bar >= 16 else eighths
+                      for bar in range(len(labels))})
+
+    model = song_model.build(grid=_grid(len(labels)), raw=raw, onsets=onsets)
+    assert model is not None
+    assert len([g for g in model.groups if g.is_repeat]) >= 2, "two repeating groups"
+    assert len({p.pattern.id for p in model.patterns.values()}) >= 2, \
+        "and two grooves, because the song really does play two"
+
+
+def test_two_measurements_of_one_groove_are_one_groove():
+    """Content addressing collapses grooves that are byte-identical. Two
+    extractions of the same strum differing by one 16th are not byte-identical,
+    and nothing in the pipeline noticed — measured on the stored songs, the mean
+    pairwise similarity of a song's "different" patterns was about 0.5."""
+    from app.analysis.model import _consolidate
+    from app.analysis.strumming import extract
+
+    dduudu = extract([(bar, p, 1.0) for bar in range(16) for p in
+                      (0.0, 0.75, 1.0, 1.75, 2.0, 3.0)],
+                     bar_beats=4.0, bars=16, tempo=120, name="Verse strum")
+    nearly = extract([(bar, p, 1.0) for bar in range(16) for p in
+                      (0.0, 0.75, 1.0, 1.75, 2.0, 2.75, 3.0)],
+                     bar_beats=4.0, bars=16, tempo=120, name="Chorus strum")
+    assert dduudu.pattern.id != nearly.pattern.id, "different bytes, before"
+
+    merged = _consolidate({"A": dduudu, "B": nearly}, {"A": 32, "B": 8})
+    assert merged["B"].pattern.id == dduudu.pattern.id, \
+        "and one groove after — the one with more bars behind it wins"
+
+
+def test_grooves_that_are_genuinely_different_are_not_merged():
+    from app.analysis.model import _consolidate
+    from app.analysis.strumming import extract
+
+    quarters = extract([(bar, p, 1.0) for bar in range(16) for p in (0.0, 1.0, 2.0, 3.0)],
+                       bar_beats=4.0, bars=16, tempo=120, name="Verse strum")
+    offbeats = extract([(bar, p, 1.0) for bar in range(16) for p in (0.5, 1.5, 2.5, 3.5)],
+                       bar_beats=4.0, bars=16, tempo=120, name="Chorus strum")
+
+    merged = _consolidate({"A": quarters, "B": offbeats}, {"A": 32, "B": 32})
+    assert merged["B"].pattern.id == offbeats.pattern.id

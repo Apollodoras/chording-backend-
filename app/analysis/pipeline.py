@@ -41,7 +41,7 @@ from ..errors import (
 )
 from ..lint import TEMPO_MAX, TEMPO_MIN, lint, lint_sync, repair
 from ..payload import CompositionPayload
-from ..sync import TheoryReport, VideoSync
+from ..sync import DownbeatRepair, TheoryReport, VideoSync
 from . import model as song_model
 from .compile import build_sync, compile_song
 from .scratch import scratch
@@ -81,6 +81,14 @@ class AnalysisOutcome:
     # analysis worth reporting, and the benchmark still has to be able to read
     # what the theory layer did to it.
     theory: TheoryReport = field(default_factory=TheoryReport)
+    # **Why** the song is low-confidence, when it is. Four different things set
+    # that flag and they call for four different responses — a weak chord read
+    # is not a broken bar grid is not a tempo an octave out — and until this
+    # existed the only signal anywhere was a single boolean on the stored row.
+    # "This song lost video sync and nobody can say what for" is not a state an
+    # operator should have to be in. Not on the wire: the player is told the
+    # sync is unavailable, which is all it can act on.
+    low_confidence_reasons: tuple[str, ...] = ()
 
 
 def gate(meta: VideoMeta, *, settings, store) -> None:
@@ -222,9 +230,28 @@ def assemble(
                     model.meter.tempo_octave_suspect)
         raise TempoUnreadable(tempo, TEMPO_MIN, TEMPO_MAX)
 
-    low_confidence = (model.confidence < settings.confidence_floor
-                      or grid.confidence < settings.confidence_floor
-                      or model.meter.tempo_octave_suspect)
+    # `downbeats.unreliable` is the fourth way in, and it is the one §20.2a
+    # added: a song whose bars disagreed with their own mode more often than the
+    # repair's ceiling may genuinely not be in the meter we are charting it in.
+    # The repair still ran — a self-consistent grid is worth having either way —
+    # but the sidecar is a claim about *this recording's* timeline, and that is
+    # the claim in doubt. §13.3's honest degradation, on new evidence.
+    reasons: list[str] = []
+    if model.confidence < settings.confidence_floor:
+        reasons.append(f"chords {model.confidence:.2f} < floor {settings.confidence_floor:.2f}")
+    if grid.confidence < settings.confidence_floor:
+        reasons.append(f"beat grid {grid.confidence:.2f} < floor {settings.confidence_floor:.2f}")
+    if model.meter.tempo_octave_suspect:
+        reasons.append(f"tempo {tempo} may be an octave out")
+    if model.meter.downbeats.unreliable:
+        reasons.append(
+            f"bars disagreed with the song's own {model.meter.downbeats.bar_beats}-beat "
+            f"bar more than the repair's ceiling"
+        )
+    low_confidence = bool(reasons)
+    if low_confidence:
+        log.warning("%s ships low-confidence (no sidecar): %s", meta.video_id,
+                    "; ".join(reasons))
     pattern_confidence: float | None = model.pattern_confidence
     total_bars = model.total_bars
     theory = TheoryReport(
@@ -239,6 +266,11 @@ def assemble(
         meterSource=model.meter.meter_source,
         tempoOctaveSuspect=model.meter.tempo_octave_suspect,
         tempoOctaveShift=model.meter.tempo_octave_shift,
+        irregularBars=model.meter.downbeats.irregular_bars,
+        downbeatsRepaired=DownbeatRepair(
+            dropped=model.meter.downbeats.dropped,
+            inserted=model.meter.downbeats.inserted,
+        ),
         exactRatio=round(model.exact_ratio, 3),
     )
 
@@ -321,4 +353,5 @@ def assemble(
         analyzed_at=analyzed_at,
         duration_ms=duration_ms,
         theory=theory,
+        low_confidence_reasons=tuple(reasons),
     )

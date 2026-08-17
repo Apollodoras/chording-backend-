@@ -57,6 +57,8 @@ sys.path.insert(0, str(ROOT))
 
 from app.analysis import engines, postprocess  # noqa: E402
 from app.analysis.axis import build_axis  # noqa: E402
+from app.analysis.downbeats import modal_bar_beats  # noqa: E402
+from app.analysis.downbeats import repair as repair_downbeats  # noqa: E402
 from app.analysis.meter import reconcile  # noqa: E402
 from app.analysis.pipeline import assemble  # noqa: E402
 from app.analysis.types import BeatGrid, EngineInfo, RawChordSpan, VideoMeta  # noqa: E402
@@ -290,14 +292,42 @@ def _split(cases: list[Case]) -> tuple[list[Case], list[Case]]:
 
 # --- the runs ---------------------------------------------------------------
 
+def bar_regularity(grid: BeatGrid) -> tuple[float, float]:
+    """Share of bars that are the song's own modal length — before, after repair.
+
+    The number nothing measured until the beat audit, and the one the player was
+    complaining about: on the stored catalog it ran from 58% to 92%, while every
+    gate in the repo was green. `after` is what the chart is actually built on,
+    since `meter.reconcile` runs the repair before `build_axis` sees the grid.
+    """
+    def share(g: BeatGrid) -> float:
+        mode = modal_bar_beats(g.beats_ms, g.downbeats_ms)
+        if mode is None:
+            return 0.0
+        beats = sorted({int(t) for t in g.beats_ms})
+        downbeats = sorted({int(t) for t in g.downbeats_ms})
+        counts = [sum(1 for t in beats if start <= t < end)
+                  for start, end in zip(downbeats, downbeats[1:])]
+        return counts.count(mode) / len(counts) if counts else 0.0
+
+    repaired, _ = repair_downbeats(grid)
+    return share(grid), share(repaired)
+
+
 def bench_beats(cases: list[Case]) -> dict[str, Tally]:
     names = sorted(engines._BEAT_TRACKERS)
     if not names:
         print("no beat trackers registered — see app/analysis/engines.py\n")
         return {}
     print("BEAT TRACKERS")
+    # `bars` is the column the beat audit added, and it is a different question
+    # from downbeat F: F asks whether each downbeat is near a true one, and a
+    # tracker can score well on it while emitting bars of wildly different
+    # lengths — an extra downbeat one beat into a real bar costs F almost
+    # nothing and costs the player a tempo change. This is the share of bars
+    # that are the song's own modal length, before the repair and after it.
     print(f"{'engine':<12}{'track':<22}{'beat F':>8}{'downbeat F':>12}"
-          f"{'bpm err':>9}{'meter':>8}{'sec':>7}")
+          f"{'bpm err':>9}{'meter':>8}{'bars':>13}{'sec':>7}")
     tallies = {name: Tally() for name in names}
     for name in names:
         for case in cases:
@@ -306,12 +336,14 @@ def bench_beats(cases: list[Case]) -> dict[str, Tally]:
             down_f, _, _ = f_measure(grid.downbeats_ms, case.truth["downbeats_ms"])
             bpm_error = abs(grid.bpm - case.truth["tempo"])
             meter_ok = grid.time_signature == case.truth["time_signature"]
+            before, after = bar_regularity(grid)
             tallies[name].add(case, beat_f=beat_f, down_f=down_f,
                               bpm_err=bpm_error, meter=float(meter_ok),
+                              bars_before=before, bars_after=after,
                               seconds=elapsed)
             print(f"{name:<12}{case.name:<22}{beat_f:>8.3f}{down_f:>12.3f}"
                   f"{bpm_error:>9.1f}{('ok' if meter_ok else grid.time_signature):>8}"
-                  f"{elapsed:>7.1f}")
+                  f"{f'{before:.2f}→{after:.2f}':>13}{elapsed:>7.1f}")
     print()
     return tallies
 
@@ -853,13 +885,16 @@ def summarise(chord_tallies: dict[str, Tally], beat_tallies: dict[str, Tally],
 
     if beat_tallies:
         print(f"{'beat tracker':<14}{'REAL beat F':>13}{'REAL down F':>13}"
-              f"{'bpm err':>9}{'meter':>8}{'s/track':>9}")
+              f"{'bpm err':>9}{'meter':>8}{'bars raw':>10}{'repaired':>10}"
+              f"{'s/track':>9}")
         for name, tally in sorted(beat_tallies.items(),
                                   key=lambda kv: -kv[1].mean("real", "down_f")):
             print(f"{name:<14}{tally.mean('real', 'beat_f'):>13.3f}"
                   f"{tally.mean('real', 'down_f'):>13.3f}"
                   f"{tally.mean('real', 'bpm_err'):>9.1f}"
                   f"{tally.mean('real', 'meter'):>8.2f}"
+                  f"{tally.mean('real', 'bars_before'):>10.2f}"
+                  f"{tally.mean('real', 'bars_after'):>10.2f}"
                   f"{tally.mean('real', 'seconds'):>9.1f}")
         print()
 

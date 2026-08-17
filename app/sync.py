@@ -81,6 +81,21 @@ class EngineVersions(BaseModel):
     beats: str
 
 
+class DownbeatRepair(BaseModel):
+    """What §20.2a changed about the tracker's downbeat sequence.
+
+    Both counts are edits nothing downstream can see — the anchors that ship are
+    the repaired ones, and a repaired grid is *more* self-consistent than the one
+    it replaced, so no check anywhere would notice. Which is precisely why they
+    are published rather than logged: a song reporting forty dropped downbeats
+    had a beat tracker that fired forty bar lines the music does not have, and
+    that is worth knowing about the recording even though the chart is now right.
+    """
+
+    dropped: int = 0
+    inserted: int = 0
+
+
 class TheoryReport(BaseModel):
     """What the §20 layer concluded, and what it changed to get there.
 
@@ -128,6 +143,14 @@ class TheoryReport(BaseModel):
     # the bar started, and the harmony won.
     phaseShift: int = 0
     meterSource: str = "tracker"
+    # §20.2a. `irregularBars` counts bars still disagreeing with the song's own
+    # modal bar **after** the repair — which is exactly the set `axis.py`
+    # resamples, so it is also "how many bars of this chart are evenly spread
+    # rather than tracked". Zero on a clean grid, a handful on a song with real
+    # metric irregularity in it (Here Comes The Sun), and a large number on a
+    # song whose meter we have probably got wrong.
+    irregularBars: int = 0
+    downbeatsRepaired: DownbeatRepair = Field(default_factory=DownbeatRepair)
     # The tempo is outside the range this repertoire plausibly occupies, *after*
     # any correction — so a song reporting it is one whose beat grid may be an
     # octave out, and it is flagged `lowConfidence` for that reason alone.

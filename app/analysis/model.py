@@ -49,12 +49,20 @@ from .axis import BeatAxis, build_axis
 from .consensus import ConsensusReport
 from .keyfinder import DetectedKey, detect_key
 from .meter import Meter, reconcile
-from .strumming import ExtractedPattern, fallback
+from .strumming import ExtractedPattern, fallback, stroke_similarity
 from .structure import BarChord, Section, bars_from_spans, spans_from_bars
 from .types import BeatGrid, EnergyCurve, Onset, RawChordSpan
 from .vocabulary import VocabularyReport
 
 log = logging.getLogger("chords.model")
+
+# How alike two extracted grooves must be before the song is told it has one
+# groove, not two. Jaccard over stroke positions, and 0.5 is measured rather than
+# chosen: at that threshold the stored catalog's 17 / 23 / 7 emitted patterns
+# cluster into 3 / 6 / 2, which is the order of magnitude a song actually has.
+# Tighter and the merge stops happening; looser and grooves that differ by a beat
+# start collapsing together.
+GROOVE_SIMILARITY = 0.5
 
 # The tier the model is built at. The richest one, because everything structural
 # is easier to see before simplification has flattened distinctions — two
@@ -342,11 +350,24 @@ def impose(sections: list[Section], bars: list[list[BarChord]]) -> list[Section]
 def _patterns(groups: list[form.RepeatGroup], sections: list[Section], *,
               onsets: list[Onset], axis: BeatAxis, bar_beats: float, tempo: int,
               time_signature: str) -> dict[str, ExtractedPattern]:
-    """One pattern per repeat group (§14, pooled per §20.4).
+    """The song's grooves — at most a handful, each one backed by music that
+    repeats (§14, pooled per §20.4).
 
     With no onset detector at all every group gets the quarter-note fallback,
     which is the intended behaviour: the app requires a pattern, and a boring one
     that plays is worth more than no song.
+
+    One extraction per group is where this starts, and on its own it produced
+    seventeen "patterns" for Let It Be — one per section, every one of them
+    `repeats: 1`. Two passes fix that, and they are separate because they are
+    answering separate objections. `_inherit_dominant` applies the rule the user
+    stated: **if a pattern doesn't repeat, it isn't a pattern** — a group that
+    occurs once has one section's worth of onsets behind it and has not earned
+    its own groove. `_consolidate` then merges what is left by similarity, which
+    content-addressing cannot do on its own: it collapses grooves that are
+    byte-identical, and two extractions of the same strum that differ by one 16th
+    are not byte-identical. Measured over the stored songs, clustering at 0.5
+    Jaccard takes 17 patterns to 3, 23 to 6, and 7 to 2.
     """
     names = {}
     for section in sections:
@@ -363,7 +384,98 @@ def _patterns(groups: list[form.RepeatGroup], sections: list[Section], *,
             group, onsets=onsets, axis=axis, bar_beats=bar_beats, tempo=tempo,
             name=name, time_signature=time_signature,
         )
+
+    weights = {g.label: g.length_bars * max(1, len(g.occurrences)) for g in groups}
+    out = _inherit_dominant(out, groups, weights)
+    out = _consolidate(out, weights)
     return _rename_shared_grooves(out, names)
+
+
+def _dominant(patterns: dict[str, ExtractedPattern], weights: dict[str, int],
+              labels: list[str]) -> str | None:
+    """Whichever of `labels` has the most bars of music standing behind it.
+
+    Bars rather than occurrences: a four-bar chorus played twice and a sixteen-bar
+    verse played twice are not equal evidence, and the groove that should win an
+    argument is the one the song spends its time playing.
+    """
+    candidates = [label for label in labels if label in patterns]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda label: (weights.get(label, 0),
+                                              patterns[label].confidence, label))
+
+
+def _inherit_dominant(patterns: dict[str, ExtractedPattern],
+                      groups: list[form.RepeatGroup],
+                      weights: dict[str, int]) -> dict[str, ExtractedPattern]:
+    """A group that never repeats — or whose extraction gave up — plays the
+    song's groove rather than one of its own.
+
+    `RepeatGroup.is_repeat` has existed since §20.4 and was never consulted, and
+    this is the question it was written for. A single-occurrence group's
+    extraction rests on one section's onsets; on a four-bar bridge that is four
+    bars of evidence against the sixteen or sixty-four behind the verse, and
+    emitting it as a distinct pattern tells the player the song has two strums
+    when the recording has one. The same goes for a group whose extraction fell
+    back: a second, different quarter-note bar is not a second groove, it is the
+    same absence of evidence written twice.
+
+    Nothing is inherited when there is nothing to inherit *from* — a song of
+    entirely non-repeating sections keeps every extraction, because the
+    alternative is picking one at random and calling it the song's.
+    """
+    repeating = [g.label for g in groups
+                 if g.is_repeat and g.label in patterns
+                 and not patterns[g.label].is_fallback]
+    source = _dominant(patterns, weights, repeating)
+    if source is None:
+        return patterns
+
+    out = dict(patterns)
+    for group in groups:
+        if group.label == source or group.label not in out:
+            continue
+        if not group.is_repeat or patterns[group.label].is_fallback:
+            # The pattern object is shared wholesale, id included — which is what
+            # makes `compile` emit one embedded pattern for both, and what
+            # `_rename_shared_grooves` then names for the song rather than for a
+            # section it isn't from.
+            out[group.label] = patterns[source]
+    return out
+
+
+def _consolidate(patterns: dict[str, ExtractedPattern],
+                 weights: dict[str, int]) -> dict[str, ExtractedPattern]:
+    """Merge grooves that are the same groove measured slightly differently.
+
+    Clustered by Jaccard over the stroke positions, greedily, strongest first:
+    the most-supported groove claims everything within `GROOVE_SIMILARITY` of
+    itself, then the strongest of what remains, and so on. Greedy rather than
+    exhaustive because the alternative — transitive chaining — walks a song from
+    quarters to sixteenths one 16th at a time and ends with every section
+    playing a groove none of them measured.
+    """
+    if len(patterns) < 2:
+        return patterns
+
+    order = sorted(patterns, key=lambda label: (-weights.get(label, 0),
+                                                -patterns[label].confidence, label))
+    out = dict(patterns)
+    claimed: set[str] = set()
+    for label in order:
+        if label in claimed:
+            continue
+        claimed.add(label)
+        anchor = [s.beat for s in patterns[label].pattern.strokes]
+        for other in order:
+            if other in claimed:
+                continue
+            candidate = [s.beat for s in patterns[other].pattern.strokes]
+            if stroke_similarity(anchor, candidate) >= GROOVE_SIMILARITY:
+                out[other] = patterns[label]
+                claimed.add(other)
+    return out
 
 
 def _rename_shared_grooves(patterns: dict[str, ExtractedPattern],
