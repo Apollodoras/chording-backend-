@@ -11,6 +11,7 @@
 | `GET /healthz` | — | `{"status": "ok", …}` |
 | `POST /v1/admin/block` | `{videoId \\| channelId, reason}` | purge + block |
 | `DELETE /v1/admin/maps/{videoId}` | — | purge |
+| `GET /v1/admin/worker` | — | what the *worker* image built (`/healthz` can only see this one) |
 
 §16 is explicit about why this file looks like Mo's `app/main.py`: the client's
 HTTP layer, error enum and account plumbing **already exist** and will be copied,
@@ -28,6 +29,7 @@ transport today.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from contextlib import asynccontextmanager
@@ -139,9 +141,18 @@ def create_app(
     # inline one explicitly.
     app.state.runner = runner or ThreadJobRunner(settings, app.state.store, app.state.source)
 
+    # **Order matters, and it is the reverse of what it reads like.**
+    # `add_middleware` *prepends*, so the middleware installed last runs first and
+    # sits outermost. The limiter therefore has to be installed BEFORE the CORS
+    # layer in order to end up INSIDE it — and it was the other way round, so
+    # every 429 left the app without passing through `CORSMiddleware` and carried
+    # no `Access-Control-Allow-Origin`. A browser cannot read an opaque response:
+    # the `Retry-After` header and the `rate_limited` code were both unreachable
+    # from the web client, and being throttled was indistinguishable from the
+    # server dying. Native clients never noticed, which is why this survived.
+    _install_ip_rate_limit(app)
     _install_cors(app, settings)
     _install_error_handlers(app)
-    _install_ip_rate_limit(app)
     _install_routes(app)
     return app
 
@@ -167,19 +178,34 @@ def _install_cors(app: FastAPI, settings: Settings) -> None:
 # ---------------------------------------------------------------------------
 
 def client_ip(request: Request) -> str:
-    """The caller's IP, as far as it can be trusted behind Modal's proxy.
+    """The caller's IP, as far as it can be trusted behind our own proxies.
 
-    `X-Forwarded-For` grows left to right as it crosses proxies, so the
-    **rightmost** entry is the one our trusted proxy appended and everything left
-    of it is caller-supplied text. Reading the leftmost value — the common
+    `X-Forwarded-For` grows left to right as it crosses proxies, so the entries on
+    the **right** are the ones our infrastructure appended and everything left of
+    them is caller-supplied text. Reading the leftmost value — the common
     shorthand — hands an attacker a free bypass: a different fake IP per request
     starts a fresh window every time.
+
+    Which entry to read depends on **how many hops we own**, and that is a
+    deployment fact rather than a constant. The rightmost is correct behind
+    exactly one trusted proxy. Behind two — Cloudflare in front of a load
+    balancer, say — the rightmost entry is the *load balancer's* address, which is
+    the same for everyone, so the whole internet collapses into a single rate-limit
+    bucket and one noisy caller throttles every player at once.
+    `CHORDS_TRUSTED_PROXY_HOPS` is that count; the default of 1 is today's
+    behaviour and today's deployment.
+
+    Clamped rather than trusted blindly: with fewer entries than configured hops,
+    the leftmost value is the furthest-left thing we could possibly attribute, and
+    a header shorter than expected means the request did not come through the
+    chain we think it did.
     """
+    hops = max(1, getattr(request.app.state.settings, "trusted_proxy_hops", 1))
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         parts = [part.strip() for part in forwarded.split(",") if part.strip()]
         if parts:
-            return parts[-1]
+            return parts[-min(hops, len(parts))]
     return request.client.host if request.client else "unknown"
 
 
@@ -194,14 +220,24 @@ def _install_ip_rate_limit(app: FastAPI) -> None:
     still costs container time, and the per-uid limit cannot see a caller who
     never presents a valid token.
 
-    `/healthz` is the only exemption: a liveness probe that can rate-limit itself
-    into red is worse than useless. Everything else fails **closed**.
+    Two exemptions, both because counting them makes the limiter worse at its job:
+
+    - `/healthz` — a liveness probe that can rate-limit itself into red is worse
+      than useless.
+    - `OPTIONS` — a CORS preflight is the browser's, not the player's. The browser
+      sends one before each non-simple request, so counting them **halves** every
+      web client's real budget, and a preflight that 429s fails the request it was
+      asking permission for with no status the page can see. It also never reaches
+      a route, so it can neither spend quota nor start work.
+
+    Everything else fails **closed**.
     """
 
     @app.middleware("http")
     async def _limit(request: Request, call_next):
         settings: Settings = app.state.settings
-        if request.url.path == "/healthz" or settings.rate_limit_ip_per_min <= 0:
+        if (request.url.path == "/healthz" or request.method == "OPTIONS"
+                or settings.rate_limit_ip_per_min <= 0):
             return await call_next(request)
 
         ip = client_ip(request)
@@ -444,6 +480,13 @@ def _install_routes(app: FastAPI) -> None:
             "egress": getattr(app.state.source, "egress", None),
             "engines": engines.available(),
             "enginesReady": engines.is_ready(settings),
+            # **Which container the two fields above describe.** On Modal the
+            # answer is `ModalJobRunner`, i.e. "not this one" — and without that
+            # said out loud, `canAnalyze: true` next to `engines: {}` reads as the
+            # endpoint contradicting itself rather than as one page describing two
+            # containers. `GET /v1/admin/worker` is where the other container
+            # answers for itself.
+            "runner": type(app.state.runner).__name__,
             "canAnalyze": app.state.runner.can_analyze(),
             # Reported separately because the two genuinely differ: an upload
             # needs ffmpeg and the engines but no fetch source, so it survives
@@ -531,8 +574,15 @@ def _install_routes(app: FastAPI) -> None:
 
         # Two players asking for the same video at once join one job rather than
         # decoding the same recording twice for an identical result.
+        #
+        # Joining has to be *recorded*, or the join is worse than no join at all:
+        # the second caller gets a job id owned by the first, and the poll route
+        # refuses it. They were told, forever, that the analysis had expired —
+        # and retrying handed back the same dead id, so one player asking first
+        # made the video permanently un-analyzable for everyone else.
         existing = store.active_job_for(video_id, difficulty)
         if existing is not None:
+            store.follow_job(existing.job_id, principal.uid)
             return JSONResponse(status_code=202,
                                 content={"jobId": existing.job_id, "status": existing.status})
 
@@ -576,6 +626,16 @@ def _install_routes(app: FastAPI) -> None:
         request and forwarded to the worker. They are never written to a Volume,
         never stored, and never readable by a later request; §4's isolation is
         unchanged because this container still never *decodes* anything.
+
+        How *many* of them may be resident at once is bounded — see
+        `MAX_CONCURRENT_UPLOADS`. Holding the whole body is unavoidable given §2.1
+        leaves nowhere to spool it; holding ten of them at once was not.
+
+        The map an upload produces is **private to its uploader**
+        (`store.chord_maps.owner_uid`). A cache hit here still serves it, including
+        one owned by somebody else: the caller supplied the bytes, and the id is
+        their hash, so possession is what authorizes the read. That is not true of
+        `GET /v1/maps/{id}`, where the caller has proved nothing.
         """
         settings: Settings = app.state.settings
         store: Store = app.state.store
@@ -587,35 +647,39 @@ def _install_routes(app: FastAPI) -> None:
                        CODE_FEATURE_DISABLED)
 
         tier = _difficulty(difficulty)
-        data = await _read_upload(file, settings)
-        video_id = upload_id(data)
+        async with _upload_slot():
+            data = await _read_upload(file, settings)
+            video_id = upload_id(data)
 
-        cached = store.get_map(video_id, tier)
-        if cached is not None:
-            return _result(cached)
-        if store.is_blocked(video_id=video_id):
-            raise fail(403, "That audio isn’t available for chord analysis.", CODE_VIDEO_BLOCKED)
+            cached = store.get_map(video_id, tier)
+            if cached is not None:
+                return _result(cached)
+            if store.is_blocked(video_id=video_id):
+                raise fail(403, "That audio isn’t available for chord analysis.",
+                           CODE_VIDEO_BLOCKED)
 
-        existing = store.active_job_for(video_id, tier)
-        if existing is not None:
-            return JSONResponse(status_code=202,
-                                content={"jobId": existing.job_id, "status": existing.status})
+            existing = store.active_job_for(video_id, tier)
+            if existing is not None:
+                store.follow_job(existing.job_id, principal.uid)
+                return JSONResponse(status_code=202,
+                                    content={"jobId": existing.job_id, "status": existing.status})
 
-        _charge(app, principal)
-        job_id = uuid.uuid4().hex
-        store.create_job(job_id=job_id, uid=principal.uid, video_id=video_id, difficulty=tier)
-        try:
-            app.state.runner.submit(job_id=job_id, video_id=video_id, difficulty=tier,
-                                    uid=principal.uid, audio=data, filename=file.filename)
-        except Exception:
-            log.exception("failed to submit upload job %s", job_id)
-            store.update_job(job_id, status=STATUS_FAILED, progress=1.0,
-                             error_code=CODE_ANALYSIS_FAILED,
-                             error_message="That audio couldn’t be analyzed.")
-            store.refund_use(principal.uid)
-            raise fail(503, "Chord analysis is busy right now — try again in a moment.",
-                       CODE_FEATURE_DISABLED)
-        return JSONResponse(status_code=202, content={"jobId": job_id, "status": "queued"})
+            _charge(app, principal)
+            job_id = uuid.uuid4().hex
+            store.create_job(job_id=job_id, uid=principal.uid, video_id=video_id,
+                             difficulty=tier)
+            try:
+                app.state.runner.submit(job_id=job_id, video_id=video_id, difficulty=tier,
+                                        uid=principal.uid, audio=data, filename=file.filename)
+            except Exception:
+                log.exception("failed to submit upload job %s", job_id)
+                store.update_job(job_id, status=STATUS_FAILED, progress=1.0,
+                                 error_code=CODE_ANALYSIS_FAILED,
+                                 error_message="That audio couldn’t be analyzed.")
+                store.refund_use(principal.uid)
+                raise fail(503, "Chord analysis is busy right now — try again in a moment.",
+                           CODE_FEATURE_DISABLED)
+            return JSONResponse(status_code=202, content={"jobId": job_id, "status": "queued"})
 
     @app.get("/v1/analyze/{job_id}")
     async def analyze_status(job_id: str, principal: Principal = Depends(_principal_polling)):
@@ -623,18 +687,27 @@ def _install_routes(app: FastAPI) -> None:
         job = store.get_job(job_id)
         if job is None:
             raise fail(404, "That analysis has expired — ask for it again.", CODE_NOT_FOUND)
-        if job.uid != principal.uid:
-            # 404 rather than 403: whether someone else's job exists is not this
-            # caller's business.
+        # The owner, or anyone who was handed this id because they asked for the
+        # same video while it was running (`follow_job`). 404 rather than 403:
+        # whether someone else's job exists is not this caller's business.
+        if not store.may_read_job(job, principal.uid):
             raise fail(404, "That analysis has expired — ask for it again.", CODE_NOT_FOUND)
 
         body: dict = {"status": job.status, "progress": round(job.progress, 3)}
         if job.status == STATUS_READY:
             cached = store.get_map(job.video_id, job.difficulty)
             if cached is None:
-                # The map was purged between finishing and polling — a takedown
-                # landing mid-flight. Not an error we caused; say so plainly.
-                raise fail(404, "That video isn’t available for chord analysis.", CODE_VIDEO_BLOCKED)
+                # The map went away between finishing and polling. Which of the
+                # two reasons it was decides what the player is told, and
+                # answering `video_blocked` for both was actively misleading —
+                # the client renders that as "this video is banned", so a purge
+                # that was really an admin clearing a bad analysis accused the
+                # video.
+                if store.is_blocked(video_id=job.video_id):
+                    raise fail(403, "That video isn’t available for chord analysis.",
+                               CODE_VIDEO_BLOCKED)
+                raise fail(404, "That analysis is no longer available — ask for it again.",
+                           CODE_NOT_FOUND)
             body.update(_result(cached))
         elif job.error_message:
             body["message"] = job.error_message
@@ -645,9 +718,22 @@ def _install_routes(app: FastAPI) -> None:
     @app.get("/v1/maps/{video_id}")
     async def get_map(video_id: str, difficulty: str | None = None,
                       principal: Principal = Depends(_principal_polling)):
+        """A cached analysis by id — **only if this caller may read it.**
+
+        Uploaded audio is stored in the same table as fetched video, under a
+        content-hash id, and this route used to serve any of it to anyone who
+        asked for the right hash. An upload is somebody's private recording, so a
+        private row answers 404 — the same answer an id that does not exist gets,
+        because whether someone else's upload exists is not this caller's
+        business.
+
+        The way an upload's owner gets it back is `POST /v1/analyze/upload`, which
+        is idempotent and free on a cache hit: possession of the bytes is what
+        authorizes the read there.
+        """
         store: Store = app.state.store
         cached = store.get_map(video_id, _difficulty(difficulty))
-        if cached is None:
+        if cached is None or not _may_read(cached, principal):
             raise fail(404, "No analysis for that video yet.", CODE_NOT_FOUND)
         if store.is_blocked(video_id=video_id, channel_id=cached.channel_id):
             raise fail(403, "That video isn’t available for chord analysis.", CODE_VIDEO_BLOCKED)
@@ -771,6 +857,36 @@ def _install_routes(app: FastAPI) -> None:
         _admin(request)
         return {"entries": app.state.store.audit_entries(min(limit, 1000))}
 
+    @app.get("/v1/admin/worker")
+    async def admin_worker(request: Request):
+        """What the **worker** container built — the half `/healthz` cannot see.
+
+        `/healthz` describes the container answering it, and on the deployed
+        two-container shape that is the API image, which correctly has no engines
+        and no fetch (§4). `canAnalyze` comes from the runner and answers from the
+        deployment's *shape*, so the page reads `canAnalyze: true` beside
+        `engines: {}` — which looks self-contradictory and is really one page
+        describing two containers.
+
+        The real gap was that a worker image which built **without an engine** was
+        indistinguishable from a healthy one: the API comes up, healthz is green,
+        and every job dies one poll later in the chord stage — behind a fetch stage
+        whose bot check usually stops jobs before they get that far, so the symptom
+        is rare and misattributed.
+
+        Admin-gated and not folded into `/healthz` on purpose: this costs a worker
+        cold start, and a liveness probe that starts a container per check is a
+        different kind of problem. `503` when the runner has no worker to ask,
+        which is the local and single-container case.
+        """
+        _admin(request)
+        report = app.state.runner.worker_report()
+        if report is None:
+            raise fail(503, "This deployment runs analyses in-process — /healthz "
+                            "already describes the container that would run them.",
+                       CODE_FEATURE_DISABLED)
+        return report
+
     @app.get("/v1/admin/blocklist")
     async def admin_blocklist(request: Request):
         _admin(request)
@@ -792,29 +908,80 @@ def _video_id(body: AnalyzeRequest) -> str:
     return video_id
 
 
-async def _read_upload(file: UploadFile, settings: Settings) -> bytes:
-    """The uploaded audio, read with a hard ceiling.
+# How many upload bodies this container will hold at once.
+#
+# `@modal.concurrent(max_inputs=10)` lets ten requests share the API container, and
+# an upload may be 64 MB — so ten of them is 640 MB of a 4 GB cap held before
+# anything has been analyzed, and the old double-buffer below made it 1.28 GB. The
+# bytes have to be resident at the moment they are handed to the worker (a Modal
+# function argument is serialized, and there is no streaming form of it), so the
+# honest control is admission: hold at most three, and tell the fourth to come
+# back. A 503 with `Retry-After` is a far better answer than an OOM kill, which
+# takes the other nine requests with it.
+#
+# **Why not stream to a Volume and pass a key.** That is the shape this would want,
+# and §2.1 forbids it: the worker deliberately mounts no Volume, so audio has
+# nowhere durable to land, and giving the audio-handling container a durable write
+# surface is the specific thing §4's isolation exists to prevent. Bounding
+# concurrency keeps the invariant and costs a queue.
+MAX_CONCURRENT_UPLOADS = 3
+_upload_slots = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
+
+
+@asynccontextmanager
+async def _upload_slot():
+    """Admission for one upload body, or a clean 503.
+
+    Non-blocking rather than a queue: the client is holding a request open with a
+    64 MB body in it, and making it *wait* for a slot means the socket, the buffer
+    and the slot are all occupied by something that has not started yet. Refusing
+    immediately with `Retry-After` lets the client come back when there is room.
+    """
+    if _upload_slots.locked():
+        raise fail(503, "Too many uploads are being processed right now — try again shortly.",
+                   CODE_FEATURE_DISABLED, headers={"Retry-After": "15"})
+    await _upload_slots.acquire()
+    try:
+        yield
+    finally:
+        _upload_slots.release()
+
+
+async def _read_upload(file: UploadFile, settings: Settings) -> bytearray:
+    """The uploaded audio, read with a hard ceiling and **one** copy in memory.
 
     Read in chunks and abandoned the moment the cap is passed, rather than read
     whole and measured afterwards: `await file.read()` on an unbounded body is
     how a container with a memory cap dies instead of returning a 400. The cap is
     generous for a 10-minute song (§18) even lossless.
+
+    **One copy, and getting there took two goes.** The original accumulated chunks
+    in a list and finished with `b"".join(chunks)`, which allocates the whole
+    payload again while the list is still referenced — a peak of twice the upload,
+    128 MB per request at the cap, before the bytes had gone anywhere. Switching to
+    a `bytearray` fixes the list but not the peak, because `bytes(buffer)` is the
+    same second copy wearing a different name. Measured at 2.00× either way.
+
+    So the `bytearray` **is** the return value. Everything downstream takes a
+    bytes-like object rather than `bytes` specifically — `hashlib.sha256`,
+    `Path.write_bytes`, and the worker's serializer — and the type is annotated
+    honestly here instead of a copy being made to satisfy a signature nobody needed.
+    `tests/test_upload.py` measures the peak, which is the only reason this is known
+    to work rather than assumed to.
     """
     limit = MAX_UPLOAD_BYTES
-    chunks: list[bytes] = []
-    total = 0
+    buffer = bytearray()
     while True:
         chunk = await file.read(1024 * 1024)
         if not chunk:
             break
-        total += len(chunk)
-        if total > limit:
+        if len(buffer) + len(chunk) > limit:
             raise fail(413, f"That file is larger than {limit // (1024 * 1024)} MB.",
                        CODE_BAD_REQUEST)
-        chunks.append(chunk)
-    if total == 0:
+        buffer.extend(chunk)
+    if not buffer:
         raise fail(400, "That upload was empty.", CODE_BAD_REQUEST)
-    return b"".join(chunks)
+    return buffer
 
 
 def _difficulty(value: str | None) -> str:
@@ -823,6 +990,16 @@ def _difficulty(value: str | None) -> str:
     if value not in DIFFICULTIES:
         raise fail(400, f"Difficulty must be one of {', '.join(DIFFICULTIES)}.", CODE_BAD_REQUEST)
     return value
+
+
+def _may_read(cached, principal: Principal) -> bool:
+    """Whether this caller is entitled to a stored map.
+
+    Public maps — everything fetched from a video — are readable by anyone; the
+    catalog lists them and that is the point. A private map is an upload, and only
+    the player who uploaded it may read it by id.
+    """
+    return not cached.is_private or cached.owner_uid == principal.uid
 
 
 def _result(cached) -> dict:
@@ -838,34 +1015,34 @@ def _result(cached) -> dict:
     return {"song": cached.song, "videoSync": sync}
 
 
-def _catalog_row(cached) -> dict:
+def _catalog_row(entry) -> dict:
     """One catalog entry, in the shape the client's search decoder already reads.
 
-    Everything here is derived from the stored `CompositionPayload` rather than
-    from new columns: the payload is the song, and duplicating its chords or
-    tempo into `chord_maps` would be two sources of truth for one fact.
+    Reads a `store.CatalogEntry` — the five scalars off their own columns —
+    rather than decoding a whole `CompositionPayload` per row. The payload is
+    still the song and still the only thing `GET /v1/maps` serves; these columns
+    exist because this listing reads exactly these fields and nothing else (see
+    `store.list_catalog`).
 
-    The title falls back to the payload's own when the column is empty — older
-    rows predate `chord_maps.title`, and a catalog entry with no name is worse
-    than one named by the song it holds.
+    `embeddable` is reported `true` throughout, and that is now type-coherent as
+    well as convenient: uploads are excluded from the catalog, so every row here
+    really is a video a YouTube player can resolve.
     """
-    song = cached.song if isinstance(cached.song, dict) else {}
-    title = (cached.title or song.get("title") or "").strip()
     return {
-        "videoId": cached.video_id,
-        "title": title or "Untitled",
-        "channel": song.get("artist") or "",
-        "durationMs": cached.duration_ms or 0,
+        "videoId": entry.video_id,
+        "title": (entry.title or "").strip() or "Untitled",
+        "channel": entry.artist or "",
+        "durationMs": entry.duration_ms or 0,
         # The client keys its Library on this and it is how a catalog row is
         # recognized as "already analyzed" (`SongPlayability.ready`).
-        "songId": song.get("id"),
-        "chords": song.get("chordNames") or [],
-        "tempo": song.get("tempo"),
-        "tonic": song.get("tonic"),
-        "mode": song.get("mode"),
-        "difficulty": cached.difficulty,
-        "analyzedAt": cached.analyzed_at,
-        "lowConfidence": bool(cached.low_confidence),
+        "songId": entry.song_id,
+        "chords": entry.chord_names,
+        "tempo": entry.tempo,
+        "tonic": entry.tonic,
+        "mode": entry.mode,
+        "difficulty": entry.difficulty,
+        "analyzedAt": entry.analyzed_at,
+        "lowConfidence": bool(entry.low_confidence),
         "embeddable": True,
     }
 
@@ -886,14 +1063,21 @@ def _charge(app: FastAPI, principal: Principal) -> None:
     spending an analysis. Cache hits never reach here (§16.4)."""
     settings: Settings = app.state.settings
     store: Store = app.state.store
-    store.upsert_user(principal.uid, principal.display_name)
 
     if not principal.is_verified:
         # 403, not 429: a limit says "come back later", this says "do something
         # first", and the app renders a different state for each. Waiting will
         # never clear it — checking their inbox will.
+        #
+        # Checked **before** the user row is written. Anyone can mint an
+        # unverified password account through Firebase's public Auth REST API, and
+        # upserting first meant every one of them left a row behind on a request
+        # that was always going to be refused — an unbounded table any script
+        # could grow, populated entirely by accounts that may not spend anything.
+        # A verified caller still gets their row on the line below.
         raise fail(403, "Verify your email to analyze a video — check your inbox.",
                    CODE_EMAIL_UNVERIFIED)
+    store.upsert_user(principal.uid, principal.display_name)
 
     charged, _count = store.try_record_use(principal.uid, effective_quota(settings, principal))
     if not charged:

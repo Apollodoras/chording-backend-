@@ -298,11 +298,35 @@ api_secrets = [modal.Secret.from_name("chords-secrets")]
 worker_secrets = [modal.Secret.from_name("chords-worker-secrets")]
 
 
+# The worker's hard wall-clock ceiling, and it has to sit **outside** the job
+# deadline rather than inside it.
+#
+# It was 300 s against a job deadline of 180 s and stage ceilings summing to 405 s,
+# which is three numbers that cannot all be right. The consequence was specific and
+# nasty: a slow-but-successful fetch was SIGKILLed by Modal at 300 s, and a
+# SIGKILLed container writes no terminal status — so the job sat in `analyzing`
+# until the store's 900 s lease reaper found it. Fifteen minutes of spinner for an
+# analysis that had been working.
+#
+# The ordering that makes the failure legible instead:
+#
+#     stage ceilings + DSP reserve  ≤  CHORDS_JOB_DEADLINE_S (450, config.py)
+#                                   <  WORKER_TIMEOUT_S (600, here)
+#                                   <  Store._JOB_LEASE_S (900, store.py)
+#
+# The deadline fires first and writes a terminal status, a message and a refund.
+# This is the backstop for the one thing the deadline cannot see — a hang inside
+# pure compute, which no in-process check can interrupt — and the lease is the
+# backstop for this. `tests/test_deployment.py` asserts the chain rather than
+# trusting the comment.
+WORKER_TIMEOUT_S = 600
+
+
 @app.function(
     image=worker_image,
     secrets=worker_secrets,
     # NO volumes. This is the isolation, not an omission — see the docstring.
-    timeout=300,
+    timeout=WORKER_TIMEOUT_S,
     memory=4096,
     # A DSP job is CPU-bound and holds a decoded track in memory; one at a time
     # per container keeps the memory cap meaningful.
@@ -344,10 +368,17 @@ def analysis_worker(job_id: str, video_id: str, difficulty: str, uid: str,
     from app.analysis.fetch import build_source
     from app.analysis.file_source import FileSource
     from app.analysis.scratch import assert_clean
-    from app.store import build_store
+    from app.store import ROLE_WORKER, build_store
 
     settings = load_settings()
-    store = build_store(settings)
+    # `ROLE_WORKER` is load-bearing: it makes `build_store` refuse SQLite here.
+    # This container mounts no Volume and `db_path` is relative, so a SQLite store
+    # would be a fresh file on a disk that dies with the call — every status
+    # transition and the finished map written where the API can never read them,
+    # and every job stuck at `queued` until the lease reaper failed it. Both
+    # containers would report a green `/healthz` throughout, because individually
+    # each one is fine. See `build_store` for the remedy it names.
+    store = build_store(settings, role=ROLE_WORKER)
     source = (FileSource(audio, filename=filename, settings=settings)
               if audio is not None else build_source(settings))
 
@@ -377,6 +408,54 @@ def analysis_worker(job_id: str, video_id: str, difficulty: str, uid: str,
         # it, so this is belt-and-braces — but it is how you find out that the
         # cleanup path stopped working, rather than assuming it still does.
         assert_clean(settings.scratch_root)
+
+
+@app.function(
+    image=worker_image,
+    secrets=worker_secrets,
+    timeout=60,
+    # One container is plenty for a diagnostic, and capping it means an operator
+    # refreshing a dashboard cannot fan this out across the worker pool.
+    max_containers=1,
+)
+def worker_health() -> dict:
+    """What the **worker** image actually built. The gap `/healthz` cannot see.
+
+    `/healthz` reports the container answering it, which on the API image is
+    correctly "no fetch, no engines" (§4) — and `canAnalyze` comes from the runner,
+    which on Modal answers `True` on the strength of the deployment's shape rather
+    than of the worker's contents. So the health endpoint reads
+    `canAnalyze: true, engines: {}, enginesReady: false`, which looks like a
+    contradiction and is really two containers being described by one page. What it
+    genuinely could not do is notice a **worker image that built without an
+    engine**: the API comes up fine, healthz stays green, and every job fails one
+    poll later in the chord stage.
+
+    Deliberately *not* wired into `/healthz`. Calling this from a liveness probe
+    would cold-start a worker container on every check — seconds of latency and a
+    container pulled for a question nobody asked. It is exposed at
+    `GET /v1/admin/worker`, admin-gated, for when an operator wants the answer.
+    """
+    from app.analysis import engines
+    from app.analysis.fetch import build_source
+    from app.config import load_settings
+
+    settings = load_settings()
+    source = build_source(settings)
+    return {
+        "engines": engines.available(),
+        "enginesReady": engines.is_ready(settings),
+        "chordEngine": settings.chord_engine,
+        "beatTracker": settings.beat_tracker,
+        "fetch": "configured" if source is not None else "unconfigured",
+        "egress": getattr(source, "egress", None),
+        # Whether this container could reach the shared store at all — the failure
+        # `build_store(role=ROLE_WORKER)` refuses, seen from outside.
+        "store": "postgres" if settings.database_url else "MISCONFIGURED (no DSN)",
+        "jobDeadlineS": settings.job_deadline_s,
+        "stageBudgetS": settings.stage_budget_s,
+        "workerTimeoutS": WORKER_TIMEOUT_S,
+    }
 
 
 @app.function(
@@ -421,6 +500,16 @@ def fastapi_app():
             ffmpeg and the engines, and this container's job is to delegate, not
             to decode."""
             return True
+
+        def worker_report(self) -> dict:
+            """Ask the worker image what it built. See `worker_health`.
+
+            This is the channel `/healthz` never had — the reason it could report
+            `canAnalyze: true` beside an empty engine registry and be unable to
+            tell a healthy deployment from one whose worker image is broken. It
+            costs a container start, so it is only reachable from the admin route.
+            """
+            return worker_health.remote()
 
     settings = load_settings()
     store = build_store(settings)

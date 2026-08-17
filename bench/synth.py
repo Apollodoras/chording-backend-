@@ -70,6 +70,23 @@ class Spec:
     pattern: tuple[float, ...] = DDUUDU
     octave_root: int = 52                   # E3-ish — where a guitar actually sits
     noise: float = 0.0                      # 0…1, adds broadband hiss
+    # Bars where the player does something else, as (every-nth-bar, pattern). The
+    # audit's open question about §14: `SUPPORT_THRESHOLD` is a share of the
+    # *whole* repeat group, so a stroke a human plays in some bars and not others
+    # can fall under it and vanish — and the syncopated strokes are exactly the
+    # ones a human varies. Whether that leaves the groove or the metronome behind
+    # it is a measurement, and this is what makes it one. The truth stays the
+    # dominant pattern: one groove per repeat group is §14's design, and a
+    # turnaround is variation on the section's pattern rather than a second one.
+    vary: tuple[int, tuple[float, ...]] | None = None
+    # 0…1, adds a drum kit at this level relative to the guitar. **The one thing
+    # broadband hiss cannot stand in for.** Hiss raises the noise floor evenly, so
+    # an onset detector still sees the guitar's attacks as the only peaks; a kit
+    # puts *competing attacks on the grid*, most of them louder than the strum and
+    # most of them on cells the player never struck. That is what a full mix
+    # actually does to §14, and until this existed the strumming extractor was
+    # only ever measured on a guitar alone (see `run_bench.bench_strum`).
+    kit: float = 0.0
 
 
 @dataclass
@@ -130,7 +147,10 @@ def render(spec: Spec) -> tuple[list[float], Truth]:
             "endMs": int((bar_start_beat + spec.bar_beats) * seconds_per_beat * 1000),
             "name": chord_name,
         })
-        for offset in spec.pattern:
+        played = spec.pattern
+        if spec.vary and bar_index % spec.vary[0] == spec.vary[0] - 1:
+            played = spec.vary[1]
+        for offset in played:
             beat = bar_start_beat + offset
             start_ms = int(beat * seconds_per_beat * 1000)
             truth.onsets_ms.append(start_ms)
@@ -140,6 +160,8 @@ def render(spec: Spec) -> tuple[list[float], Truth]:
             _pluck(buffer, notes, start_ms, seconds_per_beat, upstroke=upstroke)
 
     _normalize(buffer)
+    if spec.kit > 0:
+        _add_kit(buffer, spec, seconds_per_beat, total_beats)
     if spec.noise > 0:
         _add_noise(buffer, spec.noise)
     return buffer, truth
@@ -175,6 +197,85 @@ def _tone(buffer: list[float], hz: float, start: int, decay_s: float, gain: floa
                 break
             sample += weight * math.sin(two_pi_f * harmonic * n)
         buffer[start + n] += gain * envelope * sample * 0.08
+
+
+def _add_kit(buffer: list[float], spec: Spec, seconds_per_beat: float,
+             total_beats: int) -> None:
+    """A rock kit over the strum: kick on 1 and 3, snare on 2 and 4, hats on
+    every eighth.
+
+    Deliberately **not** aligned to the guitar's pattern. That is the whole
+    point: the hats occupy every eighth-note cell whether the player struck it or
+    not, and the snare lands on the backbeat harder than any strum. An onset
+    detector reading the full mix therefore sees a wall of evenly-spaced attacks
+    with the guitar somewhere underneath, which is exactly why §14's extraction
+    collapses real grooves into straight eighths and why the detector moved onto
+    the harmonic component.
+
+    Synthesized rather than sampled so the file stays dependency-free and
+    deterministic, and shaped only enough to be spectrally honest: the kick is
+    a fast downward pitch sweep with all its energy low, the snare and hats are
+    filtered noise bursts with none of theirs low. Nothing here is a drum
+    machine — it is the *spectral* fact the separation depends on.
+    """
+    beats_per_bar = spec.bar_beats
+    for beat in range(total_beats):
+        in_bar = beat % beats_per_bar
+        at_ms = beat * seconds_per_beat * 1000
+        if in_bar % 2 == 0:
+            _kick(buffer, at_ms, spec.kit * 0.9)
+        else:
+            _snare(buffer, at_ms, spec.kit * 1.0)
+        _hat(buffer, at_ms, spec.kit * 0.35)
+        _hat(buffer, at_ms + seconds_per_beat * 500, spec.kit * 0.30)
+
+
+def _kick(buffer: list[float], at_ms: float, gain: float) -> None:
+    """A sine sweeping 110 Hz → 45 Hz over 90 ms. All of its energy is below the
+    guitar's fundamentals, so HPSS keeps almost none of it."""
+    start = int(at_ms / 1000.0 * SAMPLE_RATE)
+    length = int(0.09 * SAMPLE_RATE)
+    phase = 0.0
+    for n in range(length):
+        if start + n >= len(buffer):
+            return
+        fraction = n / length
+        hz = 110.0 * math.exp(-2.2 * fraction)
+        phase += 2.0 * math.pi * hz / SAMPLE_RATE
+        buffer[start + n] += gain * math.exp(-5.0 * fraction) * math.sin(phase) * 0.5
+
+
+def _snare(buffer: list[float], at_ms: float, gain: float) -> None:
+    """Noise plus a 190 Hz body, 120 ms. Broadband, which is what makes it the
+    loudest thing in a full-mix onset envelope and the hardest to tell from a
+    strum by amplitude alone."""
+    start = int(at_ms / 1000.0 * SAMPLE_RATE)
+    length = int(0.12 * SAMPLE_RATE)
+    state = 0x13579BDF ^ start
+    for n in range(length):
+        if start + n >= len(buffer):
+            return
+        state = (1103515245 * state + 12345) & 0x7FFFFFFF
+        hiss = (state / 0x3FFFFFFF) - 1.0
+        envelope = math.exp(-14.0 * n / length)
+        body = math.sin(2.0 * math.pi * 190.0 * n / SAMPLE_RATE)
+        buffer[start + n] += gain * envelope * (hiss * 0.6 + body * 0.25) * 0.5
+
+
+def _hat(buffer: list[float], at_ms: float, gain: float) -> None:
+    """A very short bright noise burst — high-passed by construction, since the
+    sample-to-sample difference of white noise is itself a high-pass."""
+    start = int(at_ms / 1000.0 * SAMPLE_RATE)
+    length = int(0.035 * SAMPLE_RATE)
+    state = 0x2468ACE1 ^ start
+    previous = 0.0
+    for n in range(length):
+        if start + n >= len(buffer):
+            return
+        state = (1103515245 * state + 12345) & 0x7FFFFFFF
+        hiss = (state / 0x3FFFFFFF) - 1.0
+        bright, previous = hiss - previous, hiss
+        buffer[start + n] += gain * math.exp(-30.0 * n / length) * bright * 0.5
 
 
 def _normalize(buffer: list[float]) -> None:
@@ -226,6 +327,34 @@ SPECS = [
     # The same song under noise — a crude stand-in for a dense mix, and the one
     # place this set gestures at what only real tracks can answer.
     Spec(name="folk-g-d-em-c-noisy", chords=["G", "D", "Em", "C"], noise=0.6),
+    # The same song again with a **drum kit** over it, which is the case §14 is
+    # actually reported for: the strum is D-DU-UD-U and the kit fills every
+    # eighth, so a detector reading the full mix has to tell the six strokes the
+    # player struck from the eight the hats did. Two levels, because the answer
+    # is not binary — a kit under the guitar and a kit over it are different
+    # problems, and the second is what a produced record sounds like.
+    Spec(name="folk-kit-light", chords=["G", "D", "Em", "C"], kit=0.35),
+    Spec(name="folk-kit-loud", chords=["G", "D", "Em", "C"], kit=0.75),
+    # A groove with a *hole* in it — nothing on beat 3 — under a kit that plays
+    # straight through it. The single sharpest test of whether the extraction is
+    # reading the guitar or the drummer, because the kit's evidence for beat 3 is
+    # as strong as its evidence for every other cell and the guitar's is zero.
+    Spec(name="folk-kit-syncopated", chords=["G", "D", "Em", "C"], kit=0.6,
+         pattern=(0.0, 1.0, 1.5, 2.5, 3.5)),
+    # A player rather than a machine: the campfire strum, with a busier
+    # turnaround every fourth bar. The extra strokes are played in a quarter of
+    # the bars — well under `SUPPORT_THRESHOLD` — so the section's groove should
+    # come back as D-DU-UD-U and the turnaround should not contaminate it.
+    Spec(name="folk-kit-turnaround", chords=["G", "D", "Em", "C"], kit=0.5,
+         vary=(4, (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5))),
+    # And the case the audit actually worried about: the syncopation itself is
+    # inconsistent. The "&" of 2 is played in half the bars and the "&" of 4 in
+    # the other half, so *each* sits right at the threshold while the groove is
+    # unmistakably syncopated. If averaging is going to leave the metronome
+    # behind instead of the groove, it will do it here.
+    Spec(name="folk-kit-human", chords=["G", "D", "Em", "C"], kit=0.5,
+         pattern=(0.0, 1.0, 1.5, 2.5, 3.0),
+         vary=(2, (0.0, 1.0, 2.5, 3.0, 3.5))),
 ]
 
 

@@ -34,6 +34,8 @@ back down happens at the wire and is written out in `keyfinder.project`.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 from ..chords import (
     AUGMENTED,
     DIMINISHED,
@@ -151,6 +153,35 @@ def distance(a: tuple[int, str], b: tuple[int, str]) -> float:
     return 1.0 - similarity(a, b)
 
 
+# A quality → the triad underneath it. **Colour dropped, identity kept**: the
+# seventh and the suspension go, the major/minor/diminished/augmented distinction
+# stays. This is not `chords.simplify` and must not be confused with it —
+# `_EASY` folds a diminished chord onto a minor triad because a beginner has to
+# play *something*, which is a statement about the player. This is a statement
+# about the recognizer: a seventh is the note BTC is least sure it heard, and a
+# suspension is the third it could not find, so two readings that differ only
+# there are two readings of one chord.
+#
+# The suspensions fold to major, which is the one arbitrary choice here — a
+# sus chord has no third to read. It is the right arbitrary choice because the
+# alternative (a token of their own) makes every `Csus4` heard in a song that
+# plays `C` break the repeat it lands in, and that is the defect this exists to
+# fix. Being wrong about a sus in a minor song costs one bar of a similarity
+# score; being wrong about the form costs the whole chart.
+_TRIAD: dict[str, str] = {
+    MAJOR: MAJOR, MAJOR7: MAJOR, DOMINANT7: MAJOR, SUS2: MAJOR, SUS4: MAJOR,
+    MINOR: MINOR, MINOR7: MINOR,
+    DIMINISHED: DIMINISHED, DIMINISHED7: DIMINISHED, HALF_DIM7: DIMINISHED,
+    AUGMENTED: AUGMENTED,
+}
+
+
+def triad(quality: str) -> str:
+    """The triad a quality is built on. Unknown qualities are left alone, which
+    keeps this total without inventing an answer for something it cannot read."""
+    return _TRIAD.get(quality, quality)
+
+
 def is_near_miss(a: tuple[int, str], b: tuple[int, str]) -> bool:
     """Whether a disagreement between these two is plausibly the engine's.
 
@@ -161,8 +192,17 @@ def is_near_miss(a: tuple[int, str], b: tuple[int, str]) -> bool:
     return similarity(a, b) >= NEAR_MISS
 
 
+@lru_cache(maxsize=None)
 def scale_pcs(tonic_pc: int, mode: str) -> frozenset[int]:
-    """The mode's pitch classes, rooted at `tonic_pc`."""
+    """The mode's pitch classes, rooted at `tonic_pc`.
+
+    Cached, and unbounded on purpose: the domain is 12 tonics × 7 modes = 84
+    frozensets of at most 8 small ints, so the whole table is a rounding error in
+    memory and is fully populated after one song. Uncached it rebuilt a set from a
+    tuple on every call — and `diatonic_fit` calls it once per candidate chord
+    inside both the consensus vote and the vocabulary consolidation, which are the
+    hottest loops in the theory layer.
+    """
     degrees = SCALES.get(mode, IONIAN)
     pcs = set((tonic_pc + d) % 12 for d in degrees)
     if mode == "aeolian":

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import statistics
+import threading
 
 from ..downbeats import modal_bar_beats
 from ..types import PCM, BeatGrid
@@ -37,15 +38,24 @@ class BeatThisTracker:
 
     def __init__(self) -> None:
         self._tracker = None
+        # The instance is now shared for the life of the process
+        # (`engines._cached`), so two jobs can reach `_load` at once. Without the
+        # lock they both build the model — which is the cost the cache exists to
+        # remove, paid twice, at the worst possible moment.
+        self._load_lock = threading.Lock()
 
     def _load(self):
-        if self._tracker is None:
-            from beat_this.inference import Audio2Beats
+        if self._tracker is not None:
+            return self._tracker
+        with self._load_lock:
+            if self._tracker is None:
+                from beat_this.inference import Audio2Beats
 
-            # CPU: this deployment has no GPU by default, and the model is small
-            # enough that a GPU would mostly buy cold-start latency (§18).
-            self._tracker = Audio2Beats(checkpoint_path=_CHECKPOINT, device="cpu",
-                                        dbn=False)
+                # CPU: this deployment has no GPU by default, and the model is
+                # small enough that a GPU would mostly buy cold-start latency
+                # (§18).
+                self._tracker = Audio2Beats(checkpoint_path=_CHECKPOINT, device="cpu",
+                                            dbn=False)
         return self._tracker
 
     def track(self, pcm: PCM, sr: int) -> BeatGrid:

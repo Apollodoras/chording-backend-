@@ -448,3 +448,203 @@ def test_the_deploy_says_out_loud_which_container_shape_it_chose():
 
     source = (Path(__file__).resolve().parents[1] / "modal_app.py").read_text()
     assert "print(" in source and "PINNED TO 1" in source
+
+
+# --- the time budget --------------------------------------------------------
+#
+# Four numbers in three files describe one job's wall clock, and they used to
+# contradict each other in every direction. Each was defensible alone; the set was
+# not, and the failure it produced was the worst-shaped one available — a
+# *successful but slow* fetch SIGKILLed with no terminal status written, leaving the
+# player watching a spinner until the 900 s lease reaper noticed.
+
+def _modal_constant(name: str):
+    """One module-level `NAME = <literal>` out of `modal_app.py`.
+
+    Read rather than imported for the reason the whole module gives: `modal` is not
+    a dependency of this package.
+    """
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "modal_app.py").read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return node.value.value
+    raise AssertionError(f"modal_app.py no longer defines {name}")
+
+
+def test_the_stage_ceilings_fit_inside_the_job_deadline():
+    """The deadline has to be the thing that fires, not the container timeout.
+
+    `probe + fetch + decode + DSP reserve` must fit, because only the deadline can
+    write a terminal status, a message the player can read, and a refund. If the
+    stages can outlast it, the job is still running when something outside kills it
+    — and a SIGKILLed container writes nothing at all.
+
+    This was 45 + 240 + 120 = 405 s of subprocess budget against a 180 s deadline.
+    """
+    from app.config import Settings
+
+    settings = Settings()
+    assert settings.stage_budget_s <= settings.job_deadline_s, (
+        f"the stages may spend {settings.stage_budget_s}s but the job is killed at "
+        f"{settings.job_deadline_s}s — a slow stage would outlive the only check that "
+        f"can answer the player"
+    )
+
+
+def test_the_worker_timeout_sits_outside_the_job_deadline():
+    """And the lease sits outside that. Read outward, each layer is the backstop
+    for the one inside it:
+
+        stages ≤ job deadline < container timeout < job lease
+
+    The container timeout was 300 s against a 405 s stage budget, so Modal killed
+    workers that were working. The lease has to be larger again because a container
+    killed at its timeout writes nothing, and the reaper is the only thing left.
+    """
+    from app.config import Settings
+    from app.store import Store
+
+    settings = Settings()
+    worker_timeout = _modal_constant("WORKER_TIMEOUT_S")
+
+    assert settings.job_deadline_s < worker_timeout, (
+        f"the worker is killed at {worker_timeout}s but its own deadline is "
+        f"{settings.job_deadline_s}s — the kill wins, and a kill writes no status"
+    )
+    assert worker_timeout < Store._JOB_LEASE_S, (
+        f"the lease ({Store._JOB_LEASE_S}s) must outlast the container timeout "
+        f"({worker_timeout}s), or the reaper collects jobs that are still running"
+    )
+
+
+def test_a_timed_out_job_is_refunded():
+    """The deadline is ours to size; the video did nothing wrong.
+
+    It used to raise a bare `AnalysisError`, whose code is `analysis_failed` — a
+    code deliberately *outside* `REFUNDABLE_CODES` because it means the analysis
+    genuinely ran and genuinely failed. So a player whose job we killed for taking
+    too long paid a daily analysis for our capacity planning.
+    """
+    from app.errors import AnalysisTimeout
+    from app.jobs import REFUNDABLE_CODES
+
+    assert AnalysisTimeout().code in REFUNDABLE_CODES
+
+
+# --- the worker cannot use SQLite -------------------------------------------
+
+def test_a_remote_worker_refuses_a_sqlite_store():
+    """The two-container shape only works on Postgres, and nothing enforced it.
+
+    The worker calls `build_store` in *its own container*. `db_path` is relative and
+    the `chords-data` Volume is mounted on the API function only, so SQLite there
+    means a brand-new database file on a disk that dies with the call: `analyzing`,
+    `ready`, and the finished map all written where nothing will ever read them.
+    From the API's side every job sits at `queued` until the lease reaper fails it —
+    a total outage of the feature, behind a `/healthz` that is green in *both*
+    containers, because individually each one is fine.
+
+    The `MAX_CONTAINERS = 1` pin does not cover this: the worker is a separate
+    container whether or not the API is pinned.
+    """
+    from app.config import Settings
+    from app.store import ROLE_WORKER, StoreUnusable, build_store
+
+    with pytest.raises(StoreUnusable) as raised:
+        build_store(Settings(db_path="chords.sqlite3"), role=ROLE_WORKER)
+    # The message has to name the remedy: this surfaces in a worker's log, and the
+    # operator reading it is the only audience it will ever have.
+    assert "CHORDS_DATABASE_URL" in str(raised.value)
+
+
+def test_the_api_container_still_gets_sqlite(tmp_path):
+    """The refusal is about the worker, not about SQLite. Local dev, CI and a
+    single-container deployment are all legitimate and all use it."""
+    from app.config import Settings
+    from app.store import SQLiteStore, build_store
+
+    store = build_store(Settings(db_path=str(tmp_path / "t.sqlite3")))
+    assert isinstance(store, SQLiteStore)
+    store.close()
+
+
+def test_the_worker_function_asks_for_the_worker_role():
+    """The guard above is only worth having if the worker actually passes the flag.
+
+    Read out of the source, like the other `modal_app.py` assertions: an
+    `analysis_worker` that called plain `build_store()` would be exactly as broken
+    as before, and the guard would sit there looking like protection.
+    """
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "modal_app.py").read_text()
+    worker = source.split("def analysis_worker(", 1)[1].split("\ndef ", 1)[0]
+    assert "role=ROLE_WORKER" in worker, (
+        "analysis_worker must build its store with role=ROLE_WORKER, or the SQLite "
+        "guard never runs in the one place it exists for"
+    )
+
+
+def test_a_materialized_cookie_file_is_removed(monkeypatch):
+    """It is a credential, and it was never unlinked.
+
+    A Modal container's filesystem dies with it, so this is belt-and-braces there —
+    but this source also runs under `ThreadJobRunner` in a long-lived local process
+    and in the bench harness, and a 0600 file full of session cookies that outlives
+    the run that needed it is a credential left lying around.
+    """
+    import os
+
+    from app.analysis import ytdlp_source
+
+    monkeypatch.setenv("CHORDS_YTDLP_COOKIES_CONTENT", "# Netscape HTTP Cookie File\n")
+    monkeypatch.delenv("CHORDS_YTDLP_COOKIES", raising=False)
+
+    source = ytdlp_source.YtDlpSource()
+    path = source._cookie_file()
+    assert path and os.path.isfile(path)
+
+    source._discard_cookie_file()
+    assert not os.path.exists(path)
+    # Idempotent: the atexit hook fires even after an explicit discard.
+    source._discard_cookie_file()
+
+
+def test_the_cookie_file_cleanup_is_registered_at_exit(monkeypatch):
+    """A process that never calls `_discard_cookie_file` explicitly — which is every
+    process — still has to lose the file."""
+    import atexit
+
+    from app.analysis import ytdlp_source
+
+    registered = []
+    monkeypatch.setattr(atexit, "register", lambda fn, *a, **k: registered.append(fn) or fn)
+    monkeypatch.setenv("CHORDS_YTDLP_COOKIES_CONTENT", "# Netscape HTTP Cookie File\n")
+    monkeypatch.delenv("CHORDS_YTDLP_COOKIES", raising=False)
+
+    source = ytdlp_source.YtDlpSource()
+    try:
+        source._cookie_file()
+        assert source._discard_cookie_file in registered
+    finally:
+        source._discard_cookie_file()
+
+
+def test_a_cookies_path_given_by_the_operator_is_never_unlinked(monkeypatch, tmp_path):
+    """We materialized it, we remove it. A path the operator supplied is theirs."""
+    from app.analysis import ytdlp_source
+
+    given = tmp_path / "cookies.txt"
+    given.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setenv("CHORDS_YTDLP_COOKIES", str(given))
+    monkeypatch.delenv("CHORDS_YTDLP_COOKIES_CONTENT", raising=False)
+
+    source = ytdlp_source.YtDlpSource()
+    assert source._cookie_file() == str(given)
+    source._discard_cookie_file()
+    assert given.is_file()

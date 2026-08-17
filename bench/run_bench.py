@@ -61,6 +61,7 @@ from app.analysis.downbeats import modal_bar_beats  # noqa: E402
 from app.analysis.downbeats import repair as repair_downbeats  # noqa: E402
 from app.analysis.meter import reconcile  # noqa: E402
 from app.analysis.pipeline import assemble  # noqa: E402
+from app.analysis.strumming import extract, fold_onsets  # noqa: E402
 from app.analysis.types import BeatGrid, EngineInfo, RawChordSpan, VideoMeta  # noqa: E402
 from app.chords import (  # noqa: E402
     HARD,
@@ -588,6 +589,101 @@ def _verdict(label: str, off: float, on: float, rewritten: int) -> str:
 # measured two further ways, and both are here rather than in a notebook because a
 # rule whose justification cannot be re-run is a rule nobody can revisit.
 
+def bench_strum(cases: list[Case]) -> None:
+    """§14 — the strumming pattern, scored against the strum that was played.
+
+    The one part of the pipeline that had ground truth recorded (`synth.Truth`
+    carries `pattern_beats`) and **nothing scoring against it**. Every other
+    stage here is measured; the grooves were judged by reading them, which is how
+    a real regression — grooves collapsing into straight eighths on any track
+    with drums on it — sat in the tree behind a green suite.
+
+    Three columns, because a pattern can be wrong in two directions and one
+    number hides which:
+
+    - `F` — F-measure of the extracted stroke positions against the played ones.
+      The headline, and the only column that is not gameable on its own.
+    - `extra` — strokes emitted that nobody played, as a share of those played.
+      This is the reported defect's own number: a groove that collapses into
+      eighths scores high here while `F` stays deceptively respectable, because
+      the strokes the player *did* strike are all still in there.
+    - `miss` — the opposite failure, and the one an over-eager fix causes. A rule
+      that suppresses the drummer by suppressing everything drives `extra` to
+      zero and `miss` through the roof, and it has not bought anything.
+
+    Synthetic only, deliberately. The real corpus has Isophonics *chord*
+    annotations and no strum transcription, so there is nothing on those tracks
+    to score against — and inventing one by ear is exactly the impressionism this
+    is replacing. What the kit specimens can answer is the question the change
+    turns on: whether the extractor is reading the guitar or the drummer.
+    """
+    scored = [c for c in cases if not c.is_real and c.truth.get("pattern_beats")]
+    if not scored:
+        print("STRUMMING — no synthetic specimens with a pattern to score against.\n")
+        return
+
+    print("STRUMMING  (§14 — extracted strokes vs the strum that was played)")
+    print(f"{'track':<24}{'played':>8}{'got':>6}{'F':>7}{'extra':>7}{'miss':>7}"
+          f"{'conf':>7}  pattern")
+
+    totals: list[tuple[float, float, float]] = []
+    detector = engines.build_onset_detector(Settings())
+    if detector is None:
+        print("  ! no onset detector registered — install the `audio` extra\n")
+        return
+
+    for case in scored:
+        truth = case.truth
+        played = [round(float(b), 3) for b in truth["pattern_beats"]]
+        bar_beats = float(truth["time_signature"].split("/")[0])
+        grid = grid_from(truth)
+        axis = build_axis(grid)
+        if axis is None:
+            continue
+        onsets = detector.detect(case.pcm, case.sample_rate)
+        folded = fold_onsets(onsets, axis, bar_beats=bar_beats, first_beat=0.0,
+                             last_beat=float(len(truth["beats_ms"]) - 1))
+        got = extract(folded, bar_beats=bar_beats,
+                      bars=max(1, len(truth["downbeats_ms"]) - 1),
+                      tempo=int(round(truth["tempo"])), name="bench",
+                      time_signature=truth["time_signature"])
+        positions = [round(s.beat, 3) for s in got.pattern.strokes]
+
+        hits = _matched(positions, played)
+        precision = hits / len(positions) if positions else 0.0
+        recall = hits / len(played) if played else 0.0
+        f = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+        extra = (len(positions) - hits) / len(played) if played else 0.0
+        missed = (len(played) - hits) / len(played) if played else 0.0
+        totals.append((f, extra, missed))
+
+        shown = " ".join(f"{p:g}" for p in positions) or "—"
+        print(f"{case.name:<24}{len(played):>8}{len(positions):>6}{f:>7.3f}"
+              f"{extra:>7.2f}{missed:>7.2f}{got.confidence:>7.2f}  {shown}"
+              + ("  [fallback]" if got.is_fallback else ""))
+
+    if totals:
+        print(f"{'MEAN':<24}{'':>8}{'':>6}"
+              f"{statistics.mean(f for f, _, _ in totals):>7.3f}"
+              f"{statistics.mean(e for _, e, _ in totals):>7.2f}"
+              f"{statistics.mean(m for _, _, m in totals):>7.2f}")
+    print()
+
+
+def _matched(got: list[float], played: list[float], tolerance: float = 0.06) -> int:
+    """How many extracted strokes land on a stroke that was played. Greedy and
+    one-for-one, so emitting a cluster of strokes around one real one counts
+    once — otherwise a denser answer would score better for being denser."""
+    remaining = list(played)
+    hits = 0
+    for position in got:
+        match = next((p for p in remaining if abs(p - position) <= tolerance), None)
+        if match is not None:
+            remaining.remove(match)
+            hits += 1
+    return hits
+
+
 def bench_calibration(cases: list[Case]) -> None:
     """Given what the engine says, what does the record actually play?
 
@@ -927,6 +1023,13 @@ def main() -> int:
         # §20.8's measurement: injected mistakes, so the population is big enough
         # to resolve. Needs no engines either — the noise model *is* the engine.
         bench_noise(cases)
+        return 0
+
+    if "--strum" in sys.argv:
+        # §14 on its own: the extraction against the strum that was played.
+        # Needs the onset detector but neither the chord engine nor the tracker,
+        # since the grid comes from the ground truth.
+        bench_strum(cases)
         return 0
 
     if "--calibration" in sys.argv:

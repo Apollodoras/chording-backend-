@@ -20,6 +20,7 @@ import pytest
 from app.analysis import model as song_model
 from app.analysis.types import BeatGrid, EnergyCurve, RawChordSpan
 from app.chords import DIFFICULTIES, EASY, HARD
+from app.chords import render as render_name
 from app.errors import AnalysisError
 
 BEAT_MS = 500
@@ -301,10 +302,11 @@ def test_a_render_replays_the_vote_with_the_key_the_vote_used(monkeypatch):
     votes: list[tuple[int, str]] = []
     real_apply = song_model.consensus.apply
 
-    def spy_apply(bars, groups, *, bar_beats, tonic_pc=0, mode="ionian", record=True):
+    def spy_apply(bars, groups, *, bar_beats, tonic_pc=0, mode="ionian", record=True,
+                  weigh=True):
         votes.append((tonic_pc, mode))
         return real_apply(bars, groups, bar_beats=bar_beats, tonic_pc=tonic_pc,
-                          mode=mode, record=record)
+                          mode=mode, record=record, weigh=weigh)
 
     real_detect = song_model.detect_key
     readings: list[int] = []
@@ -564,3 +566,46 @@ def test_grooves_that_are_genuinely_different_are_not_merged():
 
     merged = _consolidate({"A": quarters, "B": offbeats}, {"A": 32, "B": 32})
     assert merged["B"].pattern.id == offbeats.pattern.id
+
+
+# --- the reported defect, end to end -----------------------------------------
+
+def test_a_four_chord_song_heard_with_variants_charts_as_four_chords():
+    """The complaint §20.9 and `form.folded` were built for, through the whole
+    model rather than a unit at a time.
+
+    `Em G D C`, a four-bar loop played eight times, fed in the way BTC actually
+    hears such a thing: the Em as `Em7` in half the passes and once as a bare
+    `E`, one `G` as `G7`, one `C` as `Csus4` — every variant hedged, which is the
+    engine telling us it could not hear the note it added.
+
+    Two failures used to come out of this, and they are one wobble wearing two
+    hats: the chart carried six or seven distinct chords instead of four, and the
+    eight passes collapsed into a *four*-fold repeat of an eight-bar section
+    because a lag of 8 explained the alternating seventh better than a lag of 4.
+    """
+    heard = [
+        [("E:min", .78), ("G", .80), ("D", .82), ("C", .84)],
+        [("E:min7", .62), ("G", .80), ("D", .82), ("C", .84)],
+        [("E:min", .74), ("G:7", .61), ("D", .82), ("C", .84)],
+        [("E:min7", .66), ("G", .80), ("D", .82), ("C", .84)],
+        [("E", .58), ("G", .80), ("D", .82), ("C:sus4", .55)],
+        [("E:min7", .64), ("G:7", .59), ("D", .82), ("C", .84)],
+        [("E:min", .76), ("G", .80), ("D", .82), ("C", .84)],
+        [("E:min7", .63), ("G", .80), ("D", .82), ("C", .84)],
+    ]
+    raw = [RawChordSpan(start_ms=i * BAR_MS, end_ms=(i + 1) * BAR_MS,
+                        label=label, confidence=confidence)
+           for i, (label, confidence) in enumerate(x for row in heard for x in row)]
+
+    model = song_model.build(grid=_grid(bars=32), raw=raw, onsets=[])
+    assert model is not None
+
+    for difficulty in DIFFICULTIES:
+        sections = song_model.render(model, raw, difficulty)
+        names = {render_name(c.root_pc, c.quality)
+                 for s in sections for b in s.bars for c in b}
+        assert names == {"Em", "G", "D", "C"}, f"{difficulty} tier carried {sorted(names)}"
+
+    assert [s.repeats for s in model.sections] == [8], "the eight passes collapsed"
+    assert model.total_bars == 32

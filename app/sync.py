@@ -130,6 +130,13 @@ class TheoryReport(BaseModel):
     groups: int = 0
     rewrittenBars: int = 0
     contestedBars: int = 0
+    # §20.9's share of ``rewrittenBars`` — slots the count could not decide and
+    # belief could (a tie, or a plurality pointing the other way from the
+    # confidence). Published separately because it is the number that says
+    # whether the second reduction is earning its place, and because it cannot be
+    # inferred from the other two: switching it off moves bars from here into
+    # ``contestedBars`` rather than changing any total.
+    weighedBars: int = 0
     # §20.8's two counts, and they are the ones that move on a song whose
     # sections do *not* repeat enough for the vote to speak: spans pulled onto the
     # quality the song plays on that root everywhere else, and brief near-misses

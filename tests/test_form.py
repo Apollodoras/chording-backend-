@@ -17,6 +17,7 @@ from app.analysis.form import (
     bar_similarity,
     cluster,
     detect,
+    folded,
     period,
     segment,
 )
@@ -269,3 +270,102 @@ def test_without_a_key_the_prechorus_cue_is_simply_unavailable():
     energy = ([0.3] * 8 + [0.5] * 8 + [0.9] * 8) * 2
     sections = segment(bars, energy=energy)
     assert [s.kind for s in sections] == ["verse", "verse", "chorus"] * 2
+
+
+# --- the sampling cache ------------------------------------------------------
+#
+# `sampled` is memoized because the same bar is sampled thousands of times for one
+# song: `_layout` tries every phase of the period, each phase scores every block
+# against every other, each block comparison samples every bar in both — and
+# `detect` then runs the whole thing twice, before and after the consensus vote.
+#
+# A cache on something the caller can mutate is the obvious way to get this wrong,
+# so that is what these pin.
+
+def test_the_sampling_cache_keys_on_the_bar_and_not_on_the_list():
+    """A bar passed as a mutable list must not be able to return a stale answer.
+
+    `BarChord` is frozen, so a tuple of them hashes to the bar's *identity* — same
+    chords, same offsets, same answer. Coercing per call is what makes the key the
+    contents rather than the container.
+    """
+    from app.analysis.form import sampled
+
+    bar = _bar(C)
+    before = sampled(bar, 4.0)
+
+    bar[0] = BarChord(root_pc=G, quality=MAJOR, start_beat=0.0, length_beats=4.0)
+    after = sampled(bar, 4.0)
+
+    assert before != after
+    assert {cell for cell in after if cell} == {(G, MAJOR)}
+
+
+def test_the_same_bar_at_a_different_bar_length_is_a_different_answer():
+    """`bar_beats` is part of the key, and it changes the cell count — a 3/4 bar
+    sampled as if it were 4/4 would compare against the wrong grid."""
+    from app.analysis.form import sampled
+
+    bar = _bar(C)
+    assert len(sampled(bar, 4.0)) != len(sampled(bar, 3.0))
+
+
+def test_a_list_and_a_tuple_of_the_same_bar_agree():
+    """Blocks hold tuples and the rest of the pipeline holds lists, so both reach
+    this function and both must get the same answer out of the cache."""
+    from app.analysis.form import sampled
+
+    bar = _bar(C)
+    assert sampled(bar, 4.0) == sampled(tuple(bar), 4.0)
+
+
+# --- the structural view ------------------------------------------------------
+
+def test_a_seventh_on_alternate_passes_does_not_double_the_period():
+    """The measurement behind `form.folded`.
+
+    A four-bar loop played eight times, with the Em heard as Em7 on every other
+    pass — which is what BTC does with a doubled guitar part. Scored on the real
+    chords the loop reaches 0.9375 at lag 4 and a perfect 1.0 at lag 8, and
+    `PERIOD_MARGIN` is 0.05, so the song loses its own period by 0.0125 and comes
+    out as an eight-bar section played four times.
+
+    That is the "chart is twice as long as the song" half of the same engine
+    wobble that shows up as "more chords than the song has", and it has to be
+    fixed *first*: §20.9's evidence is what the other passes of a slot say, so it
+    cannot speak at all until the passes are lined up correctly.
+    """
+    from app.chords import MINOR7
+
+    loop = [_bar(E, MINOR), _bar(G), _bar(D), _bar(C)]
+    coloured = [_bar(E, MINOR7), _bar(G), _bar(D), _bar(C)]
+    bars = (loop + coloured) * 4
+
+    assert period(bars, 4.0) == 8, "on the real chords the wobble wins"
+    assert period(folded(bars), 4.0) == 4, "on the triads the song wins"
+
+    _, groups = detect(bars, bar_beats=4.0)
+    assert [(g.length_bars, len(g.occurrences)) for g in groups] == [(4, 8)]
+
+
+def test_the_fold_keeps_a_real_chord_change_apart():
+    """The fold drops colour, not identity — otherwise the rule that finds the
+    form would also erase it. A major and a minor triad on the same root stay two
+    different chords, and a verse and a chorus stay two different sections."""
+    assert folded([_bar(C)])[0][0].quality == MAJOR
+    assert folded([_bar(C, MINOR)])[0][0].quality == MINOR
+
+    _, groups = detect(VERSE * 2 + CHORUS * 2, bar_beats=4.0)
+    assert len(groups) == 2, "different music is still different music"
+
+
+def test_the_sections_are_built_from_the_real_chords_not_the_folded_ones():
+    """The fold is a lens for the *structural* math and must not leak into what
+    the player is shown: a song that really plays a seventh still prints one."""
+    from app.chords import DOMINANT7
+
+    bars = [_bar(G, DOMINANT7), _bar(C), _bar(G, DOMINANT7), _bar(C)] * 4
+    sections, groups = detect(bars, bar_beats=4.0)
+    printed = {c.quality for s in sections for b in s.bars for c in b}
+    assert printed == {DOMINANT7, MAJOR}, "the colour survives into the chart"
+    assert {c.quality for g in groups for b in g.canonical for c in b} == {DOMINANT7, MAJOR}

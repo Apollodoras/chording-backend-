@@ -32,8 +32,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from .analysis import engines
+from .analysis.file_source import is_upload_id
 from .analysis.pipeline import analyze as run_pipeline
-from .errors import AnalysisError, EgressBlocked, CODE_ANALYSIS_FAILED, CODE_VIDEO_BLOCKED
+from .errors import (
+    CODE_ANALYSIS_FAILED,
+    CODE_ANALYSIS_TIMEOUT,
+    CODE_VIDEO_BLOCKED,
+    AnalysisError,
+    AnalysisTimeout,
+    EgressBlocked,
+)
 from .store import (
     STATUS_ANALYZING,
     STATUS_BLOCKED,
@@ -61,6 +69,14 @@ REFUNDABLE_CODES = {
     "video_unavailable",
     "video_too_long",
     "feature_disabled",
+    # Our clock, not their video. The hard deadline used to raise a bare
+    # `AnalysisError`, which carries `analysis_failed` — a code deliberately *not*
+    # in this set, because it means the analysis genuinely ran and genuinely
+    # failed. So a player whose job we killed for taking too long was charged a
+    # daily analysis for a timeout that was ours to size. `AnalysisTimeout` exists
+    # to be tellable apart here; the lease reaper already refunded its own version
+    # of the same event, so the two paths now agree.
+    CODE_ANALYSIS_TIMEOUT,
 }
 
 # Which terminal job status each error code maps to. `blocked` and `unavailable`
@@ -97,7 +113,7 @@ def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
     def progress(status: str, fraction: float) -> None:
         store.update_job(job_id, status=status, progress=fraction)
         if time.monotonic() - started > settings.job_deadline_s:
-            raise AnalysisError("That video took too long to analyze — try a shorter one.")
+            raise AnalysisTimeout()
 
     try:
         store.update_job(job_id, status=STATUS_ANALYZING, progress=0.05)
@@ -154,14 +170,24 @@ def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
     # someone for our own storage failure is the one reading nobody would
     # defend.
     try:
+        # The sidecar is stored **per tier**, because it is only true of the tiers
+        # whose chart agrees with it (see `AnalysisOutcome.sync_tiers`). One
+        # shortened render used to cost every other render its video sync.
         sync_wire = outcome.sync.model_dump() if outcome.sync else None
+        # `owner_uid` is what keeps an upload private: it is somebody's own
+        # recording, so it is not catalog material and not readable by id by
+        # anyone else. Decided from the id rather than from the source, so it holds
+        # whichever runner and whichever source produced it — `is_upload_id` is the
+        # existing answer to "is this a content hash rather than a video".
+        owner_uid = uid if is_upload_id(video_id) else None
         for tier, song in outcome.songs.items():
             store.put_map(
-                video_id=video_id, difficulty=tier, song=song, sync=sync_wire,
+                video_id=video_id, difficulty=tier, song=song,
+                sync=sync_wire if tier in outcome.sync_tiers else None,
                 engine_chords=outcome.engine_chords, engine_beats=outcome.engine_beats,
                 analyzed_at=outcome.analyzed_at, channel_id=outcome.meta.channel_id,
                 title=outcome.meta.title, duration_ms=outcome.duration_ms,
-                low_confidence=outcome.low_confidence,
+                low_confidence=outcome.low_confidence, owner_uid=owner_uid,
             )
         store.update_job(job_id, status=STATUS_READY, progress=1.0)
     except Exception:
@@ -190,14 +216,22 @@ def _finish_failed(store: Store, job_id: str, uid: str, code: str, message: str,
     better. A job that analyzed cleanly and then could not be *filed* is not in
     that set — it cost us the full analysis — but the player still got nothing
     and has to ask again.
+
+    The refund is credited to **the day the charge was made**, which is read off
+    the job row rather than assumed to be today. An analysis can be queued and run
+    across midnight, and crediting the wrong day left yesterday exhausted while
+    quietly consuming a slot from today.
     """
     status = _STATUS_FOR_CODE.get(code, STATUS_FAILED)
     give_back = (code in REFUNDABLE_CODES) if refund is None else refund
     try:
+        # Read before the row is overwritten — `created_at` is not touched by the
+        # update, but reading first keeps the two facts from depending on order.
+        charge_day = store.charge_day_for_job(job_id) if give_back else None
         store.update_job(job_id, status=status, progress=1.0,
                          error_code=code, error_message=message)
         if give_back:
-            store.refund_use(uid)
+            store.refund_use(uid, charge_day)
     except Exception:
         log.exception("job %s: could not record the terminal status", job_id)
 
@@ -254,6 +288,20 @@ class JobRunner:
         the whole distinction, so it is asked separately from `can_analyze`."""
         from .analysis.file_source import available
         return available() and engines.is_ready(self.settings)
+
+    def worker_report(self) -> dict | None:
+        """What the container that will actually run the analysis has built.
+
+        `None` for an in-process runner, and that is the honest answer rather than
+        a gap: this runner *is* the worker, so `/healthz`'s own `engines` and
+        `enginesReady` already describe it and a second copy could only disagree.
+
+        A remote runner overrides it. That is the channel `/healthz` was missing —
+        `can_analyze()` there answers from the deployment's shape, so a worker image
+        that built without an engine looked identical to a healthy one until the
+        first job failed in the chord stage.
+        """
+        return None
 
 
 class ThreadJobRunner(JobRunner):

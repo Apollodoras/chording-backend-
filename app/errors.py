@@ -40,6 +40,13 @@ CODE_NOT_FOUND = "not_found"
 # renders `message` and behaves exactly as it does today.
 CODE_TEMPO_UNREADABLE = "tempo_unreadable"
 
+# And a second narrowing, for the same reason plus a billing one: a job we killed
+# on **our** wall-clock budget is not an analysis that failed. It used to arrive as
+# `analysis_failed`, which `jobs.REFUNDABLE_CODES` deliberately excludes — so the
+# player paid a daily analysis for a deadline we chose. A distinct code is what
+# lets the refund rule tell the two apart.
+CODE_ANALYSIS_TIMEOUT = "analysis_timeout"
+
 
 def fail(status: int, message: str, code: str | None = None, **kwargs) -> HTTPException:
     """Build the {"message", "code"} HTTPException the error handler reshapes.
@@ -145,6 +152,23 @@ class TempoUnreadable(AnalysisError):
             status=422,
         )
         self.tempo = tempo
+
+
+class AnalysisTimeout(AnalysisError):
+    """The job outran its wall-clock budget (`settings.job_deadline_s`).
+
+    Kept apart from `AnalysisError` for one practical reason: **it is refundable**.
+    The budget is ours to size, the container it runs in is ours to provision, and
+    the video did nothing wrong — so charging a daily analysis for it is charging
+    the player for our capacity planning. `jobs.REFUNDABLE_CODES` carries the code
+    that makes that automatic.
+
+    The message deliberately still suggests a shorter video, because that is the
+    one thing the player can actually do about it.
+    """
+
+    def __init__(self, message: str = "That video took too long to analyze — try a shorter one."):
+        super().__init__(message, CODE_ANALYSIS_TIMEOUT, status=422)
 
 
 class VideoTooLong(AnalysisError):

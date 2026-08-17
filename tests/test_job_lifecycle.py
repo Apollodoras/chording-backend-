@@ -165,6 +165,10 @@ class _Outcome:
     meta = _Meta()
     duration_ms = 180_000
     low_confidence = False
+    # Which tiers the sidecar is true of — empty here because `sync` is None.
+    # `run_job` stores the sidecar per difficulty rather than once for all of
+    # them, so this is part of the shape a pipeline outcome has to have.
+    sync_tiers = frozenset()
 
 
 def _analyzed_job(store, settings, monkeypatch, *, put_map):

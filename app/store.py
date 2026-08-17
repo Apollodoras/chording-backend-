@@ -89,6 +89,52 @@ def next_utc_reset() -> datetime:
     return datetime.combine(tomorrow, dt_time.min, tzinfo=timezone.utc)
 
 
+def day_of(iso_timestamp: str | None) -> str:
+    """The UTC quota day an ISO-8601 timestamp falls in.
+
+    Used to refund the charge on the day it was **made**. `refund_use` used to
+    always decrement today's row, so a job that started at 23:59 and failed at
+    00:01 credited a day the player had not spent anything on — and left
+    yesterday's exhausted quota exhausted.
+    """
+    if not iso_timestamp:
+        return utc_day()
+    # Everything this store writes is `_now_iso()`'s `…Z`; be tolerant anyway,
+    # since a hand-edited or migrated row is not worth an exception.
+    return iso_timestamp[:10] if len(iso_timestamp) >= 10 else utc_day()
+
+
+def _decode_chord_names(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        names = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [str(name) for name in names] if isinstance(names, list) else []
+
+
+def _catalog_scalars(song: dict) -> tuple[str | None, str | None, int | None,
+                                          str | None, str | None, str]:
+    """The five catalog fields, read off a `CompositionPayload` wire dict.
+
+    One function so `put_map` and the backfill cannot disagree about what the
+    columns mean. `chord_names` is stored as JSON because it is the one non-scalar
+    — a short list of symbols the card prints, never queried on.
+    """
+    if not isinstance(song, dict):
+        song = {}
+    tempo = song.get("tempo")
+    return (
+        song.get("id"),
+        song.get("artist"),
+        int(tempo) if isinstance(tempo, (int, float)) else None,
+        song.get("tonic"),
+        song.get("mode"),
+        json.dumps(song.get("chordNames") or [], ensure_ascii=False),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schema — dialect-neutral except the auto-increment key, which each backend
 # supplies via `_ID_COLUMN`.
@@ -126,6 +172,22 @@ _SCHEMA = [
     # §13 sidecar (nullable — §13.3 returns the song without it rather than
     # faking a grid). `engine_chords`/`engine_beats` are stored per §5.3 so a
     # cache can be invalidated selectively when one engine is upgraded.
+    #
+    # `owner_uid` is what makes an **upload** private. Uploaded audio lands in
+    # this table exactly like a fetched video, and until this column existed the
+    # catalog listed it and `GET /v1/maps/{id}` served it to anyone who guessed
+    # the hash — one player's private recording, with their own filename on it,
+    # on every other player's home screen. NULL means "public, came from a
+    # video"; a uid means "only this player may read it, and it is not catalog
+    # material". Nullable rather than defaulted so the distinction is a fact
+    # about the row and not about when the row was written.
+    #
+    # `song_id`/`artist`/`tempo`/`tonic`/`mode`/`chord_names` duplicate five
+    # scalars out of `song_json`, and the duplication is deliberate: the catalog
+    # reads exactly those and nothing else, and reading them *through*
+    # `song_json` meant `json.loads` on every row of the table to return a page
+    # of sixty. They are written from the payload by `put_map`, which is the only
+    # writer, so the two cannot drift.
     """
     CREATE TABLE IF NOT EXISTS chord_maps (
         video_id      TEXT NOT NULL,
@@ -140,6 +202,13 @@ _SCHEMA = [
         engine_chords TEXT NOT NULL,
         engine_beats  TEXT NOT NULL,
         analyzed_at   TEXT NOT NULL,
+        owner_uid     TEXT,
+        song_id       TEXT,
+        artist        TEXT,
+        tempo         INTEGER,
+        tonic         TEXT,
+        mode          TEXT,
+        chord_names   TEXT,
         PRIMARY KEY (video_id, difficulty)
     )
     """,
@@ -163,6 +232,27 @@ _SCHEMA = [
     """,
     "CREATE INDEX IF NOT EXISTS jobs_video ON jobs (video_id)",
     "CREATE INDEX IF NOT EXISTS jobs_uid ON jobs (uid)",
+    # Who else is waiting on a job they did not start.
+    #
+    # `active_job_for` deliberately joins a second caller onto one in-flight
+    # analysis rather than decoding the same recording twice — but the job row
+    # carries a single `uid`, and `GET /v1/analyze/{jobId}` refuses a poll from
+    # anyone else. So the second player was handed an id and then told, forever,
+    # that it had expired; they retried, got the same dead id, and the video was
+    # un-analyzable for everybody except whoever asked first.
+    #
+    # A follower row is the smallest thing that fixes it without weakening the
+    # check: you may poll a job because you *joined* it, not because you guessed
+    # its id. Nobody is charged for following — joining a running analysis is
+    # free for the same reason a cache hit is (§16.4).
+    """
+    CREATE TABLE IF NOT EXISTS job_followers (
+        job_id     TEXT NOT NULL,
+        uid        TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (job_id, uid)
+    )
+    """,
     # §3 — per-video-ID and per-channel-ID.
     """
     CREATE TABLE IF NOT EXISTS blocklist (
@@ -193,6 +283,42 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS audit_log_created ON audit_log (created_at)",
 ]
 
+# Columns added to an existing table after it was first deployed.
+#
+# `CREATE TABLE IF NOT EXISTS` is silent about a table that already exists with
+# *fewer* columns, so a database written by an earlier version gets these here or
+# not at all — and "not at all" means the privacy filter below cannot see
+# `owner_uid` and every query naming it fails. Additive and nullable only: this
+# is a migration path, not a schema tool, and anything needing a backfill or a
+# rewrite deserves to be written by hand and read by a person.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("chord_maps", "owner_uid", "TEXT"),
+    ("chord_maps", "song_id", "TEXT"),
+    ("chord_maps", "artist", "TEXT"),
+    ("chord_maps", "tempo", "INTEGER"),
+    ("chord_maps", "tonic", "TEXT"),
+    ("chord_maps", "mode", "TEXT"),
+    ("chord_maps", "chord_names", "TEXT"),
+    # Set once the row's five catalog scalars have been lifted out of
+    # `song_json`. A flag rather than "is `song_id` still NULL?" so a song that
+    # legitimately has no id is not re-read from JSON on every container start.
+    ("chord_maps", "denormalized", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+# Indexes that name a column from `_ADDED_COLUMNS`, and so cannot be created until
+# after the migration has run. `CREATE TABLE IF NOT EXISTS` is a no-op against an
+# existing table, so putting these in `_SCHEMA` meant every already-deployed
+# database failed to open on `no such column: owner_uid` — the schema list and the
+# migration are two different mechanisms and only one of them adds columns.
+_POST_MIGRATION_SCHEMA = [
+    # The catalog's own ordering, so paging it is an index walk rather than a sort
+    # of the whole table. Ends in `video_id` because that is the tiebreak
+    # `list_catalog` orders by, and a partial index match would leave the sort in
+    # place for exactly the rows the first page is made of.
+    "CREATE INDEX IF NOT EXISTS chord_maps_catalog ON chord_maps (analyzed_at DESC, video_id DESC)",
+    "CREATE INDEX IF NOT EXISTS chord_maps_owner ON chord_maps (owner_uid)",
+]
+
 
 @dataclass(frozen=True)
 class ChordMap:
@@ -210,6 +336,37 @@ class ChordMap:
     channel_id: Optional[str] = None
     title: Optional[str] = None
     duration_ms: int = 0
+    # None for a fetched video — public, and catalog material. A uid for
+    # uploaded audio, which only its uploader may read (see the schema note).
+    owner_uid: Optional[str] = None
+
+    @property
+    def is_private(self) -> bool:
+        return self.owner_uid is not None
+
+
+@dataclass(frozen=True)
+class CatalogEntry:
+    """One row of the catalog listing — the five scalars a card needs, and
+    nothing else.
+
+    Deliberately **not** a `ChordMap`: a `ChordMap` carries the whole
+    `CompositionPayload`, and the listing was decoding two thousand of them to
+    print sixty titles. These fields come straight out of their own columns.
+    """
+
+    video_id: str
+    difficulty: str
+    title: Optional[str]
+    artist: Optional[str]
+    duration_ms: int
+    song_id: Optional[str]
+    chord_names: list[str]
+    tempo: Optional[int]
+    tonic: Optional[str]
+    mode: Optional[str]
+    analyzed_at: str
+    low_confidence: bool
 
 
 @dataclass(frozen=True)
@@ -264,6 +421,22 @@ class Store:
             return sql
         return sql.replace("?", "%s")
 
+    def _columns(self, cur, table: str) -> set[str]:
+        """Which columns `table` currently has. Backend-specific, and the reason
+        `_migrate_columns` can be additive without guessing."""
+        raise NotImplementedError
+
+    def _serialize_rate_key(self, cur, scope: str, key: str) -> None:
+        """Serialize concurrent limiter checks on one `(scope, key)`.
+
+        A no-op here, because `SQLiteStore` already holds a process-wide lock for
+        the whole cursor block and SQLite itself takes a database write lock —
+        the read-count-then-insert below is atomic there by construction.
+        Postgres is the backend that needs it: under READ COMMITTED two
+        concurrent transactions both see a count below the limit, both insert,
+        and the limiter admits `2 × limit` requests. See `PostgresStore`.
+        """
+
     def ping(self) -> None:
         """One round-trip, for `/healthz`. Raises if the store is unreachable.
 
@@ -279,6 +452,75 @@ class Store:
         with self._cursor(write=True) as cur:
             for statement in _SCHEMA:
                 cur.execute(statement.format(id_column=self._ID_COLUMN))
+        self._migrate_columns()
+        with self._cursor(write=True) as cur:
+            for statement in _POST_MIGRATION_SCHEMA:
+                cur.execute(statement)
+        self._denormalize_catalog()
+
+    def _migrate_columns(self) -> None:
+        """Add any column in `_ADDED_COLUMNS` this database is missing."""
+        wanted: dict[str, list[tuple[str, str]]] = {}
+        for table, column, ddl in _ADDED_COLUMNS:
+            wanted.setdefault(table, []).append((column, ddl))
+        with self._cursor(write=True) as cur:
+            for table, columns in wanted.items():
+                present = self._columns(cur, table)
+                for column, ddl in columns:
+                    if column in present:
+                        continue
+                    log.info("migrating: adding %s.%s", table, column)
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    def _denormalize_catalog(self) -> None:
+        """Lift the catalog's five scalars out of `song_json`, once per row.
+
+        The listing used to read them by decoding every payload in the table, so
+        the columns have to be populated for rows written before they existed.
+        Bounded and one-off: the flag column means a container start after the
+        backfill does one indexed count, not a table scan.
+
+        Best-effort by design. A row whose payload cannot be decoded is left
+        flagged as done with empty scalars rather than retried on every start —
+        the alternative is a store that refuses to open because one cached song
+        is malformed, which is a worse failure than one card with no chords on
+        it.
+
+        Read in **batches**, because the whole point of the columns is not holding
+        every payload in the table at once: selecting them all here would
+        reintroduce the memory cost of the query being replaced, at startup, where
+        it is least visible.
+        """
+        batch = 200
+        total = 0
+        while True:
+            with self._cursor() as cur:
+                cur.execute(self._sql(
+                    "SELECT video_id, difficulty, song_json FROM chord_maps "
+                    "WHERE denormalized = 0 LIMIT ?"
+                ), (batch,))
+                rows = cur.fetchall()
+            if not rows:
+                break
+            for video_id, difficulty, song_json in rows:
+                try:
+                    song = json.loads(song_json) if song_json else {}
+                except (TypeError, ValueError):
+                    log.warning("chord map %s@%s has undecodable song_json",
+                                video_id, difficulty)
+                    song = {}
+                with self._cursor(write=True) as cur:
+                    cur.execute(self._sql(
+                        """
+                        UPDATE chord_maps
+                        SET song_id = ?, artist = ?, tempo = ?, tonic = ?, mode = ?,
+                            chord_names = ?, denormalized = 1
+                        WHERE video_id = ? AND difficulty = ?
+                        """
+                    ), (*_catalog_scalars(song), video_id, difficulty))
+            total += len(rows)
+        if total:
+            log.info("migrating: denormalized %d chord map(s) for the catalog", total)
 
     # -- users ---------------------------------------------------------------
 
@@ -339,18 +581,37 @@ class Store:
             blocked = cur.fetchone()
         return False, blocked[0] if blocked else limit
 
-    def refund_use(self, uid: str) -> None:
+    def refund_use(self, uid: str, day: str | None = None) -> None:
         """Give back a charge whose analysis never happened.
 
         Analysis can fail for reasons that are not the player's doing and cost us
         nothing worth billing — a video that turns out to be blocked, private, or
         too long is rejected before a single second is decoded. Charging for that
         would burn a daily quota on an error message.
+
+        `day` is **the day the charge was made**, not today. Analyses outlive
+        midnight: a job that started at 23:59 and failed at 00:01 was charged to
+        yesterday's row, and crediting today's instead did the player double harm
+        — yesterday stayed exhausted, and today's fresh allowance absorbed a
+        refund it was owed nothing for. Callers that know the job pass
+        `charge_day_for_job`; the default is today, which is right for a failure
+        that happens in the same request that charged.
         """
         with self._cursor(write=True) as cur:
             cur.execute(self._sql(
                 "UPDATE usage SET count = count - 1 WHERE uid = ? AND day = ? AND count > 0"
-            ), (uid, utc_day()))
+            ), (uid, day or utc_day()))
+
+    def charge_day_for_job(self, job_id: str) -> str | None:
+        """Which quota day this job's charge landed on, or None if it is gone.
+
+        The charge happens in the request that creates the row, so the row's
+        `created_at` *is* the day it was charged to.
+        """
+        with self._cursor() as cur:
+            cur.execute(self._sql("SELECT created_at FROM jobs WHERE job_id = ?"), (job_id,))
+            row = cur.fetchone()
+        return day_of(row[0]) if row else None
 
     # -- rate limiting -------------------------------------------------------
 
@@ -361,6 +622,13 @@ class Store:
 
         Sliding rather than a fixed bucket because a fixed bucket lets a caller
         fire `limit` requests at 11:59:59 and `limit` more at 12:00:00.
+
+        Count-then-insert, which is only atomic because the whole block is one
+        transaction **and** concurrent checks of the same key are serialized —
+        see `_serialize_rate_key`. Without that, Postgres under READ COMMITTED
+        lets two simultaneous requests both read a count below the limit and both
+        insert, so the budget quietly doubles under exactly the load it exists
+        for. SQLite never had the problem; Postgres is what this deployment runs.
         """
         if limit <= 0:
             return True, 0.0
@@ -368,6 +636,7 @@ class Store:
         self._maybe_prune_rate_events(window_s, now)
         cutoff = now - window_s
         with self._cursor(write=True) as cur:
+            self._serialize_rate_key(cur, scope, key)
             cur.execute(
                 self._sql("DELETE FROM rate_events WHERE scope = ? AND key = ? AND ts <= ?"),
                 (scope, key, cutoff),
@@ -432,12 +701,27 @@ class Store:
         now = time.time() if now is None else now
         cutoff = datetime.fromtimestamp(now - older_than_s, tz=timezone.utc)
         placeholders = ", ".join("?" for _ in TERMINAL_STATUSES)
+        stamp = cutoff.isoformat().replace("+00:00", "Z")
         with self._cursor(write=True) as cur:
+            # Followers first, while the rows they point at still exist to be
+            # selected by. There is no foreign key here (neither backend's schema
+            # in this file declares one), so an orphaned follower row would simply
+            # accumulate forever holding a uid — see `_maybe_prune_rate_events` on
+            # why that matters beyond tidiness.
+            cur.execute(
+                self._sql(
+                    f"""DELETE FROM job_followers WHERE job_id IN (
+                            SELECT job_id FROM jobs
+                            WHERE status IN ({placeholders}) AND updated_at < ?
+                        )"""
+                ),
+                (*sorted(TERMINAL_STATUSES), stamp),
+            )
             cur.execute(
                 self._sql(
                     f"DELETE FROM jobs WHERE status IN ({placeholders}) AND updated_at < ?"
                 ),
-                (*sorted(TERMINAL_STATUSES), cutoff.isoformat().replace("+00:00", "Z")),
+                (*sorted(TERMINAL_STATUSES), stamp),
             )
             return cur.rowcount
 
@@ -494,14 +778,14 @@ class Store:
         with self._cursor(write=True) as cur:
             cur.execute(self._sql(
                 f"""
-                SELECT job_id, uid FROM jobs
+                SELECT job_id, uid, created_at FROM jobs
                 WHERE status NOT IN ({placeholders}) AND updated_at < ?
                 """
             ), (*sorted(TERMINAL_STATUSES), cutoff))
             candidates = cur.fetchall()
 
         reaped = 0
-        for job_id, uid in candidates:
+        for job_id, uid, created_at in candidates:
             with self._cursor(write=True) as cur:
                 # The `status NOT IN (terminal)` repeat is the claim: if the
                 # worker was merely slow and has since finished, this matches
@@ -520,7 +804,10 @@ class Store:
                 claimed = cur.rowcount
             if claimed:
                 reaped += 1
-                self.refund_use(uid)
+                # The day the charge was made, not the day the lease expired. A
+                # lease is fifteen minutes and a job can be queued for longer, so
+                # this reaper is the path most likely to cross midnight.
+                self.refund_use(uid, day_of(created_at))
         return reaped
 
     # -- chord maps (the cache) ----------------------------------------------
@@ -529,7 +816,8 @@ class Store:
                 sync: dict | None, engine_chords: str, engine_beats: str,
                 analyzed_at: str, channel_id: str | None = None,
                 title: str | None = None, duration_ms: int = 0,
-                offset_ms: int | None = None, low_confidence: bool = False) -> None:
+                offset_ms: int | None = None, low_confidence: bool = False,
+                owner_uid: str | None = None) -> None:
         """Store (or replace) one analysis.
 
         Upsert, not insert: re-analyzing a video **replaces** its map, exactly as
@@ -537,18 +825,27 @@ class Store:
         An admin-set `offset_ms` is preserved across a re-analysis — it is a
         human correction and a fresh run has no better information than the
         person who watched the video.
+
+        `owner_uid` makes the row private (see the schema note). It is preserved
+        across a re-analysis for the same reason `offset_ms` is: a second upload
+        of the same audio must not be able to hand someone else's recording to
+        whoever uploads it next, and re-analysis must not silently publish it.
         """
         with self._cursor(write=True) as cur:
-            cur.execute(self._sql("SELECT offset_ms FROM chord_maps WHERE video_id = ? AND difficulty = ?"),
-                        (video_id, difficulty))
+            cur.execute(self._sql(
+                "SELECT offset_ms, owner_uid FROM chord_maps WHERE video_id = ? AND difficulty = ?"
+            ), (video_id, difficulty))
             row = cur.fetchone()
             preserved = row[0] if row and row[0] is not None else offset_ms
+            owner = row[1] if row and row[1] is not None else owner_uid
             cur.execute(self._sql(
                 """
                 INSERT INTO chord_maps (video_id, difficulty, channel_id, title, duration_ms,
                                         song_json, sync_json, offset_ms, low_confidence,
-                                        engine_chords, engine_beats, analyzed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        engine_chords, engine_beats, analyzed_at, owner_uid,
+                                        song_id, artist, tempo, tonic, mode, chord_names,
+                                        denormalized)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(video_id, difficulty) DO UPDATE SET
                     channel_id = EXCLUDED.channel_id,
                     title = EXCLUDED.title,
@@ -559,18 +856,28 @@ class Store:
                     low_confidence = EXCLUDED.low_confidence,
                     engine_chords = EXCLUDED.engine_chords,
                     engine_beats = EXCLUDED.engine_beats,
-                    analyzed_at = EXCLUDED.analyzed_at
+                    analyzed_at = EXCLUDED.analyzed_at,
+                    owner_uid = EXCLUDED.owner_uid,
+                    song_id = EXCLUDED.song_id,
+                    artist = EXCLUDED.artist,
+                    tempo = EXCLUDED.tempo,
+                    tonic = EXCLUDED.tonic,
+                    mode = EXCLUDED.mode,
+                    chord_names = EXCLUDED.chord_names,
+                    denormalized = 1
                 """
             ), (video_id, difficulty, channel_id, title, duration_ms,
                 json.dumps(song, ensure_ascii=False), json.dumps(sync, ensure_ascii=False) if sync else None,
-                preserved, 1 if low_confidence else 0, engine_chords, engine_beats, analyzed_at))
+                preserved, 1 if low_confidence else 0, engine_chords, engine_beats, analyzed_at,
+                owner, *_catalog_scalars(song)))
 
     def get_map(self, video_id: str, difficulty: str) -> ChordMap | None:
         with self._cursor() as cur:
             cur.execute(self._sql(
                 """
                 SELECT video_id, difficulty, song_json, sync_json, offset_ms, low_confidence,
-                       engine_chords, engine_beats, analyzed_at, channel_id, title, duration_ms
+                       engine_chords, engine_beats, analyzed_at, channel_id, title, duration_ms,
+                       owner_uid
                 FROM chord_maps WHERE video_id = ? AND difficulty = ?
                 """
             ), (video_id, difficulty))
@@ -583,69 +890,97 @@ class Store:
             offset_ms=row[4], low_confidence=bool(row[5]),
             engine_chords=row[6], engine_beats=row[7], analyzed_at=row[8],
             channel_id=row[9], title=row[10], duration_ms=row[11] or 0,
+            owner_uid=row[12],
         )
 
+    # The catalog is public rows only: `owner_uid IS NULL`. Spelled once, because
+    # the listing and the version token have to agree about what "the catalog" is
+    # — a private upload that moved the version everyone polls would tell every
+    # other player their home screen had changed, and then show them nothing.
+    _PUBLIC = "m.owner_uid IS NULL"
+
     def list_catalog(self, *, limit: int = 60, offset: int = 0,
-                     difficulty: str | None = None) -> list[ChordMap]:
+                     difficulty: str | None = None) -> list[CatalogEntry]:
         """The **catalog**: everything analyzed so far, newest first.
 
         This is what the app's Home screen is built from. Every row here is a
         cache hit — already analyzed, free to open, instant — which is exactly why
         the client leads with it and treats YouTube as the long tail.
 
-        Two things it must get right, and both are about not serving something we
-        shouldn't:
+        Three things it must get right, and all three are about not serving
+        something we shouldn't, or not doing it a table at a time:
 
+        - **Uploads are excluded.** Uploaded audio is stored in this same table,
+          and it is somebody's private recording: their file name, their chart,
+          their key and tempo. It has no `videoId` a YouTube player could resolve
+          either, so a catalog row for one is both a privacy failure and a card
+          that cannot be opened. `owner_uid IS NULL` is the whole filter, and it
+          is in SQL for the same reason the blocklist is.
         - **Blocked videos and channels are excluded in SQL**, not filtered after.
           §3's takedown surface has to hold on a *listing* as firmly as it does on
           ``GET /v1/maps/{id}``; a blocked video that vanishes from the detail
           endpoint but still sits on the home screen is a takedown that didn't
           happen.
-        - **One row per video.** A video analyzed at two difficulties has two
-          rows, and the catalog is a list of *songs*, not of analyses — so it
-          collapses to the newest per video id.
+        - **One row per video, and the page is a page.** A video analyzed at two
+          difficulties has two rows, and the catalog is a list of *songs*, so it
+          collapses to the newest per video id — in SQL, with `ROW_NUMBER`, and
+          then `LIMIT`/`OFFSET`. Collapsing in Python meant fetching and decoding
+          the entire table to return sixty rows, so a catalog hit cost a second of
+          CPU at two thousand maps and grew from there, with `offset` buying
+          nothing at all.
 
-        ``song_json`` is returned whole. It is the same ``CompositionPayload`` the
-        client already knows how to read, so the caller can take the chords, key
-        and tempo off it without this table growing columns that duplicate it.
+        The five scalars come from their own columns rather than from
+        ``song_json``: this endpoint reads exactly those, and decoding a whole
+        ``CompositionPayload`` per row to reach them is the cost that made paging
+        pointless. See the schema note on why the duplication is safe.
         """
-        sql = """
-            SELECT video_id, difficulty, song_json, sync_json, offset_ms, low_confidence,
-                   engine_chords, engine_beats, analyzed_at, channel_id, title, duration_ms
-            FROM chord_maps m
-            WHERE NOT EXISTS (
+        where = [self._PUBLIC, """NOT EXISTS (
                       SELECT 1 FROM blocklist b
                       WHERE (b.kind = ? AND b.key = m.video_id)
                          OR (b.kind = ? AND b.key = m.channel_id)
-                  )
-        """
+                  )"""]
         params: list = [BLOCK_VIDEO, BLOCK_CHANNEL]
         if difficulty is not None:
-            sql += " AND difficulty = ?"
+            where.append("m.difficulty = ?")
             params.append(difficulty)
-        sql += " ORDER BY analyzed_at DESC, video_id DESC"
+
+        # `ROW_NUMBER` rather than `GROUP BY`: the collapse has to keep the
+        # *winning row's* other columns, which a grouped query cannot hand back
+        # portably. Ordered by difficulty as the tiebreak so two tiers analyzed in
+        # the same instant still collapse deterministically (§16.5).
+        sql = f"""
+            SELECT video_id, difficulty, title, artist, duration_ms, song_id,
+                   chord_names, tempo, tonic, mode, analyzed_at, low_confidence
+            FROM (
+                SELECT m.video_id, m.difficulty, m.title, m.artist, m.duration_ms,
+                       m.song_id, m.chord_names, m.tempo, m.tonic, m.mode,
+                       m.analyzed_at, m.low_confidence,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY m.video_id
+                           ORDER BY m.analyzed_at DESC, m.difficulty DESC
+                       ) AS rank_in_video
+                FROM chord_maps m
+                WHERE {' AND '.join(where)}
+            ) ranked
+            WHERE rank_in_video = 1
+            ORDER BY analyzed_at DESC, video_id DESC
+            LIMIT ? OFFSET ?
+        """
+        params += [max(0, limit), max(0, offset)]
 
         with self._cursor() as cur:
             cur.execute(self._sql(sql), tuple(params))
             rows = cur.fetchall()
-
-        # Collapse to one row per video (newest wins — the ORDER BY above already
-        # put it first), then page. Paging after the collapse is what makes the
-        # page size mean "songs", which is what the caller asked for.
-        seen: set[str] = set()
-        maps: list[ChordMap] = []
-        for row in rows:
-            if row[0] in seen:
-                continue
-            seen.add(row[0])
-            maps.append(ChordMap(
-                video_id=row[0], difficulty=row[1],
-                song=json.loads(row[2]), sync=json.loads(row[3]) if row[3] else None,
-                offset_ms=row[4], low_confidence=bool(row[5]),
-                engine_chords=row[6], engine_beats=row[7], analyzed_at=row[8],
-                channel_id=row[9], title=row[10], duration_ms=row[11] or 0,
-            ))
-        return maps[offset:offset + limit]
+        return [
+            CatalogEntry(
+                video_id=row[0], difficulty=row[1], title=row[2], artist=row[3],
+                duration_ms=row[4] or 0, song_id=row[5],
+                chord_names=_decode_chord_names(row[6]),
+                tempo=row[7], tonic=row[8], mode=row[9],
+                analyzed_at=row[10], low_confidence=bool(row[11]),
+            )
+            for row in rows
+        ]
 
     def catalog_version(self) -> str:
         """A cheap token that changes whenever the catalog does.
@@ -659,10 +994,15 @@ class Store:
         upserts and refreshes ``analyzed_at``). A deletion moves the count too.
         Deliberately not a hash of the whole table: this is the endpoint that gets
         called most often, so it has to stay one aggregate.
+
+        Counts the same rows the listing serves — public ones. A private upload
+        moving this token would wake every client to fetch a list that had not
+        changed.
         """
         with self._cursor() as cur:
             cur.execute(self._sql(
-                "SELECT COUNT(*), COALESCE(MAX(analyzed_at), '') FROM chord_maps"
+                f"SELECT COUNT(*), COALESCE(MAX(analyzed_at), '') "
+                f"FROM chord_maps m WHERE {self._PUBLIC}"
             ))
             row = cur.fetchone()
         count = row[0] if row else 0
@@ -728,6 +1068,37 @@ class Store:
             ), (job_id,))
             row = cur.fetchone()
         return Job(*row) if row else None
+
+    def follow_job(self, job_id: str, uid: str) -> None:
+        """Record that `uid` is waiting on a job somebody else started.
+
+        Called when `active_job_for` joins a second caller onto an in-flight
+        analysis. Idempotent — the client may well ask twice.
+        """
+        with self._cursor(write=True) as cur:
+            cur.execute(self._sql(
+                """
+                INSERT INTO job_followers (job_id, uid, created_at) VALUES (?, ?, ?)
+                ON CONFLICT(job_id, uid) DO NOTHING
+                """
+            ), (job_id, uid, _now_iso()))
+
+    def may_read_job(self, job: Job, uid: str) -> bool:
+        """Whether `uid` is entitled to this job's status.
+
+        The owner, or anyone the API handed this job id to because they asked for
+        the same video while it was running. Deliberately not "anyone who knows
+        the id": the id is a uuid4 and unguessable in practice, but *in practice*
+        is not an authorization rule.
+        """
+        if job.uid == uid:
+            return True
+        with self._cursor() as cur:
+            cur.execute(
+                self._sql("SELECT 1 FROM job_followers WHERE job_id = ? AND uid = ?"),
+                (job.job_id, uid),
+            )
+            return cur.fetchone() is not None
 
     def active_job_for(self, video_id: str, difficulty: str) -> Job | None:
         """An in-flight job for this exact analysis, if one exists.
@@ -824,6 +1195,10 @@ class Store:
         with self._cursor(write=True) as cur:
             cur.execute(self._sql("DELETE FROM chord_maps WHERE video_id = ?"), (video_id,))
             maps = cur.rowcount
+            cur.execute(self._sql(
+                "DELETE FROM job_followers WHERE job_id IN "
+                "(SELECT job_id FROM jobs WHERE video_id = ?)"
+            ), (video_id,))
             cur.execute(self._sql("DELETE FROM jobs WHERE video_id = ?"), (video_id,))
             jobs = cur.rowcount
         self.audit(AUDIT_PURGE, video_id, actor=actor, reason=reason,
@@ -892,6 +1267,10 @@ class SQLiteStore(Store):
         self._lock = threading.Lock()
         self._migrate()
 
+    def _columns(self, cur, table: str) -> set[str]:
+        cur.execute(f"PRAGMA table_info({table})")
+        return {row[1] for row in cur.fetchall()}
+
     @contextmanager
     def _cursor(self, *, write: bool = False):
         with self._lock:
@@ -938,15 +1317,79 @@ class PostgresStore(Store):
         with self._pool.connection() as conn, conn.cursor() as cur:
             yield cur
 
+    def _columns(self, cur, table: str) -> set[str]:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = %s AND table_schema = current_schema()",
+            (table,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+    def _serialize_rate_key(self, cur, scope: str, key: str) -> None:
+        """A transaction-scoped advisory lock on this one `(scope, key)`.
+
+        The cheapest correct answer to the limiter's count-then-insert race. Not
+        `SELECT … FOR UPDATE`: there is no row to lock — the check's whole point
+        is deciding whether to *create* one — and locking the table would
+        serialize every caller against every other. `pg_advisory_xact_lock`
+        releases at commit, which is the end of the `_cursor` block, so nothing
+        here can leak a lock.
+
+        Contended only by requests from the same uid or the same IP, which is
+        precisely the case where serializing is the intended behaviour.
+        """
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"{scope}:{key}",))
+
     def close(self) -> None:
         self._pool.close()
 
 
-def build_store(settings) -> Store:
-    """Pick the backend from configuration: DSN set ⇒ Postgres, absent ⇒ SQLite."""
+# Which half of the deployment is asking for a store. The worker is not merely a
+# second process — it is a second *container*, with its own ephemeral filesystem
+# and (deliberately, §4) no Volume mounted.
+ROLE_API = "api"
+ROLE_WORKER = "worker"
+
+
+class StoreUnusable(RuntimeError):
+    """This container cannot reach a store the rest of the deployment shares."""
+
+
+def build_store(settings, *, role: str = ROLE_API) -> Store:
+    """Pick the backend from configuration: DSN set ⇒ Postgres, absent ⇒ SQLite.
+
+    **A remote worker may not use SQLite, and this refuses rather than pretends.**
+    On Modal the worker runs `build_store` in its own container. `db_path`
+    defaults to a *relative* path and the `chords-data` Volume is mounted on the
+    API function only, so a SQLite worker opens a brand-new database file on a
+    disk that dies with the call: it writes `analyzing`, then `ready`, then the
+    map, into a file nothing will ever read. From the API's side every job sits at
+    `queued` until the 900 s lease reaper fails it — a total outage of the
+    analysis feature, behind a `/healthz` that is green in both containers,
+    because each one is individually fine.
+
+    Nothing enforced this before. The `MAX_CONTAINERS = 1` pin and its deploy-time
+    warning are about the *API* side of the same single-writer question, and are
+    silent here: the worker is a separate container whether or not the API is
+    pinned, so the pin cannot make this shape work. Postgres is not an
+    optimisation for this deployment, it is the requirement, and the honest place
+    to say so is where the store is built.
+
+    Raising leaves the job row untouched at `queued`, which is the right failure:
+    the reaper on the API container gives the player a terminal answer and a
+    refund, and the exception is in the worker's log with the remedy in it.
+    """
     dsn = getattr(settings, "database_url", None)
     if dsn:
-        log.info("store: postgres")
+        log.info("store: postgres (%s)", role)
         return PostgresStore(dsn)
-    log.info("store: sqlite at %s", settings.db_path)
+    if role == ROLE_WORKER:
+        raise StoreUnusable(
+            "This worker has no CHORDS_DATABASE_URL, so the only store it could "
+            "build is a SQLite file on its own ephemeral disk — which the API "
+            "container cannot read, so every job it ran would stay 'queued' until "
+            "the lease reaper failed it. Set CHORDS_DATABASE_URL on "
+            "chords-worker-secrets (the same Postgres DSN the API uses)."
+        )
+    log.info("store: sqlite at %s (%s)", settings.db_path, role)
     return SQLiteStore(settings.db_path)

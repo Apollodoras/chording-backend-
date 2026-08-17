@@ -322,3 +322,107 @@ def test_assemble_needs_no_audio_engine_or_network(settings):
     assert outcome.engine_chords == "btc@1.2.0"
     assert outcome.engine_beats == "beat_this@0.3.1"
     assert outcome.sync.engine.chords == "btc@1.2.0"
+
+
+# --- the sidecar is per difficulty -------------------------------------------
+
+def test_the_sidecar_records_which_tiers_it_is_true_of(settings, store):
+    """One sidecar object, and a set of the tiers whose chart agrees with it.
+
+    The sidecar describes the *recording* — anchors, tempo, bar grid — so it is the
+    same whichever tier the player asked for. What is per-tier is whether that
+    tier's chart still lines up with it, and the store is already keyed on
+    `(video_id, difficulty)`.
+    """
+    outcome = run(settings, store)
+
+    assert outcome.sync is not None
+    assert outcome.sync_tiers == frozenset(outcome.songs)
+    for tier in outcome.songs:
+        assert outcome.sync_for(tier) is outcome.sync
+
+
+def test_one_disagreeing_tier_no_longer_costs_the_others_their_sync(settings, store,
+                                                                    monkeypatch):
+    """The defect.
+
+    `impose` is allowed to drop a section from one tier — `easy`'s
+    drop-passing-chords rule can merge across a barline — so a tier disagreeing with
+    the sidecar is by design rather than a symptom. The check used to `break` on the
+    first failure and withhold the sidecar from **every** tier, punishing two renders
+    for a third one's shape, and the log line named only the tier that failed so the
+    two that were fine looked untouched.
+
+    Video sync is the product's differentiator; it should not be all-or-nothing
+    across renders that are allowed to differ.
+    """
+    from app.analysis import pipeline
+
+    real_lint_sync = pipeline.lint_sync
+
+    def only_easy_disagrees(payload, sync):
+        # The tier is in the song id (`yt:<videoId>:<difficulty>`, §12.5) — the
+        # payload has no difficulty field of its own.
+        if payload.id.endswith(f":{EASY}"):
+            return ["bar count disagrees with the sidecar"]
+        return real_lint_sync(payload, sync)
+
+    monkeypatch.setattr(pipeline, "lint_sync", only_easy_disagrees)
+    outcome = run(settings, store)
+
+    assert EASY not in outcome.sync_tiers
+    assert {NORMAL, HARD} <= outcome.sync_tiers
+    assert outcome.sync is not None, \
+        "the sidecar is still true of two tiers, so it is still worth having"
+    assert outcome.sync_for(EASY) is None
+
+
+def test_no_tier_agreeing_still_means_no_sidecar_at_all(settings, store, monkeypatch):
+    """`sync is None` has to keep meaning exactly what it always meant — this
+    analysis has no usable video sync — or every reader of it becomes subtly
+    optimistic."""
+    from app.analysis import pipeline
+
+    monkeypatch.setattr(pipeline, "lint_sync", lambda payload, sync: ["nope"])
+    outcome = run(settings, store)
+
+    assert outcome.sync is None
+    assert outcome.sync_tiers == frozenset()
+
+
+def test_a_low_confidence_song_has_no_sync_tiers(settings, store):
+    """§13.3: no sidecar is built at all, so there is nothing for any tier to
+    agree with."""
+    weak = replace(settings, confidence_floor=0.99)
+    outcome = run(weak, store)
+
+    assert outcome.sync is None
+    assert outcome.sync_tiers == frozenset()
+
+
+def test_only_the_agreeing_tiers_are_filed_with_a_sidecar(settings, store, monkeypatch):
+    """End to end through `run_job`, because the per-tier decision is only worth
+    anything if the store write honours it."""
+    from app.analysis import pipeline
+    from app import jobs
+    from app.jobs import run_job
+
+    real_lint_sync = pipeline.lint_sync
+    monkeypatch.setattr(
+        pipeline, "lint_sync",
+        lambda payload, sync: (["disagrees"] if payload.id.endswith(f":{EASY}")
+                               else real_lint_sync(payload, sync)))
+    # `run_job` builds its engines from the registry, which this module does not
+    # populate — the fakes are passed straight to `analyze` everywhere else here.
+    monkeypatch.setattr(jobs.engines, "build_chord_engine", lambda _s: FakeChordEngine())
+    monkeypatch.setattr(jobs.engines, "build_beat_tracker", lambda _s: FakeBeatTracker())
+    monkeypatch.setattr(jobs.engines, "build_onset_detector", lambda _s: FakeOnsetDetector())
+    monkeypatch.setattr(jobs.engines, "build_structure_probe", lambda _s: None)
+
+    store.create_job(job_id="j1", uid="u1", video_id="dQw4w9WgXcQ", difficulty=NORMAL)
+    run_job(job_id="j1", video_id="dQw4w9WgXcQ", difficulty=NORMAL, uid="u1",
+            settings=settings, store=store, source=FakeSource())
+
+    assert store.get_map("dQw4w9WgXcQ", EASY).sync is None
+    assert store.get_map("dQw4w9WgXcQ", NORMAL).sync is not None
+    assert store.get_map("dQw4w9WgXcQ", HARD).sync is not None

@@ -16,11 +16,11 @@ Two details worth stating, both of which change the numbers if you get them
 wrong:
 
 - **The features must match training exactly.** CQT with 144 bins at 24 per
-  octave, hop 2048, at 22.05 kHz — computed in 10-second chunks, because that is
-  how the training set was cut and `librosa.cqt` is not invariant to the length
-  of what you hand it. Then `log(|CQT| + 1e-6)`, standardised by the mean and std
-  stored *in the checkpoint*. Skipping that standardisation does not error; it
-  just returns confident nonsense.
+  octave, hop 2048, at 22.05 kHz — framed in 10-second blocks, because that is
+  how the training set was cut and one block is exactly one inference window.
+  Then `log(|CQT| + 1e-6)`, standardised by the mean and std stored *in the
+  checkpoint*. Skipping that standardisation does not error; it just returns
+  confident nonsense.
 - **Its native sample rate is already ours.** §5.1 decodes to 22.05 kHz, which is
   what BTC trained on, so nothing is resampled in the normal path.
 
@@ -30,9 +30,12 @@ already normalizes — the adapter does no translation of its own.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import math
 import os
 import sys
+import threading
 from pathlib import Path
 
 from ..types import PCM, RawChordSpan
@@ -46,6 +49,44 @@ _TIMESTEP = 108          # config.model.timestep — frames per inference window
 _N_BINS = 144
 _BINS_PER_OCTAVE = 24
 _HOP = 2048
+# librosa.cqt's default lowest bin — C1. Named because the analysis window below
+# is derived from it, and the derivation is the whole point.
+_FMIN_HZ = 32.70319566257483
+
+# sha256 of `test/btc_model_large_voca.pt` in the BTC checkout at the commit
+# `modal_app.BTC_COMMIT` pins (2682317b), measured from the vendored copy.
+#
+# The commit pin already says *which* checkpoint; this says the bytes arrived
+# intact. It matters because `_load_checkpoint` has a `weights_only=False`
+# fallback, and that flag is "run whatever code this pickle asks for". A pinned
+# clone makes that defensible and does not make it *verified* — a clone is a
+# network fetch, and the fallback would happily execute a substituted file. With
+# the hash, the unsafe path is only reachable for a file we recognise.
+#
+# `CHORDS_BTC_CHECKPOINT_SHA256` overrides it, for an operator deliberately
+# running different weights.
+BTC_CHECKPOINT_SHA256 = "1673d23f8f9a55ae7f9e8b80a51da616debb22675b8d8b67ea6ce0ef37b0ab51"
+
+
+def _context_frames() -> int:
+    """How many whole hops of real audio each block needs on either side.
+
+    A constant-Q filter is long at the bottom: at 24 bins per octave the Q factor
+    is ~34, so the lowest bin's window is `Q · sr / fmin` ≈ 23 000 samples — just
+    over a second. `librosa.cqt(..., center=True)` pads whatever it is handed, so a
+    block transformed **in isolation** has roughly half that window of padding
+    rather than audio at each end: ~0.52 s of each 10 s block, about 10% of it, and
+    concentrated in the low bins where the chord *root* lives.
+
+    Handing the transform a little of the neighbouring audio and then trimming back
+    to the block's own frames costs one extra hop-length of CQT per edge and makes
+    every frame a frame of the recording. Derived rather than hardcoded so it stays
+    correct if the bin layout changes; `+1` is slack for the rounding in librosa's
+    own filter sizing.
+    """
+    q = 1.0 / (2.0 ** (1.0 / _BINS_PER_OCTAVE) - 1.0)
+    window_samples = math.ceil(q * _SAMPLE_RATE / _FMIN_HZ)
+    return math.ceil((window_samples / 2.0) / _HOP) + 1
 
 
 class BtcUnavailable(RuntimeError):
@@ -91,6 +132,32 @@ def _restore_numpy_aliases() -> None:
             setattr(np, alias, builtin)
 
 
+def _checkpoint_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _is_pinned(path: Path) -> bool:
+    """Whether these are the bytes we pinned. Never raises — a hashing failure
+    must read as "not verified", which only ever *withholds* a privilege."""
+    expected = os.environ.get("CHORDS_BTC_CHECKPOINT_SHA256") or BTC_CHECKPOINT_SHA256
+    try:
+        actual = _checkpoint_digest(path)
+    except OSError:
+        log.warning("could not hash the BTC checkpoint at %s", path, exc_info=True)
+        return False
+    if actual == expected:
+        return True
+    log.warning("BTC checkpoint at %s hashes to %s, not the pinned %s — the safe "
+                "loader is still allowed, the arbitrary-code fallback is not. Set "
+                "CHORDS_BTC_CHECKPOINT_SHA256 if these weights are intended.",
+                path, actual, expected)
+    return False
+
+
 def _load_checkpoint(torch, path: Path):
     """`torch.load` BTC's weights across PyTorch's 2.6 default change.
 
@@ -122,8 +189,16 @@ def _load_checkpoint(torch, path: Path):
     torch >= 2.7 takes `(callable, "dotted.path")` to register under an explicit
     name, which is the supported way to say "this object, under the legacy path".
     """
+    pinned = _is_pinned(path)
+
     add_safe_globals = getattr(torch.serialization, "add_safe_globals", None)
     if add_safe_globals is None:          # torch < 2.4 — weights_only is off anyway
+        if not pinned:
+            raise BtcUnavailable(
+                f"This torch has no safe-globals API, so loading {path.name} means "
+                f"unpickling it with full code rights — and it is not the pinned "
+                f"checkpoint. Refusing."
+            )
         return torch.load(str(path), map_location="cpu")
 
     import numpy as np
@@ -162,8 +237,22 @@ def _load_checkpoint(torch, path: Path):
         # global we did not anticipate must still load, because the alternative
         # is a deployment whose only chord engine is dead. Logged at warning so
         # the weakening is visible rather than silent.
+        #
+        # **Gated on the hash.** This branch grants the pickle arbitrary-code
+        # rights, and "it came from a commit-pinned clone" is an argument about
+        # provenance, not a check. With the pin verified it is the file we
+        # reviewed; without, the honest answer is to fail the engine — a dead
+        # chord engine is a clean 503, and running unrecognised code to avoid one
+        # is not a trade worth making.
+        if not pinned:
+            raise BtcUnavailable(
+                f"The BTC checkpoint at {path} could not be loaded safely and does "
+                f"not match the pinned hash, so it will not be unpickled with code "
+                f"rights. Re-pull the checkout, or set "
+                f"CHORDS_BTC_CHECKPOINT_SHA256 if these weights are intended."
+            ) from None
         log.warning("BTC checkpoint needs an unlisted pickle global; loading with "
-                    "weights_only=False (source is the commit-pinned checkout)",
+                    "weights_only=False (hash-verified, commit-pinned checkout)",
                     exc_info=True)
         return torch.load(str(path), map_location="cpu", weights_only=False)
 
@@ -186,12 +275,21 @@ class BtcEngine:
         self._mean = None
         self._std = None
         self._labels = None
+        # One instance is shared for the life of the process now
+        # (`engines._cached`), so two concurrent jobs can arrive here together.
+        # Loading twice is the exact cost the cache exists to remove.
+        self._load_lock = threading.Lock()
 
     # -- lazy load ---------------------------------------------------------
 
     def _load(self):
         if self._model is not None:
             return
+        with self._load_lock:
+            if self._model is None:
+                self._load_locked()
+
+    def _load_locked(self):
         import torch
 
         root = str(self._root)
@@ -248,7 +346,7 @@ class BtcEngine:
             pcm = librosa.resample(np.asarray(pcm, dtype="float32"),
                                    orig_sr=sr, target_sr=_SAMPLE_RATE)
 
-        features = _features(np, pcm)
+        features, times_s = _features(np, pcm)
         if features.shape[0] == 0:
             return []
         features = (features - self._mean) / self._std
@@ -257,12 +355,6 @@ class BtcEngine:
         if pad:
             features = np.pad(features, ((0, pad), (0, 0)), mode="constant")
         windows = features.shape[0] // _TIMESTEP
-
-        # `_CHUNK_S / _TIMESTEP` rather than `hop / sr`: BTC's own timing derives
-        # from the crop length, and the two differ by ~0.3 ms per frame — which
-        # is nothing per frame and about a third of a second by the end of a
-        # song, i.e. exactly the sort of slow drift §13.2's anchors would show.
-        frame_s = _CHUNK_S / _TIMESTEP
 
         predictions: list[int] = []
         confidences: list[float] = []
@@ -282,35 +374,90 @@ class BtcEngine:
             predictions = predictions[:-pad]
             confidences = confidences[:-pad]
 
-        return _spans(self._labels, predictions, confidences, frame_s)
+        return _spans(self._labels, predictions, confidences, times_s)
 
 
 def _features(np, pcm):
-    """log-CQT in 10-second chunks — the training-time recipe, reproduced.
+    """log-CQT, framed in 10-second blocks. Returns `(features, frame_times_s)`.
 
-    Chunking is not an optimisation and removing it changes the answer: BTC was
-    trained on 10-second crops, and `librosa.cqt` on a whole song produces
-    slightly different low-frequency bins than on the crops it was fitted to.
+    **The blocking is BTC's framing, not a way of transforming the audio.** BTC was
+    trained on 10-second crops and its `timestep` is 108 frames, which at hop 2048
+    is exactly one 10-second block — so a block is an inference window, and the
+    block boundaries have to stay where they are.
+
+    What must *not* follow from that is transforming each block in isolation, which
+    is what this did. `librosa.cqt(..., center=True)` pads whatever it is handed, so
+    every block's first and last ~0.52 s were computed from zero-padding instead of
+    from the recording — 10% of every block, for the whole song, worst in the low
+    bins where the root is. Ten seconds of good evidence, half a second of
+    fabricated evidence, repeat.
+
+    So each block is transformed with `_context_frames()` hops of its neighbours
+    included and then **trimmed back to its own frames**. The framing is unchanged,
+    the frame count is unchanged, and every frame now sees audio. The very start of
+    the song is the one place padding remains, because there is nothing before it —
+    which is also what a whole-song CQT would do there.
+
+    The times come back alongside the features because they are **piecewise**, and
+    that is the second defect here. Frame *j* of block *b* is centred at
+    `b · 10 s + j · hop / sr`; the old code used a single `10.0 / 108` per frame,
+    which gets each block's origin right and then runs 0.287 ms/frame slow inside
+    it — a 30.7 ms sawtooth against the beat grid, resetting every block. (Using the
+    true hop *globally* is worse, not better: 108 hops span 10.031 s, so it would
+    drift a full second every hundred blocks.) Both terms are exact here.
     """
     import librosa
 
     audio = np.asarray(pcm, dtype="float32")
     step = int(_SAMPLE_RATE * _CHUNK_S)
-    blocks = []
+    context = _context_frames() * _HOP
+    hop_s = _HOP / _SAMPLE_RATE
+
+    blocks: list = []
+    times: list[float] = []
     for start in range(0, len(audio), step):
-        block = audio[start:start + step]
-        if len(block) == 0:
+        block_len = min(step, len(audio) - start)
+        if block_len <= 0:
             continue
-        blocks.append(librosa.cqt(block, sr=_SAMPLE_RATE, n_bins=_N_BINS,
-                                  bins_per_octave=_BINS_PER_OCTAVE, hop_length=_HOP))
+        low = max(0, start - context)
+        high = min(len(audio), start + block_len + context)
+        spectrum = librosa.cqt(audio[low:high], sr=_SAMPLE_RATE, n_bins=_N_BINS,
+                               bins_per_octave=_BINS_PER_OCTAVE, hop_length=_HOP)
+        # `center=True` centres frame k of this slice at sample `low + k · hop`, and
+        # `start - low` is a whole number of hops by construction — so the block's
+        # own frames start at exactly this offset and there is no resampling of the
+        # time base.
+        offset = (start - low) // _HOP
+        frames = min(1 + block_len // _HOP, spectrum.shape[1] - offset)
+        if frames <= 0:
+            continue
+        blocks.append(spectrum[:, offset:offset + frames])
+        block_origin_s = start / _SAMPLE_RATE
+        times.extend(block_origin_s + j * hop_s for j in range(frames))
+
     if not blocks:
-        return np.zeros((0, _N_BINS), dtype="float32")
+        return np.zeros((0, _N_BINS), dtype="float32"), []
     spectrum = np.concatenate(blocks, axis=1)
-    return np.log(np.abs(spectrum) + 1e-6).T.astype("float32")
+    return np.log(np.abs(spectrum) + 1e-6).T.astype("float32"), times
 
 
-def _spans(labels, predictions, confidences, frame_s: float) -> list[RawChordSpan]:
-    """Runs of one predicted index → one span, mean probability as confidence."""
+def _spans(labels, predictions, confidences, times_s) -> list[RawChordSpan]:
+    """Runs of one predicted index → one span, mean probability as confidence.
+
+    Times come from `times_s` rather than from `index × frame_length`: the frame
+    grid is piecewise (see `_features`), so there is no single frame length that is
+    right everywhere in the song.
+    """
+    if not times_s:
+        return []
+    hop_s = _HOP / _SAMPLE_RATE
+
+    def at(index: int) -> float:
+        if index < len(times_s):
+            return times_s[index]
+        # One frame past the end — the close of the final span.
+        return times_s[-1] + hop_s
+
     spans: list[RawChordSpan] = []
     start = 0
     for index in range(1, len(predictions) + 1):
@@ -318,8 +465,8 @@ def _spans(labels, predictions, confidences, frame_s: float) -> list[RawChordSpa
             continue
         window = confidences[start:index]
         spans.append(RawChordSpan(
-            start_ms=int(round(start * frame_s * 1000)),
-            end_ms=int(round(index * frame_s * 1000)),
+            start_ms=int(round(at(start) * 1000)),
+            end_ms=int(round(at(index) * 1000)),
             label=labels[predictions[start]],
             confidence=float(sum(window) / len(window)) if window else 0.0,
         ))

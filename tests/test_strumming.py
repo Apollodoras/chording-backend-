@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from app.analysis.strumming import (
     CONVENTION_TAGS,
+    SNAPPED_TAG,
     beat_position,
     choose_subdivision,
     direction_for,
@@ -310,11 +311,34 @@ def test_an_extraction_one_cell_short_of_an_idiom_is_snapped_onto_it():
     """The direct answer to "patterns should be more musical", and the same
     measure-then-snap discipline `vocabulary.SNAP_TO` follows for chords: an
     extraction that lands a cell short of D-DU-UD-U almost certainly *is*
-    D-DU-UD-U with one stroke under the support threshold."""
+    D-DU-UD-U with one stroke under the support threshold.
+
+    "Under the support threshold" is the load-bearing half, and it is now what
+    the fixture actually builds: the 3.5 is played in five bars of sixteen, which
+    is real evidence that misses `SUPPORT_THRESHOLD`. The rule used to fire with
+    the cell **empty**, which is not this claim — see the test below.
+    """
     short = [(bar, position, 1.0) for bar in range(16)
              for position in (0.0, 1.0, 1.5, 2.5, 3.0)]
+    short += [(bar, 3.5, 1.0) for bar in range(5)]
     result = extract(short, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
     assert [s.beat for s in result.pattern.strokes] == DDUUDU
+
+
+def test_the_library_never_adds_a_stroke_the_recording_does_not_show():
+    """A groove with a hole in it keeps the hole.
+
+    Nothing on beat 3 — an ordinary thing to play, and the nearest idiom is the
+    campfire pattern *with* beat 3 in it. Taking the entry whole would hand the
+    player a stroke they had pointedly not played, which is the opposite of what
+    a chart is for, and it is what `snap_to_idiom`'s own docstring already
+    forbade ("a correction and never an invention") while the code did it anyway.
+    """
+    holed = [(bar, position, 1.0) for bar in range(16)
+             for position in (0.0, 1.0, 1.5, 2.5, 3.5)]
+    result = extract(holed, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
+    assert [s.beat for s in result.pattern.strokes] == [0.0, 1.0, 1.5, 2.5, 3.5]
+    assert SNAPPED_TAG not in result.pattern.tags
 
 
 def test_a_snapped_pattern_says_so_out_loud():
@@ -322,6 +346,7 @@ def test_a_snapped_pattern_says_so_out_loud():
     as which of the two it is — the rule the direction tags already follow."""
     short = [(bar, position, 1.0) for bar in range(16)
              for position in (0.0, 1.0, 1.5, 2.5, 3.0)]
+    short += [(bar, 3.5, 1.0) for bar in range(5)]      # under the threshold, not absent
     snapped = extract(short, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
     measured = extract([(bar, p, 1.0) for bar in range(16) for p in DDUUDU],
                        bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
@@ -338,3 +363,47 @@ def test_a_groove_that_is_nothing_like_an_idiom_is_left_as_measured():
     result = extract(folded, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
     assert [s.beat for s in result.pattern.strokes] == list(positions)
     assert "snapped-to-idiom" not in result.pattern.tags
+
+
+def test_a_syncopation_the_player_varies_survives_the_averaging():
+    """The audit's open question about §14, and the second half of "the patterns
+    aren't rhythmic".
+
+    A human does not play the same bar sixteen times. Here the "&" of 2 lands in
+    half the bars and the "&" of 4 in the other half, so each sits exactly on
+    `SUPPORT_THRESHOLD` while the groove is unmistakably syncopated. Both used to
+    be cut — support passed them and contrast then charged them a second time for
+    the same fact, because `prominence` folds support back in as a multiplier —
+    and what came out was `0 1 2.5 3`: the metronome underneath the groove.
+
+    One pattern per repeat group is §14's design, so the honest answer for a
+    section played two ways is the union of them, and `confidence` is what says
+    the section was less consistent than the others. It reports about 0.8 here
+    against 0.99 for a groove played the same way every bar.
+    """
+    folded = []
+    for bar in range(16):
+        played = (0.0, 1.0, 1.5, 2.5, 3.0) if bar % 2 == 0 else (0.0, 1.0, 2.5, 3.0, 3.5)
+        folded += [(bar, position, 1.0) for position in played]
+    result = extract(folded, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
+    assert [s.beat for s in result.pattern.strokes] == DDUUDU
+    assert result.confidence < 0.9, "and it says the section was played two ways"
+
+
+def test_a_quiet_hi_hat_is_still_cut_on_a_grid_where_everything_is_struck():
+    """The other side of the same rule, and why the condition is the grid's
+    *sparsity* rather than a loudness threshold.
+
+    A real upstroke played in half the bars reaches 0.335 of the bar's loudest
+    cell and a hi-hat reaches 0.359, so no contrast threshold separates them.
+    What separates them is that a rhythm leaves cells empty and a hi-hat does
+    not: this grid has an onset on every eighth, so support is telling us
+    nothing, no relief applies, and loudness decides — which is the full-mix
+    behaviour `test_a_kit_behind_the_guitar_does_not_become_the_pattern` pins.
+    """
+    saturated = drum_kit()
+    scored_positions = {round(position, 3) for _, position, _ in saturated}
+    assert scored_positions == {0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5}, \
+        "every cell of the grid carries an onset — support cannot discriminate"
+    result = extract(saturated, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
+    assert [s.beat for s in result.pattern.strokes] == DDUUDU

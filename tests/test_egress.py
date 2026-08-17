@@ -151,22 +151,33 @@ def test_no_proxy_argument_when_unset(monkeypatch):
 
 # --- the sticky session ------------------------------------------------------
 
-def test_each_invocation_gets_its_own_session(monkeypatch):
-    """Sticky *within* a fetch, fresh *between* fetches.
+def test_one_session_serves_a_whole_analysis(monkeypatch):
+    """Sticky across probe **and** fetch, fresh between analyses.
 
-    Both halves matter. One address for the life of one yt-dlp invocation is what
-    stops the 403 (`MediaUrlRefused`); a *new* address next time is what gives
-    `EgressBlocked` somewhere to retry into. Pinning one session in the credential
-    would buy the first and destroy the second.
+    Both halves matter, and the unit is the *analysis*, not the subprocess.
+
+    One address for the whole analysis buys two things. A googlevideo media URL is
+    bound to the IP that resolved it, so resolving on one address and downloading
+    from another is the 403 `MediaUrlRefused` documents. And the bot check is per
+    IP: a job needs both calls to get through, so two independent draws is two
+    chances to be refused (`1 − p²`), not one.
+
+    A *new* address next time is what gives `EgressBlocked` somewhere to retry
+    into. Pinning one session in the credential would buy the first and destroy the
+    second.
     """
     monkeypatch.setenv("CHORDS_YTDLP_PROXY", "http://user:pass@proxy.example:8080")
     source = ytdlp_source.YtDlpSource()
 
-    first = _proxy_arg(source._common_args())
-    second = _proxy_arg(source._common_args())
+    source._new_session()
+    probe_args = _proxy_arg(source._common_args())
+    fetch_args = _proxy_arg(source._common_args())
+    assert probe_args == fetch_args, "probe and fetch must leave from one address"
+    assert "_lifetime-10m" in probe_args
 
-    assert first != second, "two fetches must not share one egress address"
-    assert "_lifetime-10m" in first
+    source._new_session()
+    assert _proxy_arg(source._common_args()) != probe_args, \
+        "a second analysis must draw a fresh address, or a retry retries nothing"
 
 
 def test_a_session_the_operator_pinned_is_left_alone(monkeypatch):

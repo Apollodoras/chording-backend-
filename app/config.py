@@ -70,6 +70,13 @@ class Settings:
     # wrong.
     rate_limit_poll_per_min: int = 0
     rate_limit_window_s: float = 60.0
+    # How many proxy hops in front of this service are **ours**, i.e. how far from
+    # the right of `X-Forwarded-For` the real client address is. 1 is today's
+    # deployment (Modal's own proxy) and today's behaviour. See
+    # `main.client_ip` for what getting it wrong costs in each direction —
+    # too low and every caller shares one bucket, too high and a caller can
+    # forge their own.
+    trusted_proxy_hops: int = 1
 
     # --- Admin (§3 takedown intake) ------------------------------------------
     # A shared secret for /v1/admin/*. Unset ⇒ the admin routes answer 503 and
@@ -80,9 +87,53 @@ class Settings:
 
     # --- Analysis ------------------------------------------------------------
     max_video_seconds: int = DEFAULT_MAX_VIDEO_SECONDS
-    # Hard wall-clock budget for one job (§5.1 suggests 180 s). Breaching it
-    # kills the job and cleans the scratch dir.
-    job_deadline_s: float = 180.0
+
+    # --- The time budget, which has to add up ---------------------------------
+    #
+    # These five numbers describe one job's wall clock, and they used to
+    # contradict each other in every direction. The job deadline was 180 s while
+    # the fetch stage alone was allowed 240 s; the three subprocess ceilings summed
+    # to 405 s while the Modal worker was killed at 300 s. Each number was
+    # defensible on its own and the set was not, and the failure it produced is the
+    # worst-shaped one available: a *slow but successful* fetch got the container
+    # SIGKILLed with no terminal status written, so the job sat in `analyzing`
+    # until the 900 s lease reaper found it — fifteen minutes of a player watching
+    # a spinner for an analysis that had been working.
+    #
+    # The invariant, asserted by `tests/test_deployment.py` rather than left as
+    # prose:
+    #
+    #     probe + fetch + decode + dsp_reserve  ≤  job_deadline_s
+    #                                              < the container's own timeout
+    #                                              < the store's job lease
+    #
+    # Read outward: the stages fit inside the deadline, so the deadline is what
+    # fails a slow job — with a terminal status, a message, and a refund. The
+    # container timeout is strictly larger, so it only ever fires for something the
+    # deadline cannot see (a hang inside pure compute, which no in-process check
+    # can interrupt). The lease is larger again, and is the backstop for a
+    # container that died without writing anything at all.
+    #
+    # `job_deadline_s` is 450 rather than §5.1's suggested 180 because 180 is not a
+    # budget a real analysis fits in: 10 minutes of audio has to be fetched,
+    # decoded and run through two neural models. A typical job finishes in a small
+    # fraction of this; the number is a ceiling on the pathological case, and the
+    # cost of it being generous is paid only by jobs that were going to fail.
+    job_deadline_s: float = 450.0
+    # Metadata lookup — one yt-dlp call with `--skip-download`, or one ffprobe on
+    # an upload. Short on purpose: the gate depends on it, so a video that cannot
+    # be looked up quickly should be refused rather than waited on.
+    probe_timeout_s: float = 45.0
+    # The download. A 10-minute audio-only stream is a few MB; a fetch still
+    # running after two minutes is a stream that is not going to arrive.
+    fetch_timeout_s: float = 120.0
+    # ffmpeg to mono 22.05 kHz PCM. CPU-bound and roughly linear in duration.
+    decode_timeout_s: float = 90.0
+    # Headroom kept for everything after the audio: two models, the theory layer,
+    # the compiler, the lint. Not enforced anywhere — it is the term that makes the
+    # inequality above meaningful, and the thing that shrinks if a stage ceiling
+    # grows.
+    dsp_reserve_s: float = 180.0
     # Where decoded audio may live for the seconds it exists. MUST be a tmpfs
     # mount in the worker (§4: `--read-only` + an explicit tmpfs for scratch).
     # app/analysis/scratch.py refuses to run if this looks durable.
@@ -106,6 +157,15 @@ class Settings:
     # or a mistake the engine made identically in every pass. Measured the same
     # way, by `bench/run_bench.py --theory`.
     theory_vocabulary: bool = True
+    # §20.9 — let belief settle a repeated slot the *count* cannot: a tie between
+    # two readings, or a plurality that points the other way from the confidence.
+    # A flag for the same reason as the two above, and it is the third face of
+    # the same job — but it is the one that answers the complaint those two were
+    # reported for and did not fix ("the engine adds variants and the song ends
+    # up with more chords than it has"), because that complaint is a *tie*: the
+    # engine hears the seventh in half the passes, so no majority forms, and
+    # nothing in §20.4 or §20.8 has anything to count.
+    theory_belief: bool = True
     # §20.2 — let a tempo that reads an octave out be halved (or doubled) instead
     # of only reported. **Off** by default, and for the opposite reason to
     # `theory_consensus`: this one is unmeasured. Correcting the octave rewrites
@@ -126,12 +186,41 @@ class Settings:
     # a guess: `engines.is_ready()` checks the registry, not this string.
     chord_engine: str | None = "btc"
     beat_tracker: str | None = "beat_this"
+    # Which onset detector feeds §14's strumming extraction, and this one is a
+    # *musical* choice rather than an accuracy one. `harmonic` reads the attacks
+    # off the harmonic component, so the drums stop voting on what the guitarist
+    # played; `librosa` reads the full mix, which is right for a solo recording
+    # and is what turns a groove into straight eighths on anything else.
+    # `bench/run_bench.py --strum` is where the default comes from: on the kit
+    # specimens the full-mix detector emits every eighth, including a beat the
+    # guitar never touches.
+    onset_detector: str | None = "harmonic"
+    # §15's section *names*, which need a loudness envelope to find. Off means
+    # every section is `Part N` and nothing else changes — the chart, the bars and
+    # the sidecar are all identical either way (see `pipeline.analyze`).
+    #
+    # This flag was read by `engines.build_structure_probe` via
+    # `getattr(settings, "structure_probe", True)` and `Settings` had no such
+    # field, so the knob was a permanent no-op: the probe could not be turned off,
+    # and a `getattr` default is indistinguishable from a working setting at every
+    # call site. Declaring it is the fix; the `getattr` can go.
+    structure_probe: bool = True
 
     cors_allow_origins: str = ""
 
     @property
     def has_admin(self) -> bool:
         return bool(self.admin_token)
+
+    @property
+    def stage_budget_s(self) -> float:
+        """What one job is allowed to spend before the deadline must have fired.
+
+        The sum the invariant above is about. A property rather than a constant so
+        it stays true when a deployment moves one of the parts.
+        """
+        return (self.probe_timeout_s + self.fetch_timeout_s
+                + self.decode_timeout_s + self.dsp_reserve_s)
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -183,15 +272,23 @@ def load_settings() -> Settings:
         rate_limit_ip_per_min=int(os.environ.get("CHORDS_RATE_LIMIT_IP_PER_MIN", "0")),
         rate_limit_poll_per_min=_poll_limit(),
         rate_limit_window_s=float(os.environ.get("CHORDS_RATE_LIMIT_WINDOW_S", "60")),
+        trusted_proxy_hops=int(os.environ.get("CHORDS_TRUSTED_PROXY_HOPS", "1")),
         admin_token=os.environ.get("CHORDS_ADMIN_TOKEN") or None,
         max_video_seconds=int(os.environ.get("CHORDS_MAX_VIDEO_SECONDS", str(DEFAULT_MAX_VIDEO_SECONDS))),
-        job_deadline_s=float(os.environ.get("CHORDS_JOB_DEADLINE_S", "180")),
+        job_deadline_s=float(os.environ.get("CHORDS_JOB_DEADLINE_S", "450")),
+        probe_timeout_s=float(os.environ.get("CHORDS_PROBE_TIMEOUT_S", "45")),
+        fetch_timeout_s=float(os.environ.get("CHORDS_FETCH_TIMEOUT_S", "120")),
+        decode_timeout_s=float(os.environ.get("CHORDS_DECODE_TIMEOUT_S", "90")),
+        dsp_reserve_s=float(os.environ.get("CHORDS_DSP_RESERVE_S", "180")),
         scratch_root=os.environ.get("CHORDS_SCRATCH_ROOT", "/tmp/chords-scratch"),
         confidence_floor=float(os.environ.get("CHORDS_CONFIDENCE_FLOOR", "0.5")),
         theory_consensus=_bool("CHORDS_THEORY_CONSENSUS", True),
         theory_vocabulary=_bool("CHORDS_THEORY_VOCABULARY", True),
+        theory_belief=_bool("CHORDS_THEORY_BELIEF", True),
         theory_tempo_octave=_bool("CHORDS_THEORY_TEMPO_OCTAVE", False),
         chord_engine=os.environ.get("CHORDS_CHORD_ENGINE") or "btc",
         beat_tracker=os.environ.get("CHORDS_BEAT_TRACKER") or "beat_this",
+        onset_detector=os.environ.get("CHORDS_ONSET_DETECTOR") or "harmonic",
+        structure_probe=_bool("CHORDS_STRUCTURE_PROBE", True),
         cors_allow_origins=os.environ.get("CHORDS_CORS_ORIGINS", ""),
     )

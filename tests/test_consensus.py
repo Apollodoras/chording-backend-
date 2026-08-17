@@ -34,7 +34,7 @@ from app.analysis.form import RepeatGroup, detect
 from app.analysis.strumming import SUPPORT_THRESHOLD
 from app.analysis.structure import BarChord
 from app.analysis.types import Onset
-from app.chords import MAJOR, MINOR
+from app.chords import MAJOR, MINOR, MINOR7
 
 C, D, E, F, G, A = 0, 2, 4, 5, 7, 9
 
@@ -269,3 +269,131 @@ def test_voting_lets_a_noisy_repeat_collapse_into_repeats():
     voted, _ = consensus.apply(bars, detect(bars, bar_beats=4.0)[1], bar_beats=4.0)
     after = detect(voted, bar_beats=4.0)[0]
     assert len(after) == 1 and after[0].repeats == 4
+
+
+# --- §20.9: the slots the count cannot decide --------------------------------
+#
+# The user-visible complaint these answer: "the engine adds variants to a chord
+# and the song ends up with more chords than it has". That complaint is a *tie*.
+# BTC hears the seventh in roughly half the passes of a section, so no plurality
+# ever forms, gate 1 files every one of those slots as contested, and both
+# readings ship. `vocabulary.snap` cannot reach them either — it wants a 6:1 mass
+# ratio and no more than `MAX_OCCASIONS` sightings, and a variant heard in four
+# passes of eight is neither rare nor lopsided.
+
+def test_a_tie_between_two_spellings_is_settled_by_which_was_believed():
+    """Four passes read Em, four read Em7, and the vote has nothing to count.
+
+    The seventh is the note the recognizer is least sure it heard, and here it
+    says so: the plain readings carry 0.8 and the sevenths 0.6. That gap is the
+    only evidence in the slot that was not copied along with the mistake — four
+    passes of a doubled guitar part confuse BTC four times identically, so the
+    repetition the vote runs on is four copies of one error.
+    """
+    bars = []
+    for pass_index in range(8):
+        seventh = pass_index % 2 == 1
+        bars += [bar(G), bar(D),
+                 bar(E, MINOR7 if seventh else MINOR,
+                     confidence=0.6 if seventh else 0.8),
+                 bar(C)]
+
+    voted, report = consensus.apply(bars, [group(*range(0, 32, 4))], bar_beats=4.0)
+    assert {b[0].quality for b in voted[2::4]} == {MINOR}, "Em7 should be gone"
+    assert report.weighed_bars == 4 and report.contested_bars == 0
+
+
+def test_belief_may_overrule_a_plurality_that_points_the_other_way():
+    """Five hesitant sevenths against three confident triads.
+
+    The count says Em7 and the confidences say Em. Gate 3 refuses the count's
+    answer — correctly — and before §20.9 that left both readings in the chart.
+    """
+    bars = []
+    for pass_index in range(8):
+        seventh = pass_index >= 3
+        bars += [bar(G), bar(D),
+                 bar(E, MINOR7 if seventh else MINOR,
+                     confidence=0.62 if seventh else 0.79),
+                 bar(C)]
+
+    voted, report = consensus.apply(bars, [group(*range(0, 32, 4))], bar_beats=4.0)
+    assert {b[0].quality for b in voted[2::4]} == {MINOR}
+    assert report.weighed_bars == 5
+
+
+def test_belief_never_grows_a_seventh_onto_a_triad():
+    """The direction is `vocabulary.SNAP_TO`'s, which is measured rather than
+    reasoned: a reported seventh is the plain triad about twice as often as it is
+    a seventh, and nothing in the corpus supports the move the other way. So a
+    confident Em7 against a doubtful Em leaves both alone rather than spreading
+    the seventh across the song."""
+    bars = []
+    for pass_index in range(8):
+        seventh = pass_index % 2 == 1
+        bars += [bar(G), bar(D),
+                 bar(E, MINOR7 if seventh else MINOR,
+                     confidence=0.85 if seventh else 0.55),
+                 bar(C)]
+
+    voted, report = consensus.apply(bars, [group(*range(0, 32, 4))], bar_beats=4.0)
+    assert {b[0].quality for b in voted[2::4]} == {MINOR, MINOR7}
+    assert report.weighed_bars == 0 and report.contested_bars == 1
+
+
+def test_belief_never_moves_a_root_however_sure_it_is():
+    """The gate that makes the extra power safe.
+
+    A recognizer wobbling over colour leaves the roots and the barlines exactly
+    where they were; music that changes moves one of them. So a slot where a
+    *root* differs is never shown to the belief reduction at all, whatever the
+    confidences say.
+
+    Set up as the tie §20.9 is otherwise allowed to settle — four passes against
+    four, the minority believed far less — differing this time in the root. The
+    count refuses it (no plurality) and belief must refuse it too, so the slot
+    stays contested and both readings survive.
+    """
+    bars = []
+    for pass_index in range(8):
+        wandered = pass_index % 2 == 1
+        bars += [bar(G), bar(D), bar(E, MINOR),
+                 bar(A if wandered else C, MINOR if wandered else MAJOR,
+                     confidence=0.3 if wandered else 0.9)]
+
+    voted, report = consensus.apply(bars, [group(*range(0, 32, 4))], bar_beats=4.0)
+    assert voted == bars, "a root may never be voted away by confidence alone"
+    assert report.weighed_bars == 0 and report.contested_bars == 1
+
+
+def test_belief_is_a_no_op_on_perfect_input():
+    """The property every layer in §20 is judged by, inherited here by
+    construction: ground truth arrives at a flat confidence of 1.0, so no reading
+    is ever *less believed* than another and gate C can never open. Asserted on
+    the shape §20.9 exists for — an even split that the count also refuses."""
+    bars = []
+    for pass_index in range(8):
+        seventh = pass_index % 2 == 1
+        bars += [bar(G), bar(D), bar(E, MINOR7 if seventh else MINOR), bar(C)]
+
+    voted, report = consensus.apply(bars, [group(*range(0, 32, 4))], bar_beats=4.0)
+    assert voted == bars
+    assert report.rewritten_bars == 0 and report.weighed_bars == 0
+
+
+def test_the_belief_reduction_can_be_turned_off():
+    """`CHORDS_THEORY_BELIEF=off`, the same posture the other two layers support.
+    With it off the slot stays contested, which is this module's behaviour before
+    §20.9."""
+    bars = []
+    for pass_index in range(8):
+        seventh = pass_index % 2 == 1
+        bars += [bar(G), bar(D),
+                 bar(E, MINOR7 if seventh else MINOR,
+                     confidence=0.6 if seventh else 0.8),
+                 bar(C)]
+
+    voted, report = consensus.apply(bars, [group(*range(0, 32, 4))],
+                                    bar_beats=4.0, weigh=False)
+    assert voted == bars
+    assert report.weighed_bars == 0 and report.contested_bars == 1

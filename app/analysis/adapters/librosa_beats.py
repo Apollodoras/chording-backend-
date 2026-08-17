@@ -121,8 +121,72 @@ def _zscore(np, values):
     return (values - float(values.mean())) / spread
 
 
+class HarmonicOnsetDetector:
+    """`OnsetDetector` — §14's raw material, read off the **harmonic** component.
+
+    The default, and the answer to "the strumming patterns aren't rhythmic". The
+    full-mix detector below asks "did anything strike here", and on a produced
+    record the answer is yes on every eighth, because that is what a hi-hat is
+    for. §14 then folds those onsets onto one bar, every cell clears the support
+    threshold, and the groove the player actually played comes out as
+    machine-gun eighths. Measured on `bench/run_bench.py --strum`, which renders
+    a D-DU-UD-U strum under a kit: the full-mix detector emits all eight eighths
+    on every kit specimen, including a beat the guitar demonstrably never
+    touched.
+
+    So the question is changed from "did anything strike here" to **"was a chord
+    struck here"**, and HPSS is what separates them. A strum re-excites the
+    strings, so its energy is pitched and survives into the harmonic component; a
+    kick, a snare and a hat are broadband transients and do not. On the same
+    specimens the drum-only cells come back with support **0.00** rather than
+    1.00 — not attenuated, *absent* — which is what makes the support number
+    downstream mean "the player struck this in every bar" again.
+
+    **`margin=1.0` is measured, not chosen for being the default.** The
+    separation gets *worse* above it, and fast: at 2.0 the loud-kit specimen
+    starts losing real strokes, and by 3.0 every specimen picks up spurious
+    onsets around 2.667 and 3.667 — the envelope has been smeared enough that
+    peak-picking finds artifacts of the separation rather than the playing.
+    Running the onset envelope over a CQT of the harmonic part (tried, on the
+    theory that pitched attacks would stand out further) is worse still, for the
+    same reason.
+
+    What this cannot do is separate a guitar from a piano, an organ or a voice —
+    they are all harmonic, and all of them are supposed to be here anyway, since
+    §14 is transcribing *the song's* rhythm and not one instrument's. The claim
+    is only the one the measurement supports: the drums stop voting.
+
+    **It costs about 11 seconds more than the full-mix detector on a four-minute
+    track** (13.3s against 2.0s, measured at 22.05 kHz), because HPSS is a pair
+    of median filters over the whole spectrogram. That is affordable against
+    `dsp_reserve_s`, and it is worth naming rather than discovering: this is the
+    most expensive thing in §14 by an order of magnitude, and a shorter deadline
+    is the first place it would show up.
+    """
+
+    name = "harmonic"
+    version = "1.0"
+
+    # librosa's own default is 1.0; named here because it is a measurement and
+    # not an inherited default — see the class docstring for what 2.0 and 3.0 do.
+    margin = 1.0
+
+    def detect(self, pcm: PCM, sr: int) -> list[Onset]:
+        import librosa
+
+        harmonic = librosa.effects.harmonic(pcm, margin=self.margin)
+        envelope = librosa.onset.onset_strength(y=harmonic, sr=sr, hop_length=HOP)
+        return _peaks(envelope, sr)
+
+
 class LibrosaOnsetDetector:
-    """`OnsetDetector` — §14's raw material.
+    """`OnsetDetector` on the **full mix** — every attack, whatever made it.
+
+    Kept registered and selectable (`CHORDS_ONSET_DETECTOR=librosa`) rather than
+    deleted, because it is the right answer for a recording that *is* one
+    instrument and it is the baseline the harmonic detector is measured against.
+    It is not the default: on anything with drums on it, this is the detector
+    that hands §14 a wall of eighths.
 
     Separate from the beat tracker because they answer different questions: the
     grid says where the pulse is, this says where a hand actually struck. A song
@@ -136,22 +200,29 @@ class LibrosaOnsetDetector:
         import librosa
 
         envelope = librosa.onset.onset_strength(y=pcm, sr=sr, hop_length=HOP)
-        # `backtrack=False` on purpose. Backtracking rolls each detection back to
-        # the preceding energy minimum, which is what you want when slicing audio
-        # into samples and wrong when you want the time a hand struck: it moves
-        # every onset earlier, by an amount that depends on the attack's shape.
-        # §14 folds these onto a bar, so a systematic early bias is not noise
-        # that averages out — it walks the whole pattern off the grid, and the
-        # downbeat (the one cell with a bar boundary in front of it) off first.
-        frames = librosa.onset.onset_detect(
-            onset_envelope=envelope, sr=sr, hop_length=HOP, backtrack=False
-        )
-        if len(frames) == 0:
-            return []
-        times = librosa.frames_to_time(frames, sr=sr, hop_length=HOP)
-        peak = float(envelope.max()) or 1.0
-        return [
-            Onset(t_ms=int(round(t * 1000)),
-                  strength=float(envelope[min(int(f), len(envelope) - 1)] / peak))
-            for f, t in zip(frames, times)
-        ]
+        return _peaks(envelope, sr)
+
+
+def _peaks(envelope, sr: int) -> list[Onset]:
+    """An onset-strength envelope → the attacks in it."""
+    import librosa
+
+    # `backtrack=False` on purpose. Backtracking rolls each detection back to the
+    # preceding energy minimum, which is what you want when slicing audio into
+    # samples and wrong when you want the time a hand struck: it moves every
+    # onset earlier, by an amount that depends on the attack's shape. §14 folds
+    # these onto a bar, so a systematic early bias is not noise that averages out
+    # — it walks the whole pattern off the grid, and the downbeat (the one cell
+    # with a bar boundary in front of it) off first.
+    frames = librosa.onset.onset_detect(
+        onset_envelope=envelope, sr=sr, hop_length=HOP, backtrack=False
+    )
+    if len(frames) == 0:
+        return []
+    times = librosa.frames_to_time(frames, sr=sr, hop_length=HOP)
+    peak = float(envelope.max()) or 1.0
+    return [
+        Onset(t_ms=int(round(t * 1000)),
+              strength=float(envelope[min(int(f), len(envelope) - 1)] / peak))
+        for f, t in zip(frames, times)
+    ]

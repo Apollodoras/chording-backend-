@@ -19,7 +19,7 @@ mirrors deliberately — §16).
 
 **Working end to end, in the deployed shape, and now measured on the thing that
 actually matters.** A YouTube id (or an uploaded file) goes in; a linted
-`CompositionPayload` v2 and a `videoSync` sidecar come out. 511 tests, green, no
+`CompositionPayload` v2 and a `videoSync` sidecar come out. 619 tests, green, no
 audio and no network required to run them.
 
 That last clause is new and it was the important one. Every number this repo
@@ -58,6 +58,7 @@ App Review 5.2.3 stays a non-event — is [`RIGHTS.md`](RIGHTS.md).
 | CI | ✅ suite, Postgres, fixture stability, and a test that the API image cannot touch audio |
 | Deploy gate | ✅ `scripts/smoke.py` — `/healthz` audit, one real analysis, and a proof that the cache hit is free |
 | Seeded catalog | ⚠️ `scripts/seed_catalog.py` — 12 known songs graded against published transcriptions: 9 correct, 1 mostly, **1 wrong, 1 unanalyzable** ([below](#what-the-seeded-catalog-says)) |
+| Service audit (2026-08-17) | ✅ four ship blockers, four performance findings, two audio-accuracy findings and fourteen smaller ones — all fixed, with the measurements ([below](#the-service-audit-2026-08-17)) |
 
 One real analysis, start to finish, on this machine:
 
@@ -103,6 +104,18 @@ curl -s localhost:8000/healthz | python3 -m json.tool
 mode, store backend, kill-switch state, whether a fetch source exists, which
 engines are installed. A green health check that hides a dead authenticator is
 the failure the Mo backend learned from.
+
+It describes **the container answering it**, which on the deployed two-container
+shape is the API image — correctly no fetch and no engines (§4). `canAnalyze`
+comes from the *runner*, which answers from the deployment's shape, so the page
+reads `canAnalyze: true` beside `engines: {}`; the `runner` field names which
+runner said so, because otherwise that looks like the endpoint contradicting
+itself rather than one page describing two containers. What it genuinely could not
+see was a **worker image that built without an engine** — the API comes up, healthz
+stays green, and every job fails one poll later in the chord stage.
+`GET /v1/admin/worker` closes that: admin-gated, because it costs a worker cold
+start, and a liveness probe that starts a container per check is a different kind
+of problem.
 
 ---
 
@@ -356,8 +369,8 @@ an engine that says `Cmaj9` and one that says `Cmaj7` play identically here.
 
 | chord engine | real acc | root only | synthetic | s/track |
 |---|---|---|---|---|
-| **btc** | **0.805** | 0.886 | 0.876 | 10.3 |
-| chroma (control) | 0.531 | 0.702 | 0.895 | 30.5 |
+| **btc** | **0.808** | 0.888 | 0.876 | 1.7 |
+| chroma (control) | 0.531 | 0.702 | 0.895 | 8.8 |
 
 | beat tracker | beat F | **downbeat F** | bpm err | s/track |
 |---|---|---|---|---|
@@ -384,10 +397,51 @@ with the *chart*; it cannot catch a grid that is internally consistent and
 disagrees with the *music*. Choosing on that number would have picked the worse
 tracker for the reason it was worse.
 
-Cost: ~47 s of DSP for a 3-minute song on CPU, against a 180 s job deadline. BTC
+Cost: ~10 s of DSP for a 3-minute song on CPU, against a 450 s job deadline. BTC
 on a GPU was not pursued — §18 anticipated that a GPU cold start per job may cost
-more latency than the accuracy gap costs quality, and at 10 s/track on CPU there
-is nothing to buy.
+more latency than the accuracy gap costs quality, and at these numbers there is
+nothing to buy. (The `s/track` figures above are lower than the ones first
+recorded here because the engines are now built once per container rather than per
+job; see below.)
+
+#### The feature extractor's block edges (fixed 2026-08-17)
+
+BTC's 10-second blocks are its **framing** — `timestep` is 108 frames, which at hop
+2048 is exactly one 10-second block, so a block *is* one inference window. What did
+not follow from that, and was being done anyway, is transforming each block in
+isolation. `librosa.cqt(..., center=True)` pads whatever it is handed, and at 24
+bins per octave the lowest bin's analysis window is ~1.04 s — so roughly 0.52 s at
+each block edge was computed from zero-padding rather than from the recording.
+About 10% of every block, for the whole song, worst in the bass where the root is.
+
+Each block now gets seven hops of its neighbours' audio and is trimmed back to its
+own frames: same framing, same 108 frames, every frame real audio. Against a single
+CQT over the whole signal as ground truth, mean absolute error in the bottom two
+octaves:
+
+| | block edges | block interiors |
+|---|---|---|
+| isolated blocks | 1.73 | 0.25 |
+| with context, trimmed | **0.24** | 0.25 |
+
+Frame *times* were wrong in a second, separate way: frame *j* of block *b* is
+centred at `b · 10 s + j · hop / sr`, and the code used a single `10.0 / 108` per
+frame — right about each block's origin, then 0.287 ms/frame slow inside it, a
+**30.7 ms sawtooth** against the beat grid that reset every block. (Using the true
+hop *globally* is worse, not better: 108 hops span 10.031 s, so it would drift a
+full second every hundred blocks.) Both terms are now exact, which is why the times
+are built where the block structure is known instead of derived from a frame index.
+
+**And the honest part: downstream this is worth very little.** Raw chord accuracy
+on the real corpus goes 0.805 → 0.808, with 8 of 9 tracks non-negative;
+*delivered* accuracy — the chord actually on screen — does not move at all
+(0.793 → 0.794). BTC's self-attention runs over all 108 frames of a window, so it
+absorbs a couple of degraded frames at each edge, and the chord at a block seam is
+usually the same chord as on either side of it. The defect was real and is
+measurable in feature space; the fix is strictly more correct and slightly *faster*
+(12.1 s vs 13.6 s over the corpus), and it is not an accuracy win. Keeping it is
+about the frame grid being true — the sawtooth is an alignment error, and alignment
+is what §13.2's anchors are for.
 
 ### Adding another candidate
 
@@ -440,16 +494,28 @@ GET /v1/catalog/version  ──► "<count>:<newest analyzed_at>"
 **The catalog is what makes the app's home screen exist** (added 2026-08-06). It
 lists every analyzed song, newest first, so a player who has analyzed nothing
 still has something to play — the cold-start problem solved by sharing, since
-every row is a cache hit and costs no quota, no egress and no wait. Three things
+every row is a cache hit and costs no quota, no egress and no wait. Four things
 about it are load-bearing:
 
+- **Uploads are excluded** (`owner_uid IS NULL`, added 2026-08-17). Uploaded audio
+  lands in the same `chord_maps` table as a fetched video, and nothing
+  distinguished the two — so one player's private rehearsal recording appeared on
+  every other player's home screen, under their own filename, with their chart,
+  key and tempo. The row was functionally broken as well as private:
+  `embeddable: true` beside a `videoId` of `up_<hash>`, which no YouTube player
+  can resolve. `GET /v1/maps/{id}` had the same hole and now answers 404 for a
+  row the caller does not own; an uploader gets their own analysis back through
+  `POST /v1/analyze/upload`, where possession of the bytes is what authorizes the
+  read. `catalog_version()` counts the same public rows, so a private upload no
+  longer wakes every client to re-fetch a list that did not change.
 - **Blocked videos and channels are excluded in SQL**, not filtered afterwards.
   §3's takedown has to hold on a listing as firmly as on `GET /v1/maps/{id}`; a
   blocked video that vanishes from the detail route but still sits on a home
   screen is a takedown that did not happen.
-- **One row per video.** A video analyzed at three difficulties is three rows in
-  `chord_maps` and one *song* in the catalog, so the listing collapses to the
-  newest per video id and pages after collapsing.
+- **One row per video, collapsed and paged in SQL.** A video analyzed at three
+  difficulties is three rows in `chord_maps` and one *song* in the catalog, so the
+  listing collapses to the newest per video id — with `ROW_NUMBER() OVER
+  (PARTITION BY video_id)`, and then `LIMIT`/`OFFSET`.
 - **Readable without signing in** (`_principal_browsing`). Every other route needs
   an identity because it spends quota or starts work; this one only reads rows
   that already exist, and refusing it would empty the home screen for exactly the
@@ -458,9 +524,29 @@ about it are load-bearing:
 
 `/v1/catalog/version` is the cheap half: the client polls it and pulls the list
 only when the token moves, so "a song someone else added shows up" costs one short
-string rather than the whole catalog. Rows carry the chords, key and tempo read
-straight off the stored `CompositionPayload`, so a card needs no second round
-trip; artwork is the video's own poster, which the client derives from the id.
+string rather than the whole catalog. Artwork is the video's own poster, which the
+client derives from the id.
+
+**The five scalars a card prints live in their own columns** (`song_id`, `artist`,
+`tempo`, `tonic`, `mode`, `chord_names`), written by `put_map` from the payload it
+is already storing. They used to be read *through* `song_json`, which meant the
+collapse and the page happened in Python: every row in the table fetched, every
+`CompositionPayload` decoded, deduped in memory, and then sixty of them returned.
+So a catalog hit cost time linear in the size of the catalog forever, and `offset`
+bought nothing at all — page 30 cost exactly what page 1 did. Measured on this
+machine:
+
+| maps | old | new |
+|---|---|---|
+| 500, first page | 44 ms | 4.5 ms |
+| 2000, first page | 249 ms | 15 ms |
+| 2000, `offset=1900` | 257 ms | 17 ms |
+
+The duplication is safe because `put_map` is the only writer and
+`store._catalog_scalars` is the only place that reads the payload into them; a
+database written before the columns existed is backfilled once, on open, and
+flagged so a container start after that is one indexed count rather than a table
+scan.
 
 Two input paths, and the difference is legal rather than technical: `/v1/analyze`
 fetches a YouTube recording (which §2 concedes contravenes the API terms as
@@ -1002,6 +1088,136 @@ the original's key, so a "wrong" chart is always two hypotheses, not one.
 
 ---
 
+## The service audit (2026-08-17)
+
+A read of the whole service — HTTP surface, store, deployment shape, and the two
+adapters — rather than of one subsystem. Twenty-four findings, all fixed. What is
+worth recording is not the list but which of them **no existing test or number
+could have caught**, and why.
+
+### The four that would have shipped
+
+**Uploaded audio was public.** `list_catalog` selected every row in `chord_maps`
+with no source filter, and uploads are written to that same table — so one
+player's private recording appeared on every other player's home screen, under
+their own filename, with their chart, key and tempo. `GET /v1/maps/up_<hash>`
+served it to anyone with the hash. `is_upload_id()` had been written for exactly
+this question and was called nowhere. The reason 547 green tests missed it: the
+suite had **one identity** in it, so "somebody else" was not expressible. The fix
+is an `owner_uid` column and `owner_uid IS NULL` in the two queries; the tests
+needed a two-identity authenticator before they could fail.
+
+**On Modal with SQLite, no analysis could ever complete.** The worker calls
+`build_store` in its own container. The `chords-data` Volume is mounted on the API
+function only and `db_path` is relative — so a SQLite worker opens a *new* database
+on a disk that dies with the call, writes `analyzing`, `ready` and the finished map
+into it, and the API never sees any of them. Every job sits at `queued` until the
+900 s lease reaper fails it. Both containers report a green `/healthz` throughout,
+because individually each one is fine. The `MAX_CONTAINERS = 1` pin does not cover
+this and never could: the worker is a separate container whether or not the API is
+pinned. `build_store(role=ROLE_WORKER)` now refuses, loudly, naming the remedy.
+
+**Two players, one video, and the second gets a job id they can never poll.**
+`active_job_for` joins the second caller onto the first's in-flight analysis —
+correctly, since decoding the same recording twice produces the same answer — but
+the job row carries one `uid` and the poll route refused anyone else. So the second
+player was told, forever, that the analysis had expired; retrying returned the same
+dead id, and one player asking first made that video permanently un-analyzable for
+everybody else. A `job_followers` row is the smallest fix that does not turn the id
+into the credential: you may poll a job because you *joined* it. Joining is free,
+on the same reasoning that makes a cache hit free (§16.4).
+
+**Rate-limit 429s were invisible to browsers.** `add_middleware` *prepends*, so the
+middleware installed last runs first and sits outermost — and the limiter was
+installed after CORS, which put it *outside* `CORSMiddleware`. Its 429 left the app
+without ever passing through the CORS layer, so it carried no
+`Access-Control-Allow-Origin`, and a browser cannot read an opaque response: the
+`Retry-After` header and the `rate_limited` code were both being set and both
+unreachable from the web client, which saw a network error. Native clients ignore
+CORS entirely, which is why it survived. Swapping the two install calls fixes it;
+`OPTIONS` is now also exempt, because a preflight is the browser's request rather
+than the player's and counting them halves a web client's real budget.
+
+### The performance findings, measured
+
+| | old | new |
+|---|---|---|
+| `/v1/catalog` first page, 2000 maps | 249 ms | **15 ms** |
+| `/v1/catalog` at `offset=1900` | 257 ms | **17 ms** |
+| engine construction per job (warm container) | 837 ms | **~0 ms** |
+| `assemble()` per real track | 359 ms | **275 ms** |
+| `detect_key()` on a 400-span track | 3.5 ms | **2.5 ms** |
+| peak memory per upload body | 2.00× | **1.13×** |
+
+The catalog was reading and JSON-decoding the entire table on every request to
+return sixty rows, so `offset` bought nothing — page 30 cost what page 1 did. Both
+engines were being rebuilt per job (`_lazy` constructs a fresh adapter, whose
+`_load()` caches on `self`), so BTC's checkpoint and Beat This!'s model were
+re-read on every analysis in a container that had already loaded them. The upload
+path buffered each body twice — `b"".join(chunks)` while the chunk list is still
+live — and that one is only *known* fixed because the test measures peak
+allocation: the obvious `bytearray` rewrite was still 2.00×, because `bytes(buffer)`
+is the same second copy under a different name.
+
+### The timeout chain, which did not add up
+
+Four numbers in three files described one job's wall clock and contradicted each
+other in every direction: stage ceilings summing to 405 s, a container killed at
+300 s, a job deadline claiming 180 s, and a 900 s lease. The failure that produced
+is the worst shape available — a *successful but slow* fetch SIGKILLed with no
+terminal status written, so the player watched a spinner until the reaper noticed
+fifteen minutes later. They are now ordered, and `tests/test_deployment.py` asserts
+the ordering rather than the comment describing it:
+
+    probe + fetch + decode + dsp_reserve  ≤  job deadline (450)
+                                          <  worker timeout (600)
+                                          <  job lease (900)
+
+Read outward, each layer is the backstop for the one inside it. And a deadline
+breach is now refundable — it used to raise a bare `AnalysisError`, whose
+`analysis_failed` code is deliberately *outside* `REFUNDABLE_CODES`, so players
+paid a daily analysis for our own capacity planning.
+
+### Two findings where the honest answer is "smaller than it looks"
+
+The BTC feature extractor's block-edge corruption is real, measurable, and worth
+about **+0.003** raw chord accuracy and **nothing** delivered — see
+[the feature extractor](#the-feature-extractors-block-edges-fixed-2026-08-17) for
+the numbers and why a transformer over 108 frames absorbs it.
+
+Per-difficulty video sync is a **latent** fix rather than a measured one. The
+sidecar was withheld from every tier on the first tier that disagreed with it, so
+one `easy` render coming out a section short cost `hard` and `normal` their video
+sync too — and the log named only the failing tier, so the two that were fine
+looked untouched. On the benchmark corpus the disagreement is always a property of
+the *recording* (all three tiers fail together, and now say so individually), so
+the sidecar count is 13/15 before and after. The fix removes a failure mode the
+corpus does not contain; that is a reason to keep it, not evidence that it helped.
+
+### Still open
+
+**`probe` and `_fetch` remain two yt-dlp invocations.** They must stay two, because
+§3's blocklist is per-channel and §18's cap is a rejection, so both have to be
+decidable before a byte of audio moves. What *was* fixed is the more consequential
+half: they now share one sticky egress session, so the address that cleared the bot
+check is the one that downloads. The old comment claimed two independent draws were
+better; that is true when either will do and false when you need both —
+`1 − p²` against `1 − p`, which at a measured `p ≈ 0.2` is the difference between a
+96% and an 80% chance of a job hitting the check. Reusing the probe's info JSON with
+`--load-info-json` would remove the second extraction entirely, and was **not** done:
+a googlevideo URL is bound to the resolving IP and time-limited, so the failure mode
+is a 403 inside the fetch stage with no budget left to retry — in the part of the
+system that is least testable from here and has the longest history of subtle egress
+bugs. Worth doing against a live deployment, not blind.
+
+**The Postgres-specific tests are unverified.** The limiter's count-then-insert race
+is real on Postgres under READ COMMITTED and is fixed with a transaction-scoped
+advisory lock (`_serialize_rate_key`), but there is no Postgres on this machine, so
+`tests/test_store_postgres.py` — including the threaded test that would catch it —
+skips. CI supplies one; that is where those five new tests first run.
+
+---
+
 ## What is still owed, and by whom
 
 Nothing in the backend's own scope is open. What remains needs an account, a key,
@@ -1043,8 +1259,10 @@ or a lawyer — every item below is console work, and none of it is code.
    ```
    Expect the bot check here rather than later — see below.
 8. **A daily quota number.** `CHORDS_DAILY_QUOTA` defaults to 10, which is a
-   placeholder, not a recommendation: ~47 s of worker CPU per analysis is what it
-   is spending.
+   placeholder, not a recommendation: a fetch, a decode and two neural models of
+   worker CPU per analysis is what it is spending. The DSP half is ~10 s per track
+   now that the engines are built once per container rather than once per job; the
+   fetch is the variable part.
 
 **Not deployment, but still owed:**
 

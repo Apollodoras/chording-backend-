@@ -181,10 +181,15 @@ def detect_key(spans: list[GridSpan]) -> DetectedKey:
         return DetectedKey("C", "major", 0.0, tonic_pc=0, scale="ionian")
 
     total = sum(s.length_beats for s in spans) or 1
+    # The endpoint bonus's cap, computed once. It is a property of the chord track,
+    # not of the candidate key, and `_score` runs 48 times — so recomputing a median
+    # over every span inside it did the same sort 48 times per key detection, and
+    # `detect_key` itself is called up to four times per analysis.
+    typical = median(s.length_beats for s in spans)
     scored: list[tuple[float, str, int]] = []
     for tonic_pc in range(12):
         for mode in KEY_MODES:
-            score = _score(spans, tonic_pc, _degrees(mode)) / total + _MODE_PRIOR[mode]
+            score = _score(spans, tonic_pc, _degrees(mode), typical) / total + _MODE_PRIOR[mode]
             scored.append((score, mode, tonic_pc))
     scored.sort(key=lambda item: (-item[0], item[2], item[1]))
 
@@ -207,7 +212,11 @@ def detect_key(spans: list[GridSpan]) -> DetectedKey:
     )
 
 
-def _score(spans: list[GridSpan], tonic_pc: int, degrees: dict[int, frozenset[str]]) -> float:
+def _score(spans: list[GridSpan], tonic_pc: int, degrees: dict[int, frozenset[str]],
+           typical: float) -> float:
+    """This key's score for the chord track. `typical` is the median span length,
+    passed in because it does not depend on the key being scored (see
+    `detect_key`)."""
     total = 0.0
     for span in spans:
         degree = (span.root_pc - tonic_pc) % 12
@@ -226,7 +235,6 @@ def _score(spans: list[GridSpan], tonic_pc: int, degrees: dict[int, frozenset[st
     # any evidence the rest of the song can offer, and the key becomes a fact
     # about the outro. Capping at the median span is what makes it "the last
     # chord, counted once".
-    typical = median(s.length_beats for s in spans) if spans else 1.0
     for endpoint in (spans[0], spans[-1]):
         if endpoint.root_pc % 12 == tonic_pc:
             total += min(endpoint.length_beats, typical) * _TONIC_ENDPOINT_BONUS

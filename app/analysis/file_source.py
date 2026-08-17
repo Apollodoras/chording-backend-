@@ -53,8 +53,10 @@ from .types import PCM, VideoMeta
 log = logging.getLogger("chords.fetch.file")
 
 _SAMPLE_RATE = 22050
+# Defaults only — `config.Settings` owns the real numbers, so that the stage
+# ceilings and the job deadline can be checked against each other as one budget.
 _PROBE_TIMEOUT_S = 30
-_DECODE_TIMEOUT_S = 120
+_DECODE_TIMEOUT_S = 90
 
 # Two bounds on how much audio a decode may produce, and the gap between them is
 # deliberate.
@@ -113,6 +115,8 @@ class FileSource:
         self._settings = settings
         self._ffmpeg = os.environ.get("CHORDS_FFMPEG", "ffmpeg")
         self._ffprobe = os.environ.get("CHORDS_FFPROBE", "ffprobe")
+        self._probe_timeout = int(getattr(settings, "probe_timeout_s", _PROBE_TIMEOUT_S))
+        self._decode_timeout = int(getattr(settings, "decode_timeout_s", _DECODE_TIMEOUT_S))
         self.video_id = upload_id(data)
         # Only ever used as a display title, and stripped of any path the client
         # may have sent. It is player-supplied text that ends up in a database
@@ -132,7 +136,7 @@ class FileSource:
             result = _run([
                 self._ffprobe, "-v", "error", "-show_entries", "format=duration",
                 "-of", "json", str(media),
-            ], timeout=_PROBE_TIMEOUT_S)
+            ], timeout=self._probe_timeout)
         if result.returncode != 0:
             log.warning("ffprobe rejected an upload: %s", (result.stderr or "").strip()[:400])
             raise VideoUnavailable("That file couldn’t be read as audio.")
@@ -175,7 +179,7 @@ class FileSource:
             command += ["-t", f"{limit * _DECODE_CEILING:.3f}"]
         command += ["-ac", "1", "-ar", str(sample_rate), "-c:a", "pcm_s16le", str(wav)]
 
-        result = _run(command, timeout=_DECODE_TIMEOUT_S)
+        result = _run(command, timeout=self._decode_timeout)
         try:
             source.unlink()
         except OSError:

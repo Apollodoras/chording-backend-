@@ -48,7 +48,8 @@ repeat (`_absorb_runts`). Each function carries the case that forced it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
 
 from . import harmony
 from .structure import MIN_SECTION_BARS, BarChord, Section
@@ -129,7 +130,28 @@ def sampled(bar: list[BarChord] | tuple[BarChord, ...], bar_beats: float
     holding `C` and a bar holding `C C` the same bar, and what lets a bar with a
     mid-bar change be compared with one without. `None` marks a slot no chord
     covers, which only happens on a malformed bar.
+
+    **Memoized on the bar's identity**, because the same bar is sampled thousands
+    of times for one song and the answer cannot change. `_layout` tries every phase
+    of the period; each phase scores every block against every other block
+    (`_repetition_score`, O(blocks²)); each block comparison samples every bar in
+    both blocks — and then `form.detect` runs the whole thing twice, before and
+    after the consensus vote (see `model.py`). The product is O(unit² × blocks²)
+    samplings of a small fixed set of bars.
+
+    `BarChord` is a frozen dataclass, so a tuple of them is hashable and its hash
+    *is* the bar's identity: same chords, same offsets, same answer. Lists are
+    coerced — cheap, since a bar holds at most a handful of chords. Bounded rather
+    than unbounded: a long song has thousands of distinct bars and this cache
+    outlives the analysis, so it is sized to hold one song's worth comfortably and
+    then behave like an LRU rather than like a leak.
     """
+    return _sampled(tuple(bar), bar_beats)
+
+
+@lru_cache(maxsize=8192)
+def _sampled(bar: tuple[BarChord, ...], bar_beats: float
+             ) -> tuple[tuple[int, str] | None, ...]:
     cells = max(1, int(round(bar_beats * COMPARE_SUBDIVISION)))
     step = bar_beats / cells
     out: list[tuple[int, str] | None] = []
@@ -179,6 +201,45 @@ def _signature(block: Block) -> tuple:
     encoding replays one pass in place of the other. A merely *similar* repeat
     has to keep both passes' bars."""
     return tuple(tuple((c.root_pc, c.quality) for c in bar) for bar in block.bars)
+
+
+# --- the structural view ----------------------------------------------------
+
+def folded(bars: list[list[BarChord]]) -> list[list[BarChord]]:
+    """The bars as *structure* sees them: every chord reduced to its triad.
+
+    **Where the form is found, colour is noise.** `bar_similarity` scores `Em`
+    against `Em7` at 0.75 — a real gradient, and the right answer to "how alike
+    do these two sound". It is the wrong answer to "are these two the same bar of
+    music", and the difference is not academic: a four-bar loop whose `Em` is
+    heard as `Em7` on alternate passes scores **0.9375** at lag 4 and a perfect
+    1.0 at lag 8, and `PERIOD_MARGIN` is 0.05. The song loses its own period by
+    0.0125 and comes out as an eight-bar section played four times instead of a
+    four-bar one played eight.
+
+    That is the failure the user sees as "the chart is twice as long as the
+    song", and it is the *same* engine wobble that shows up as "there are more
+    chords than the song has" — one cause, two symptoms. Folding here fixes the
+    structural half; `lexicon.py` fixes the naming half, and it can only run at
+    all once the groups are right, because its evidence is what the *other
+    passes of this slot* say.
+
+    Only the period, the phase and the clustering read this. The sections are
+    built from the real bars, `_signature` compares the real chords, and the vote
+    counts the real readings — because those are the places where the difference
+    between `Em` and `Em7` is the thing being decided rather than the thing
+    getting in the way.
+    """
+    return [[replace(chord, quality=harmony.triad(chord.quality)) for chord in bar]
+            for bar in bars]
+
+
+def _restored(blocks: list[Block], bars: list[list[BarChord]]) -> list[Block]:
+    """The same block boundaries, over the real bars instead of the folded ones."""
+    return [Block(start_bar=block.start_bar,
+                  bars=tuple(tuple(bar) for bar in
+                             bars[block.start_bar:block.start_bar + block.length]))
+            for block in blocks]
 
 
 # --- period and phase -------------------------------------------------------
@@ -362,9 +423,21 @@ def detect(bars: list[list[BarChord]], *, bar_beats: float = 4.0,
     if not bars:
         return [], []
 
-    unit = period(bars, bar_beats)
-    blocks = _layout(bars, unit, bar_beats)
+    # Period, phase and clustering are decided on the triad-folded bars (see
+    # `folded`); everything the caller gets back is the real ones.
+    structure = folded(bars)
+    unit = period(structure, bar_beats)
+    blocks = _layout(structure, unit, bar_beats)
     groups, assignment = cluster(blocks, bar_beats)
+
+    blocks = _restored(blocks, bars)
+    for group in groups:
+        # `cluster` seeded `canonical` from the folded block that created the
+        # group. The vote overwrites it, but until it does this is what the
+        # sidecar reports, and it must be chords the song actually contains.
+        if group.occurrences:
+            start = group.occurrences[0]
+            group.canonical = [list(bar) for bar in bars[start:start + group.length_bars]]
 
     sections = _sections_from(blocks, assignment, groups)
     sections = _absorb_runts(sections)

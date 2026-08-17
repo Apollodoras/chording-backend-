@@ -66,6 +66,52 @@ Where the gates do not all hold, the slot is **contested**: nothing is
 rewritten, for any occurrence, and the group is reported as having a real
 difference in it. Contested slots are counted, not hidden — a song whose verses
 genuinely vary is a fact about the song, and the sidecar says so.
+
+§20.9 — weighing the slots the count cannot decide
+--------------------------------------------------
+
+Counting is the right reduction only while the readings are independent samples,
+and gate 3 above already admits they are not: "counting alone cannot tell a real
+change from a repeated mistake — the confidence can." `_weigh` is that sentence
+taken to its conclusion, for the two slots where counting has nothing left to
+say:
+
+- the count **ties** — four passes read `Em`, four read `Em7`, no plurality;
+- the count points the **other way from the belief** — five hesitant `Em7`
+  against three confident `Em`, so gate 3 refuses and both readings ship.
+
+Both are ordinary, and together they are what a user sees as "the engine adds
+variants to a chord and the song ends up with more chords than it has". A doubled
+guitar part that makes the recognizer hear a seventh makes it hear that seventh
+*every time that passage comes round*, so the fourfold repetition which was
+supposed to be evidence is four copies of one mistake. The confidences are the
+only signal in the slot that did not get copied along with it.
+
+So where `_vote` returns contested, `_weigh` may still settle the slot — under a
+gate the vote does not have, and which is what makes the extra power safe:
+
+**The candidates may differ in quality alone.** Same roots, same offsets, same
+lengths, so the only thing in dispute is colour. That is precisely the shape of a
+recognizer wobbling over a third or a seventh, and precisely not the shape of
+music that changes: a verse that really goes somewhere else moves a *root* or a
+*boundary*, and a slot where either differs is never shown to `_weigh` at all.
+
+Every other gate is carried over unchanged, including the one that matters most:
+the losing reading must have been **believed less**. So §20.9 inherits the
+property the rest of the layer is judged by — **on perfect input it is provably a
+no-op**, because ground truth arrives at a flat confidence of 1.0 and no reading
+is ever less believed than any other. That is also why the whole-song chord
+profile is deliberately *not* consulted here, tempting as it looks: mass counts
+readings that have not been corrected yet, so a systematic mishearing inflates
+its own evidence, and the one case this rule exists for is the one where mass
+points the wrong way. `vocabulary.py` is where song-wide mass can speak, because
+there it is bounded by `MAX_OCCASIONS` — a limit that only means anything for a
+reading the song does *not* keep coming back to.
+
+What `_weigh` may not do is invent: the winner is always one of the readings some
+pass actually carried, never a synthesis of them, and the direction of the move
+is bounded by `vocabulary.SNAP_TO` — the measured table, so a seventh may flatten
+onto its triad and a triad may never grow one.
 """
 
 from __future__ import annotations
@@ -78,6 +124,7 @@ from .form import RepeatGroup, bar_similarity
 from .strumming import ExtractedPattern, FoldedOnset, extract, fallback, fold_onsets
 from .structure import BarChord
 from .types import Onset
+from .vocabulary import SNAP_TO
 
 log = logging.getLogger("chords.consensus")
 
@@ -107,6 +154,13 @@ class ConsensusReport:
     groups_voted: int = 0
     rewritten_bars: int = 0
     contested_bars: int = 0
+    # §20.9's share of `rewritten_bars` — bars the count could not decide and
+    # belief could. Carried separately because it is the number that says whether
+    # the second reduction is earning its place, and it is not recoverable from
+    # the others: a slot `_weigh` settles is one `_vote` would have filed as
+    # contested, so switching it off moves bars between two columns rather than
+    # changing a total.
+    weighed_bars: int = 0
 
     @property
     def touched(self) -> bool:
@@ -115,7 +169,7 @@ class ConsensusReport:
 
 def apply(bars: list[list[BarChord]], groups: list[RepeatGroup], *,
           bar_beats: float, tonic_pc: int = 0, mode: str = "ionian",
-          record: bool = True) -> tuple[list[list[BarChord]], ConsensusReport]:
+          record: bool = True, weigh: bool = True) -> tuple[list[list[BarChord]], ConsensusReport]:
     """Vote each repeat group's occurrences into agreement, where allowed.
 
     Returns a **new** bar list; the input is not mutated, so a caller can always
@@ -128,9 +182,14 @@ def apply(bars: list[list[BarChord]], groups: list[RepeatGroup], *,
     tier — and a tier's vote is a render of the reference one, not a new finding
     about the song. So renders pass `record=False` and the numbers on the groups
     keep describing the reference vote rather than whichever tier compiled last.
+
+    `weigh` turns §20.9 off, the same posture `theory_consensus` and
+    `theory_vocabulary` already support. With it off the count is the only
+    reduction and the slots it cannot decide stay contested, which is this
+    module's behaviour before §20.9 and a supported way to run.
     """
     out = [list(bar) for bar in bars]
-    rewritten = contested = voted = 0
+    rewritten = contested = voted = weighed = 0
 
     for group in groups:
         if not group.is_repeat or group.length_bars <= 0:
@@ -144,8 +203,15 @@ def apply(bars: list[list[BarChord]], groups: list[RepeatGroup], *,
                          if start + slot < len(out)]
             if len(positions) < 2:
                 continue
-            outcome = _vote([out[p] for p in positions], bar_beats=bar_beats,
+            candidates = [out[p] for p in positions]
+            outcome = _vote(candidates, bar_beats=bar_beats,
                             tonic_pc=tonic_pc, mode=mode)
+            by_belief = False
+            if outcome is None and weigh:
+                # §20.9. Only ever reached where the count already gave up, so
+                # this can add corrections and can never overturn one.
+                outcome = _weigh(candidates, tonic_pc=tonic_pc, mode=mode)
+                by_belief = outcome is not None
             if outcome is None:
                 group_contested.append(slot)
                 contested += 1
@@ -155,6 +221,7 @@ def apply(bars: list[list[BarChord]], groups: list[RepeatGroup], *,
                 out[positions[index]] = _adopt(winner, out[positions[index]])
                 group_rewritten += 1
                 rewritten += 1
+                weighed += by_belief
 
         if record:
             group.rewritten_bars = group_rewritten
@@ -170,7 +237,7 @@ def apply(bars: list[list[BarChord]], groups: list[RepeatGroup], *,
                          group.label, group_rewritten, len(group_contested))
 
     return out, ConsensusReport(groups_voted=voted, rewritten_bars=rewritten,
-                                contested_bars=contested)
+                                contested_bars=contested, weighed_bars=weighed)
 
 
 def _vote(candidates: list[list[BarChord]], *, bar_beats: float,
@@ -221,6 +288,89 @@ def _vote(candidates: list[list[BarChord]], *, bar_beats: float,
                 return None                                  # gate 3
             losers.append(index)
     return winner, losers
+
+
+def _weigh(candidates: list[list[BarChord]], *, tonic_pc: int, mode: str
+           ) -> tuple[list[BarChord], list[int]] | None:
+    """§20.9 — settle a slot the count could not, by which reading was believed.
+
+    Same contract as `_vote`: None means the slot stays contested, and an empty
+    loser list means there was nothing to decide. Reached only after `_vote` has
+    declined, so this can add corrections and can never reverse one.
+
+    The winner is the occurrence with the highest duration-weighted confidence —
+    an occurrence the song actually played, never a synthesis of several. The
+    module docstring argues why belief beats counting here and why song-wide mass
+    is deliberately left out of it; what follows is the gates.
+    """
+    skeleton = _skeleton(candidates[0])
+    if any(_skeleton(bar) != skeleton for bar in candidates[1:]):
+        return None                                          # gate A
+    tally: dict[tuple, list[int]] = {}
+    for index, bar in enumerate(candidates):
+        tally.setdefault(_colour(bar), []).append(index)
+    if len(tally) == 1:
+        return candidates[0], []            # unanimous — `_vote` said so already
+
+    ranked = sorted(
+        tally.items(),
+        key=lambda item: (
+            _mean_confidence([candidates[i] for i in item[1]]),
+            _diatonic(candidates[item[1][0]], tonic_pc, mode),
+            len(item[1]),
+            -item[1][0],                                    # earliest, for determinism
+        ),
+        reverse=True,
+    )
+    winner = candidates[ranked[0][1][0]]
+    winner_confidence = _mean_confidence([candidates[i] for i in ranked[0][1]])
+    winner_diatonic = _diatonic(winner, tonic_pc, mode)
+
+    losers: list[int] = []
+    for _, indices in ranked[1:]:
+        other = candidates[indices[0]]
+        # Gate B — every quality that differs must be one `vocabulary.SNAP_TO`
+        # allows to move this way, and a near-miss of what it is moving onto.
+        # Checked per chord rather than per bar: a bar that is right in its first
+        # half and wrong in its second must not ride in on the half that agrees.
+        for mine, theirs in zip(other, winner):
+            if mine.quality == theirs.quality:
+                continue
+            if theirs.quality not in SNAP_TO.get(mine.quality, ()):
+                return None
+            if not harmony.is_near_miss((mine.root_pc, mine.quality),
+                                        (theirs.root_pc, theirs.quality)):
+                return None
+        # Gate C — believed less, by the same margin the vote and the vocabulary
+        # use. This is the gate that makes §20.9 a no-op on perfect input, and
+        # the reason every one of these layers has one.
+        if _mean_confidence([candidates[i] for i in indices]) >= winner_confidence - CONFIDENCE_MARGIN:
+            return None
+        # Gate D — never away from the key. Non-strict and never a filter on its
+        # own, exactly as in `_diatonic` and `vocabulary.snap`: borrowed chords
+        # and secondary dominants are normal music, but a *correction* that walks
+        # out of the key is one worth refusing.
+        if winner_diatonic < _diatonic(other, tonic_pc, mode):
+            return None
+        losers.extend(indices)
+    return winner, losers
+
+
+def _skeleton(bar: list[BarChord]) -> tuple:
+    """The bar with its colour removed — roots and rhythm, nothing else.
+
+    What `_weigh` requires every candidate to share. Two readings with the same
+    skeleton disagree about *how a chord is spelled*; two with different
+    skeletons disagree about what is being played, and no amount of confidence
+    entitles one to overwrite the other.
+    """
+    return tuple((c.root_pc, round(c.start_beat, 4), round(c.length_beats, 4))
+                 for c in bar)
+
+
+def _colour(bar: list[BarChord]) -> tuple:
+    """The half of the bar `_weigh` is deciding between."""
+    return tuple(c.quality for c in bar)
 
 
 def _adopt(winner: list[BarChord], loser: list[BarChord]) -> list[BarChord]:

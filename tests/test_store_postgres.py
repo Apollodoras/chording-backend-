@@ -233,3 +233,95 @@ def test_two_callers_asking_for_one_video_share_a_job(clean):
 
     clean.update_job("j1", status=STATUS_READY)
     assert clean.active_job_for("v1", "normal") is None
+
+
+def test_the_limiter_serializes_concurrent_checks_of_one_key(store):
+    """The count-then-insert race, which SQLite never had and Postgres does.
+
+    `hit_rate_limit` deletes expired events, counts what is left, and inserts if the
+    count is under the limit. SQLite makes that atomic for free — `SQLiteStore` holds
+    a process-wide lock for the whole cursor block and SQLite takes a database write
+    lock. Under Postgres READ COMMITTED, two concurrent transactions both read a
+    count below the limit, both insert, and the budget quietly doubles under exactly
+    the load it exists for.
+
+    Asserted by driving real threads at one key, because the whole defect is a
+    property of concurrency: a sequential test passes against the racy version.
+    """
+    import threading
+
+    key = f"race-{uuid.uuid4().hex[:8]}"
+    limit = 5
+    callers = 24
+    allowed: list[bool] = []
+    lock = threading.Lock()
+    start = threading.Barrier(callers)
+
+    def hammer():
+        start.wait()
+        ok, _retry = store.hit_rate_limit("uid", key, limit, 60.0)
+        with lock:
+            allowed.append(ok)
+
+    threads = [threading.Thread(target=hammer) for _ in range(callers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sum(allowed) == limit, (
+        f"{sum(allowed)} of {callers} concurrent requests were admitted against a "
+        f"limit of {limit} — the limiter is not serializing its own check"
+    )
+
+
+def test_the_postgres_store_gets_the_added_columns(store):
+    """`_migrate_columns` has to work in this dialect too — `information_schema`
+    rather than `PRAGMA table_info`, and the privacy filter cannot run without it."""
+    with store._cursor() as cur:
+        present = store._columns(cur, "chord_maps")
+
+    assert {"owner_uid", "song_id", "artist", "tempo", "tonic", "mode",
+            "chord_names", "denormalized"} <= present
+
+
+def test_the_catalog_window_function_works_in_postgres(store):
+    """`ROW_NUMBER() OVER (PARTITION BY …)` collapses a video's difficulties to one
+    row, and `LIMIT`/`OFFSET` page it. Both are the rewrite that moved this off a
+    full-table scan, and neither had ever run in this dialect."""
+    video = f"vid{uuid.uuid4().hex[:8]}"
+    for tier in ("easy", "normal", "hard"):
+        store.put_map(video_id=video, difficulty=tier,
+                      song={"version": 2, "id": f"yt:{video}", "tempo": 120,
+                            "tonic": "G", "mode": "major", "chordNames": ["G", "D"]},
+                      sync=None, engine_chords="f@1", engine_beats="f@1",
+                      analyzed_at="2026-08-03T10:00:00Z", title="Known Song")
+
+    rows = store.list_catalog(limit=10)
+    assert [row.video_id for row in rows].count(video) == 1
+    assert rows[0].chord_names == ["G", "D"]
+    assert rows[0].tempo == 120
+
+
+def test_an_upload_is_private_in_postgres_too(store):
+    """The privacy filter is `owner_uid IS NULL` in SQL, so it is the one thing that
+    absolutely must behave identically in both backends."""
+    private = f"up_{uuid.uuid4().hex[:16]}"
+    store.put_map(video_id=private, difficulty="normal",
+                  song={"version": 2, "id": f"yt:{private}"}, sync=None,
+                  engine_chords="f@1", engine_beats="f@1",
+                  analyzed_at="2027-01-01T00:00:00Z", owner_uid="alice")
+
+    assert all(row.video_id != private for row in store.list_catalog(limit=200))
+    assert store.get_map(private, "normal").owner_uid == "alice"
+
+
+def test_a_follower_round_trips_in_postgres(store):
+    job_id = uuid.uuid4().hex
+    job = store.create_job(job_id=job_id, uid="alice", video_id="dQw4w9WgXcQ",
+                           difficulty="normal")
+
+    assert not store.may_read_job(job, "bob")
+    store.follow_job(job_id, "bob")
+    store.follow_job(job_id, "bob")          # ON CONFLICT DO NOTHING
+    assert store.may_read_job(job, "bob")

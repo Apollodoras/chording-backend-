@@ -464,3 +464,356 @@ def test_a_stale_token_still_gets_the_catalog(client):
     response = client.get("/v1/catalog", headers={"Authorization": "Bearer not-a-real-token"})
     assert response.status_code == 200
     assert response.json()["results"]
+
+
+# --- rate limits a browser can actually read --------------------------------
+
+class _MultiUser:
+    """An authenticator that maps `Bearer <name>` to uid `<name>`.
+
+    The dev token resolves to one fixed uid, which is all any single-player test
+    needs — and is exactly why the "two players, one video" defect below could not
+    be seen: with one identity in the suite, `job.uid != principal.uid` is never
+    true.
+    """
+
+    mode = "test-multi-user"
+
+    def __call__(self, authorization, *, check_revoked: bool = False):
+        from fastapi import HTTPException
+
+        from app.auth import Principal
+
+        if not authorization or not authorization.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail={"message": "Sign in."})
+        name = authorization[7:].strip()
+        return Principal(uid=name, display_name=name, email_verified=True)
+
+
+ORIGIN = {"Origin": "https://app.example.com"}
+
+
+@pytest.fixture
+def web_client(settings, store):
+    """A deployment with CORS configured and a limiter of two per minute."""
+    source = FakeSource()
+    app = create_app(
+        replace(settings, cors_allow_origins="https://app.example.com",
+                rate_limit_ip_per_min=2),
+        store=store, source=source, runner=JobRunner(settings, store, source))
+    with TestClient(app) as client:
+        yield client
+
+
+def test_a_rate_limited_response_still_carries_the_cors_header(web_client):
+    """Otherwise being throttled is indistinguishable from the server dying.
+
+    `add_middleware` **prepends**, so the middleware installed last runs first and
+    sits outermost. Installing the limiter after CORS therefore put it *outside*
+    `CORSMiddleware`: its 429 left the app without ever passing through the CORS
+    layer, so it carried no `Access-Control-Allow-Origin` and a browser could not
+    read it at all. The `Retry-After` header and the `rate_limited` code were both
+    written, and both unreachable from the web client — which saw an opaque CORS
+    failure. Native clients ignore CORS entirely, which is why this survived.
+    """
+    codes = []
+    for _ in range(4):
+        response = web_client.get("/v1/catalog", headers={**AUTH, **ORIGIN})
+        codes.append(response.status_code)
+        assert response.headers.get("access-control-allow-origin") == \
+            "https://app.example.com", (
+            f"a {response.status_code} left the app without the CORS header, so the "
+            f"browser sees a network error instead of the message and Retry-After "
+            f"this service went to the trouble of setting"
+        )
+    assert 429 in codes, "the limiter must still actually limit"
+
+
+def test_a_throttled_browser_can_read_the_retry_after(web_client):
+    """The whole point of the header being reachable: backpressure the page can act
+    on, rather than a failure it can only report."""
+    for _ in range(3):
+        response = web_client.get("/v1/catalog", headers={**AUTH, **ORIGIN})
+    assert response.status_code == 429
+    assert response.json()["code"] == "rate_limited"
+    assert int(response.headers["Retry-After"]) >= 1
+
+
+def test_a_cors_preflight_does_not_spend_the_limiter_budget(web_client):
+    """A preflight is the browser's request, not the player's.
+
+    The browser sends one before each non-simple request, so counting them **halves**
+    a web client's real budget — and a preflight that 429s fails the request it was
+    asking permission for with no status the page can see. It reaches no route, so it
+    can neither spend quota nor start work.
+    """
+    for _ in range(10):
+        preflight = web_client.options("/v1/analyze", headers={
+            **ORIGIN,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        })
+        assert preflight.status_code == 200, preflight.text
+
+    # And the real budget is untouched by all that.
+    assert web_client.get("/v1/catalog", headers={**AUTH, **ORIGIN}).status_code == 200
+
+
+# --- two players, one video -------------------------------------------------
+
+@pytest.fixture
+def shared_client(settings, store):
+    """Two identities, and a runner that leaves the job in flight."""
+    class Queueing(JobRunner):
+        def submit(self, **kwargs):
+            pass          # accepted, never run — the job stays non-terminal
+
+    source = FakeSource()
+    app = create_app(settings, store=store, source=source,
+                     authenticator=_MultiUser(), runner=Queueing(settings, store, source))
+    with TestClient(app) as client:
+        yield client
+
+
+def test_the_second_player_can_poll_the_job_they_were_given(shared_client):
+    """The reproduction.
+
+    `active_job_for` deliberately joins a second caller onto one in-flight analysis
+    rather than decoding the same recording twice. But the job row carries a single
+    `uid`, and the poll route refused anyone else — so bob was handed alice's job id
+    and then told, **forever**, that it had expired. Retrying returned the same dead
+    id, so one player asking first made that video permanently un-analyzable for
+    everybody else.
+    """
+    alice = {"Authorization": "Bearer alice"}
+    bob = {"Authorization": "Bearer bob"}
+
+    first = shared_client.post("/v1/analyze", json={"videoId": VIDEO}, headers=alice)
+    second = shared_client.post("/v1/analyze", json={"videoId": VIDEO}, headers=bob)
+
+    assert first.status_code == second.status_code == 202
+    assert second.json()["jobId"] == first.json()["jobId"], \
+        "the whole point of joining is that the second caller shares the first's job"
+
+    job_id = second.json()["jobId"]
+    poll = shared_client.get(f"/v1/analyze/{job_id}", headers=bob)
+    assert poll.status_code == 200, poll.json()
+    assert poll.json()["status"] in {"queued", "analyzing"}
+
+
+def test_joining_a_running_job_costs_the_second_player_nothing(shared_client):
+    """Consistent with a cache hit (§16.4): they did not start any work, so there
+    is nothing to charge for."""
+    shared_client.post("/v1/analyze", json={"videoId": VIDEO},
+                       headers={"Authorization": "Bearer alice"})
+    shared_client.post("/v1/analyze", json={"videoId": VIDEO},
+                       headers={"Authorization": "Bearer bob"})
+
+    assert shared_client.app.state.store.usage_today("bob") == 0
+    assert shared_client.app.state.store.usage_today("alice") == 1
+
+
+def test_a_stranger_still_cannot_poll_someone_elses_job(shared_client):
+    """The fix must not have turned the id into the credential. You may poll a job
+    because you *joined* it — not because you know its id."""
+    job_id = shared_client.post("/v1/analyze", json={"videoId": VIDEO},
+                                headers={"Authorization": "Bearer alice"}).json()["jobId"]
+
+    response = shared_client.get(f"/v1/analyze/{job_id}",
+                                 headers={"Authorization": "Bearer carol"})
+    assert response.status_code == 404
+
+
+# --- X-Forwarded-For --------------------------------------------------------
+
+def test_the_trusted_hop_count_decides_which_forwarded_address_is_read(settings, store):
+    """One hop is today's deployment; two is Cloudflare in front of a load balancer.
+
+    Reading the rightmost entry is right behind exactly one trusted proxy. Behind
+    two it is the *load balancer's* address — identical for every caller — so the
+    whole internet collapses into one rate-limit bucket and one noisy client
+    throttles every player at once.
+    """
+    from app.main import client_ip
+
+    class _Request:
+        def __init__(self, app, header):
+            self.app = app
+            self.headers = {"x-forwarded-for": header}
+            self.client = None
+
+    source = FakeSource()
+    one_hop = create_app(settings, store=store, source=source,
+                         runner=JobRunner(settings, store, source))
+    two_hops = create_app(replace(settings, trusted_proxy_hops=2), store=store,
+                          source=source, runner=JobRunner(settings, store, source))
+
+    chain = "203.0.113.9, 198.51.100.7, 10.0.0.1"
+    assert client_ip(_Request(one_hop, chain)) == "10.0.0.1"
+    assert client_ip(_Request(two_hops, chain)) == "198.51.100.7"
+
+    # Fewer entries than configured hops: attribute the leftmost rather than
+    # walking off the front. A short header means the request did not come through
+    # the chain we think it did.
+    assert client_ip(_Request(two_hops, "203.0.113.9")) == "203.0.113.9"
+
+
+def test_a_forged_forwarded_header_cannot_pick_its_own_bucket(settings, store):
+    """The reason the rightmost entry is read at all: everything left of our own
+    proxies is caller-supplied text, and a fresh fake address per request would
+    start a fresh rate-limit window every time."""
+    from app.main import client_ip
+
+    class _Request:
+        def __init__(self, app, header):
+            self.app = app
+            self.headers = {"x-forwarded-for": header}
+            self.client = None
+
+    source = FakeSource()
+    app = create_app(settings, store=store, source=source,
+                     runner=JobRunner(settings, store, source))
+    assert client_ip(_Request(app, "1.1.1.1, 10.0.0.1")) == "10.0.0.1"
+    assert client_ip(_Request(app, "2.2.2.2, 10.0.0.1")) == "10.0.0.1"
+
+
+# --- a ready job whose map went away ----------------------------------------
+
+def _drop_maps_only(store, video_id):
+    """Delete a video's maps but leave its job rows.
+
+    `purge` cascades to jobs, so it cannot produce the state under test — which is
+    the state this branch is *for*: a job that reached `ready` and whose map is no
+    longer there when the client polls. Reached by a takedown landing in that
+    window, or by a cache invalidation, and defensive either way.
+    """
+    with store._cursor(write=True) as cur:
+        cur.execute(store._sql("DELETE FROM chord_maps WHERE video_id = ?"), (video_id,))
+
+
+def test_a_missing_map_is_only_called_blocked_when_it_is_blocked(client):
+    """`video_blocked` renders in the app as "this video is banned".
+
+    Answering it for *any* missing map accused the video of something whenever the
+    map had merely been cleared. The two cases are distinguishable — the blocklist
+    is right there — and they call for different copy.
+    """
+    job_id = analyze(client).json()["jobId"]
+    _drop_maps_only(client.app.state.store, VIDEO)      # cleared, not blocked
+
+    response = client.get(f"/v1/analyze/{job_id}", headers=AUTH)
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
+
+
+def test_a_blocked_video_still_says_blocked(client):
+    """The other half: a takedown landing mid-flight is exactly what
+    `video_blocked` is for, and must keep saying so."""
+    job_id = analyze(client).json()["jobId"]
+    store = client.app.state.store
+
+    store.block(BLOCK_VIDEO, VIDEO, reason="DMCA", actor="agent")
+    _drop_maps_only(store, VIDEO)
+
+    response = client.get(f"/v1/analyze/{job_id}", headers=AUTH)
+    assert response.status_code == 403
+    assert response.json()["code"] == "video_blocked"
+
+
+# --- healthz and the worker it cannot see -----------------------------------
+
+def test_healthz_names_the_runner_the_capability_came_from(client):
+    """`canAnalyze: true` beside `engines: {}` is not a contradiction — it is one
+    page describing two containers. Saying which runner answered is what makes that
+    readable instead of alarming."""
+    body = client.get("/healthz").json()
+    assert body["runner"] == "JobRunner"
+
+
+def test_an_in_process_deployment_has_no_separate_worker_to_report(client):
+    """`/v1/admin/worker` exists for the two-container shape. In-process, `/healthz`
+    already describes the container that would run the analysis, and a second copy
+    could only disagree with it."""
+    response = client.get("/v1/admin/worker", headers=ADMIN)
+    assert response.status_code == 503
+    assert response.json()["code"] == "feature_disabled"
+
+
+def test_the_worker_report_is_admin_only(client):
+    """It costs a worker cold start, so it must not be reachable by anyone who
+    fancies starting containers."""
+    assert client.get("/v1/admin/worker").status_code == 401
+
+
+def test_a_remote_runners_worker_report_is_served(settings, store):
+    """What an operator actually gets on Modal: the worker image's own answer about
+    what it built — the gap that made a worker missing an engine indistinguishable
+    from a healthy deployment."""
+    from app.jobs import RemoteJobRunner
+
+    class Reporting(RemoteJobRunner):
+        def submit(self, **kwargs):
+            pass
+
+        def worker_report(self):
+            return {"engines": {"chords": ["btc"]}, "enginesReady": True}
+
+    app = create_app(settings, store=store, source=None,
+                     runner=Reporting(settings, store, None))
+    with TestClient(app) as remote:
+        body = remote.get("/v1/admin/worker", headers=ADMIN).json()
+    assert body["enginesReady"] is True
+
+
+# --- the user table is not a signup log -------------------------------------
+
+class _Unverified:
+    """A password account that has not proven its address — which anyone can mint
+    through Firebase's public Auth REST API."""
+
+    mode = "test-unverified"
+
+    def __call__(self, authorization, *, check_revoked: bool = False):
+        from fastapi import HTTPException
+
+        from app.auth import PASSWORD_PROVIDER, Principal
+
+        if not authorization or not authorization.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail={"message": "Sign in."})
+        return Principal(uid=authorization[7:].strip(), display_name=None,
+                         email_verified=False, sign_in_provider=PASSWORD_PROVIDER)
+
+
+def test_an_unverified_account_leaves_no_row_behind(settings, store):
+    """`_charge` upserted the user row *before* the verified-email check, so every
+    refused request from an unverified account still wrote one — an unbounded table
+    any script could grow, populated entirely by accounts that may not spend
+    anything. The check is cheap and comes first now."""
+    source = FakeSource()
+    app = create_app(settings, store=store, source=source,
+                     authenticator=_Unverified(), runner=JobRunner(settings, store, source))
+    with TestClient(app) as client:
+        response = client.post("/v1/analyze", json={"videoId": VIDEO},
+                               headers={"Authorization": "Bearer squatter"})
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "email_unverified"
+    assert store.display_name("squatter") is None
+    with store._cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM users")
+        assert cur.fetchone()[0] == 0
+
+
+def test_a_verified_account_still_gets_its_row(settings, store):
+    """The reordering must not have dropped the upsert that `/v1/me` and the quota
+    depend on."""
+    source = FakeSource()
+    app = create_app(settings, store=store, source=source,
+                     runner=JobRunner(settings, store, source))
+    with TestClient(app) as client:
+        assert client.post("/v1/analyze", json={"videoId": VIDEO},
+                           headers=AUTH).status_code == 202
+
+    with store._cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM users")
+        assert cur.fetchone()[0] == 1

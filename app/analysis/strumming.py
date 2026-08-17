@@ -87,7 +87,80 @@ SUPPORT_THRESHOLD = 0.5
 # with the bar's *mean* that test is self-defeating — six struck cells out of
 # eight drag the mean up until the six can no longer clear it — so the reference
 # is the peak, and a cell under this fraction of it is the kit, not the hand.
+#
+# Measured on **loudness**, not on `prominence`. The two axes answer different
+# questions and combining them here charged a cell twice for the same fact:
+# `SUPPORT_THRESHOLD` has already ruled on how *often* a cell is struck, and
+# `prominence` folds that same support back in as a multiplier, so a stroke
+# played in half the bars arrived at the contrast test with half the score before
+# anything about its loudness was considered.
+#
+# That is not a rounding error, it is the audit's open question about §14 and it
+# has a specimen: `folk-kit-human` varies which syncopation it plays, so the "&"
+# of 2 lands in half the bars and the "&" of 4 in the other half. Both clear
+# support — 0.5 is the threshold and they sit on it — and both were then cut by
+# contrast for being *occasional*, leaving `0 1 2.5 3`: the metronome, with the
+# groove averaged out of it. The complaint that started this was that the
+# patterns are not rhythmic, and this is one of the mechanisms that made them so.
+#
+# Loudness alone still separates the case contrast exists for, because a hi-hat
+# is not occasional — it is *quiet*, and quiet in every bar. Measured: the hat
+# reaches 0.36 of the bar's loudest cell and a real strum played half the time
+# reaches about 1.0.
 CONTRAST_RATIO = 0.45
+
+# ...but a cell struck in **every** bar is exempt from it, and the two halves of
+# that sentence have to be read together with the onset detector.
+#
+# Contrast exists to answer "everything is supported, so support says nothing",
+# and that was true while onsets came off the full mix — a hi-hat is present in
+# every bar, so it earns support 1.0 without a hand going anywhere near it. Under
+# `HarmonicOnsetDetector` it is no longer true: on the kit specimens the drum-only
+# cells come back with support **0.00**, because the kit is not in the harmonic
+# component at all. Support means what it says again, and "the player struck this
+# in every single bar" is not something a ratio should be allowed to overrule.
+#
+# It was overruling it, and this is the measurement that forced the exemption:
+# with the drums gone, the two *upstrokes* of D-DU-UD-U scored prominence 0.613
+# and 0.653 against a peak of 1.479 — under the 0.666 the ratio demands, by 0.05
+# and by 0.01. An upstroke is quieter than a downstroke; that is what makes it an
+# upstroke. Separating the drums widens the bar's dynamic range, and a rule
+# calibrated on the flatter full-mix distribution then cuts exactly the strokes
+# that carry the groove — leaving D-D--D- and calling it a pattern.
+#
+# So the relief is deliberately narrow, and its condition is this comment's own
+# first sentence turned around: **support may overrule contrast only where
+# support discriminates.** On a grid where every cell is struck, support has no
+# opinion and contrast is the only thing that can speak — the full-mix case,
+# unchanged. On a grid with *empty* cells in it, support has already told us
+# which ones the player struck, and asking those to prove themselves a second
+# time on loudness is asking the wrong question.
+#
+# **Loudness cannot make this distinction and the sparsity of the grid can**,
+# which is the whole reason the condition is shaped this way. Measured on the
+# specimens, as ratios of the bar's loudest cell:
+#
+#     a hi-hat, full mix, every bar          0.359
+#     a real upstroke played in every bar    0.414, 0.442
+#     a real upstroke played in half of them 0.335, 0.414
+#
+# Those overlap, so no contrast threshold exists that keeps the third row and
+# drops the first — a fact worth stating plainly, because the obvious fix is to
+# nudge `CONTRAST_RATIO` and there is no value of it that works. On grid sparsity
+# the same cases are not close at all: the kit fills every cell of the grid it is
+# on (0% empty) and the guitar leaves a quarter of them empty (25%), because
+# leaving cells empty is what playing a rhythm *is*. An eighth of the grid — one
+# cell in eight — is the floor, comfortably under the 25% the real grooves show
+# and comfortably over the 0% a kit leaves.
+#
+# On a sparse grid `SUPPORT_THRESHOLD` is then the only gate, and deliberately so:
+# once support is known to discriminate, "the player struck this in half the
+# bars" is the same *kind* of evidence as "in all of them", and it is the
+# half-the-bars case that carries a groove. A human varies which syncopation they
+# play; `folk-kit-human` is that specimen, and holding it to a higher bar left it
+# reading `0 1 2.5 3` — the metronome underneath the groove, which is the
+# complaint this module was reported for.
+SPARSE_GRID_SHARE = 0.125
 
 # And a hard ceiling, in strokes per quarter-note beat — eight in 4/4. Nobody
 # strums sixteen times a bar on the material this service accepts, and a pattern
@@ -103,6 +176,27 @@ TOLERANCE_BEATS = 0.12
 # small enough that a real subdivision (which costs a quarter-beat per onset it
 # cannot place) always clears it.
 SUBDIVISION_MARGIN_BEATS = 0.05
+
+# And how much better a **non-nesting rival** has to fit before the feel changes.
+# Relative, not in beats, because the two comparisons are not the same question:
+# a finer grid that nests is asking "is there more detail here", where an
+# absolute floor is right; a rival is asking "is this song in threes or in twos",
+# where the honest test is whether it explains the timing *substantially* better.
+#
+# It has to be relative because an absolute floor cannot separate the two cases
+# that matter, and both are real:
+#
+#   a genuine 16th feel  (0, .75, 1, 1.75, 2, 3) — only two of its six onsets are
+#       off the triplet grid, so triplets score 0.028 against 16ths' 0.000. An
+#       absolute margin of 0.05 says "close enough" and prints triplets.
+#   a duple groove read late — every onset detected a shade after it began, so
+#       eighths score 0.070 and triplets 0.060 by luck. A bare "better wins"
+#       hands the song to triplets over a *thousandth* of a beat.
+#
+# Halving is comfortably clear of both: 0.000 is less than half of 0.028 so 16ths
+# still win, 0.060 is not less than half of 0.070 so the duple groove survives,
+# and a real triplet feel (0.000 against the eighth grid's 0.167) wins by a mile.
+SUBDIVISION_RIVAL_SHARE = 0.5
 
 # Louder than this multiple of the bar's mean onset strength reads as an accent.
 ACCENT_RATIO = 1.35
@@ -165,6 +259,28 @@ SNAP_SIMILARITY = 0.7
 # How far apart two stroke positions may be and still be the same stroke, when
 # an extraction is matched against the library.
 SNAP_TOLERANCE_BEATS = 0.05
+
+# How much support a cell the library wants to **add** must already have.
+#
+# The snap's own docstring promises it is "a correction and never an invention",
+# and the rule had no way to keep that promise: it took the library entry whole,
+# including positions the recording showed *nothing* at. On a groove with a
+# deliberate hole in it — nothing on beat 3, which is a very ordinary thing to
+# play — the nearest idiom is the campfire pattern with beat 3 in it, and the
+# player got handed a stroke they had pointedly not played.
+#
+# The argument for adding a cell is real, but it is narrower than the rule was:
+# an extraction one cell short of an idiom is *probably* that idiom with one
+# stroke that fell under `SUPPORT_THRESHOLD`. That sentence is a claim about
+# evidence, so it can be checked — a stroke that nearly cleared the bar left
+# support behind, and a stroke nobody played left none. Half the threshold, so
+# "nearly made it" is the whole of what qualifies.
+#
+# Positions the library *drops* need no evidence, and removing the gate there
+# would be the same mistake pointing the other way: the extraction saying less
+# than the library is exactly the case where the library should not be trusted
+# over the recording.
+SNAP_EVIDENCE_SUPPORT = SUPPORT_THRESHOLD / 2
 
 
 class FoldedOnset(NamedTuple):
@@ -271,11 +387,17 @@ def choose_subdivision(positions: list[float]) -> int:
       `SUBDIVISION_MARGIN_BEATS`. This is §14's "don't over-fit": without the
       bias, timing jitter alone would always favour the finest grid and invent
       syncopation out of it.
-    - Against a grid it **doesn't** nest inside, the better fit simply wins.
-      Triplets and 16ths are different feels, not two resolutions of one grid, and
-      3 is only nominally coarser than 4 — a 16th sits just 1/12 of a beat off a
-      triplet cell, so a margin measured in beats would hand every 16th-note
-      pattern to the triplet grid.
+    - Against a grid it **doesn't** nest inside, the better fit wins — but it has
+      to be *substantially* better (`SUBDIVISION_RIVAL_SHARE`). Triplets and 16ths
+      are different feels, not two resolutions of one grid, and 3 is only
+      nominally coarser than 4, so the ordering here cannot express a preference
+      for the coarser one. What it can express is a refusal to change the song's
+      feel over nothing: an attack is detected slightly after it begins, so onsets
+      carry a systematic late bias, and with a bare "better wins" a bias of 0.07
+      beats was enough for the triplet grid to beat the eighth grid by a
+      *thousandth* and take the whole song with it. `direction_for` reads this
+      number, so every "&" in every bar changed hand. Observed on the noisy
+      specimen, where it turned a clean D-DU-UD-U into `0 1 1.667 2.667 3 3.667`.
 
     Mean error is also what makes this survive a full mix. Scored by *share of
     onsets explained*, one consistent hi-hat 16th per bar — a sixth of the
@@ -299,7 +421,7 @@ def choose_subdivision(positions: list[float]) -> int:
         rivals = [s for s in finer if s % subdivision != 0]
         if any(scores[subdivision] > scores[s] + SUBDIVISION_MARGIN_BEATS for s in nested):
             continue
-        if any(scores[subdivision] > scores[s] for s in rivals):
+        if any(scores[s] < scores[subdivision] * SUBDIVISION_RIVAL_SHARE for s in rivals):
             continue
         return subdivision
     return SUBDIVISIONS[-1]
@@ -364,7 +486,7 @@ def extract(onsets_in_bar: list[FoldedOnset], *, bar_beats: float, bars: int,
         return fallback(bar_beats=bar_beats, tempo=tempo, name=name,
                         time_signature=time_signature)
 
-    kept, snapped = snap_to_idiom(kept, bar_beats=bar_beats)
+    kept, snapped = snap_to_idiom(kept, bar_beats=bar_beats, scored=scored)
 
     # Re-read the grid off the strokes that survived, because that is the grid
     # the pattern is actually on and `direction_for` reads directions from it.
@@ -397,11 +519,17 @@ def _with_contrast(scored: list[_Cell]) -> list[_Cell]:
     Two rules on top of `SUPPORT_THRESHOLD`, and they answer different halves of
     the same complaint:
 
-    **Contrast.** A cell has to reach `CONTRAST_RATIO` of the bar's strongest
-    cell. That is what separates the hand from the kit when both are present in
-    every bar and support therefore says nothing: on the measured case the six
-    strums sit near the peak and the hi-hat's own cells sit at a third of it, so
-    the six survive and the wall of eighths does not.
+    **Contrast.** A cell has to be struck at `CONTRAST_RATIO` of the loudness of
+    the bar's strongest cell. That is what separates the hand from the kit when
+    both are present in every bar and support therefore says nothing: on the
+    measured case the six strums sit near the peak and the hi-hat's own cells sit
+    at a third of it, so the six survive and the wall of eighths does not.
+
+    On *loudness* and not on `prominence`, which is the same number with support
+    folded in — see `CONTRAST_RATIO` for the specimen that forced the
+    distinction. Support has already had its say one line above, and charging a
+    cell for it twice is what turned a groove whose syncopation varies from bar
+    to bar into the metronome underneath it.
 
     **A ceiling.** Whatever survives, at most `MAX_STROKES_PER_BEAT` per beat,
     ranked by prominence and then by metrical weight — so when the budget bites
@@ -410,13 +538,25 @@ def _with_contrast(scored: list[_Cell]) -> list[_Cell]:
     is struck *equally* and contrast has nothing to discriminate with: sixteen
     equal cells become the eight-note skeleton underneath them, which is what
     the recording is actually playing.
+
+    **Relief**, and only on a grid where support means something. When
+    `SPARSE_GRID_SHARE` of the cells are *empty*, support has already selected
+    which cells the player struck and contrast steps aside. On a grid where
+    everything is struck — the full mix, where a hi-hat guarantees it — nothing
+    is relieved and this is the rule it always was.
+
+    See `SPARSE_GRID_SHARE` for why the condition is sparsity and not loudness:
+    a hi-hat and a real upstroke overlap on loudness, so there is no threshold
+    that separates them, and they do not overlap on this at all.
     """
     if not scored:
         return []
-    peak = max(c.prominence for c in scored)
+    peak = max(c.strength for c in scored)
+    empty = sum(1 for c in scored if c.support < SUPPORT_THRESHOLD)
+    sparse = empty >= max(1, round(SPARSE_GRID_SHARE * len(scored)))
     kept = [c for c in scored
             if c.support >= SUPPORT_THRESHOLD
-            and c.prominence >= peak * CONTRAST_RATIO]
+            and (sparse or c.strength >= peak * CONTRAST_RATIO)]
 
     budget = max(1, int(round(MAX_STROKES_PER_BEAT * _beats_in(scored))))
     if len(kept) > budget:
@@ -450,7 +590,8 @@ def _metrical_weight(position: float) -> float:
     return 0.0
 
 
-def snap_to_idiom(kept: list[_Cell], *, bar_beats: float) -> tuple[list[_Cell], bool]:
+def snap_to_idiom(kept: list[_Cell], *, bar_beats: float,
+                  scored: list[_Cell] | None = None) -> tuple[list[_Cell], bool]:
     """Pull an extraction onto the nearest strum people actually play (§14).
 
     The direct answer to "patterns should be more musical". The chord side
@@ -474,6 +615,8 @@ def snap_to_idiom(kept: list[_Cell], *, bar_beats: float) -> tuple[list[_Cell], 
     positions = [c.position for c in kept]
     best_name, best_positions, best_score = "", (), 0.0
     for name, candidate in library:
+        if not _supportable(candidate, kept, scored or kept, bar_beats):
+            continue
         score = stroke_similarity(positions, candidate)
         # Ties go to the sparser entry: "don't over-fit" applies to the library
         # exactly as it applies to the grid.
@@ -500,6 +643,28 @@ def snap_to_idiom(kept: list[_Cell], *, bar_beats: float) -> tuple[list[_Cell], 
             prominence=source.prominence if near else 0.0,
         ))
     return snapped, True
+
+
+def _supportable(candidate: tuple[float, ...], kept: list[_Cell],
+                 scored: list[_Cell], bar_beats: float) -> bool:
+    """Whether every stroke this library entry would *add* has evidence for it.
+
+    A position the extraction already holds needs nothing. A position it does not
+    has to have left `SNAP_EVIDENCE_SUPPORT` behind on the grid — the recording
+    saying "there was something here" even though it did not clear
+    `SUPPORT_THRESHOLD`. See that constant for why the entry is rejected outright
+    rather than trimmed: the library's entries are grooves people play, and half
+    of one is not.
+    """
+    for position in candidate:
+        if any(_distance_in_bar(position, cell.position, bar_beats) <= SNAP_TOLERANCE_BEATS
+               for cell in kept):
+            continue
+        near = [cell for cell in scored
+                if _distance_in_bar(position, cell.position, bar_beats) <= SNAP_TOLERANCE_BEATS]
+        if not near or max(cell.support for cell in near) < SNAP_EVIDENCE_SUPPORT:
+            return False
+    return True
 
 
 def stroke_similarity(a: list[float] | tuple[float, ...], b: list[float] | tuple[float, ...]) -> float:

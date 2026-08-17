@@ -70,7 +70,7 @@ class AnalysisOutcome:
 
     meta: VideoMeta
     songs: dict[str, dict]          # difficulty → CompositionPayload wire dict
-    sync: VideoSync | None          # shared across difficulties; None when weak
+    sync: VideoSync | None          # the sidecar itself; None when none was built
     low_confidence: bool
     engine_chords: str
     engine_beats: str
@@ -89,6 +89,28 @@ class AnalysisOutcome:
     # operator should have to be in. Not on the wire: the player is told the
     # sync is unavailable, which is all it can act on.
     low_confidence_reasons: tuple[str, ...] = ()
+    # **Which difficulties the sidecar is actually true of.**
+    #
+    # The sidecar is one object — it describes the *recording*, so its anchors,
+    # tempo and bar grid are the same whichever tier the player asked for. What is
+    # per-tier is whether the tier's chart still *agrees* with it: `model.impose`
+    # can drop a section from one tier, and `lint_sync` then rejects that pairing.
+    #
+    # That check used to withhold the sidecar from **every** tier on the first
+    # failure, so an `easy` render coming out a section short cost `hard` and
+    # `normal` their video sync too — and the log line named only the tier that
+    # failed, so the two that were fine looked untouched. Video sync is the
+    # product's differentiator, and it should not be all-or-nothing across renders
+    # that are allowed to differ by design. The store is already keyed on
+    # `(video_id, difficulty)`, which is exactly the granularity this needs.
+    #
+    # Empty when no sidecar was built at all (low confidence, §13.3).
+    sync_tiers: frozenset[str] = frozenset()
+
+    def sync_for(self, difficulty: str) -> VideoSync | None:
+        """The sidecar to store against one difficulty — `None` when this tier's
+        chart and the sidecar disagree."""
+        return self.sync if difficulty in self.sync_tiers else None
 
 
 def gate(meta: VideoMeta, *, settings, store) -> None:
@@ -198,6 +220,7 @@ def assemble(
     model = song_model.build(
         grid=grid, raw=raw, onsets=onsets, energy=energy,
         vote=getattr(settings, "theory_consensus", True),
+        weigh=getattr(settings, "theory_belief", True),
         consolidate=getattr(settings, "theory_vocabulary", True),
         correct_octave=getattr(settings, "theory_tempo_octave", False),
     )
@@ -260,6 +283,7 @@ def assemble(
         groups=len(model.groups),
         rewrittenBars=model.consensus.rewritten_bars,
         contestedBars=model.consensus.contested_bars,
+        weighedBars=model.consensus.weighed_bars,
         snappedSpans=model.vocabulary.snapped_spans,
         absorbedIslands=model.vocabulary.absorbed_islands,
         phaseShift=model.meter.phase_shift,
@@ -304,6 +328,7 @@ def assemble(
 
     # --- §13, the sidecar ----------------------------------------------------
     sync: VideoSync | None = None
+    sync_tiers: set[str] = set()
     if not low_confidence:
         sync = build_sync(
             video_id=meta.video_id,
@@ -332,16 +357,28 @@ def assemble(
         # cursor would walk off the song, and a self-paced song that's right
         # beats a video-synced one that's wrong. Drop the sidecar, keep the song.
         #
-        # Checked against EVERY difficulty, not just the reference: one sidecar
-        # is returned alongside whichever tier the player asked for, so it has to
-        # be true of all of them. The tiers share a bar grid and normally agree —
-        # this catches the case where simplification shortened one of them.
-        for tier, wire in songs.items():
+        # Checked against EVERY difficulty, not just the reference: one sidecar is
+        # returned alongside whichever tier the player asked for, so it has to be
+        # true of the tier being served. The tiers share a bar grid and normally
+        # agree — this catches the case where simplification shortened one of them.
+        #
+        # **Per tier, not all-or-nothing.** This used to `break` on the first
+        # failure and withhold the sidecar everywhere, which punished two renders
+        # for a third one's shape; `impose` is allowed to drop a section per tier,
+        # so that case is by design rather than a symptom. Each tier now keeps or
+        # loses video sync on its own evidence, and the log says which did what.
+        for tier, wire in sorted(songs.items()):
             problems = lint_sync(CompositionPayload.model_validate(wire), sync)
             if problems:
-                log.warning("sidecar withheld for %s (%s tier): %s", meta.video_id, tier, problems)
-                sync = None
-                break
+                log.warning("sidecar withheld for %s (%s tier): %s",
+                            meta.video_id, tier, problems)
+            else:
+                sync_tiers.add(tier)
+        if not sync_tiers:
+            # No tier accepted it, so there is no sidecar to report either. Keeps
+            # "`sync is None`" meaning exactly what it always meant: this analysis
+            # has no usable video sync.
+            sync = None
 
     return AnalysisOutcome(
         meta=meta,
@@ -354,4 +391,5 @@ def assemble(
         duration_ms=duration_ms,
         theory=theory,
         low_confidence_reasons=tuple(reasons),
+        sync_tiers=frozenset(sync_tiers),
     )

@@ -25,6 +25,7 @@ metadata, and `duration` is a field a video can simply not have.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -41,11 +42,14 @@ log = logging.getLogger("chords.fetch.ytdlp")
 
 _SAMPLE_RATE = 22050
 
-# Wall-clock ceilings. Both sit under the job deadline (§5.1's 180 s) so a stuck
-# fetch fails as a fetch rather than as an unexplained job timeout.
+# Wall-clock ceilings, and **defaults only** — `config.Settings` owns the real
+# numbers so that the three of them plus the DSP reserve can be checked against the
+# job deadline as one budget (see the long note there). They were constants here,
+# and constants in three files is how the set came to sum to 405 s inside a
+# container that was killed at 300 s and a job deadline of 180.
 _PROBE_TIMEOUT_S = 45
-_FETCH_TIMEOUT_S = 240
-_DECODE_TIMEOUT_S = 120
+_FETCH_TIMEOUT_S = 120
+_DECODE_TIMEOUT_S = 90
 
 # A 10-minute song at a sane bitrate is a few MB. 256 MB means something is
 # wrong — a mislabelled duration, a live stream, a video that is not a song —
@@ -92,10 +96,11 @@ _MEDIA_REFUSED_MARKERS = (
     "403: forbidden",
 )
 
-# How long a sticky egress session is held. It only has to outlive one fetch —
-# `_FETCH_TIMEOUT_S` is 240 s — and every fetch asks for a new one, so a longer
-# lifetime would not make any single download more reliable, it would just keep
-# reusing an address after it stopped being needed.
+# How long a sticky egress session is held. It has to outlive one **analysis** —
+# probe plus fetch, so `probe_timeout_s + fetch_timeout_s`, comfortably inside ten
+# minutes at the configured 45 + 120 — and every analysis asks for a new one, so a
+# longer lifetime would not make any single download more reliable, it would just
+# keep reusing an address after it stopped being needed.
 _PROXY_SESSION_LIFETIME_M = 10
 
 
@@ -114,14 +119,14 @@ def _is_media_refused(stderr: str) -> bool:
     return any(marker in (stderr or "").lower() for marker in _MEDIA_REFUSED_MARKERS)
 
 
-def _sticky_proxy(raw: str) -> str:
-    """`raw` with a fresh per-fetch session pinned onto the credential.
+def _sticky_proxy(raw: str, session: str) -> str:
+    """`raw` with `session` pinned onto the credential.
 
     The pool is bought rotating, and rotating is still what we want *between*
-    fetches — every retry has to be a fresh draw or `EgressBlocked` has nothing to
+    jobs — every retry has to be a fresh draw or `EgressBlocked` has nothing to
     retry into. What broke the download is that it also rotated *within* one
-    fetch. This asks for both: one address for the life of a single yt-dlp
-    invocation, a new one next time.
+    fetch. This asks for both: one address for the life of a single analysis, a
+    new one next time.
 
     IPRoyal takes its pool directives in the **password** (`pass_session-<id>_
     lifetime-<n>m`); other vendors put them in the username, so this is
@@ -146,7 +151,6 @@ def _sticky_proxy(raw: str) -> str:
     user, _, password = userinfo.partition(":")
     if "_session-" in password:
         return raw
-    session = uuid.uuid4().hex[:12]
     password = f"{password}_session-{session}_lifetime-{_PROXY_SESSION_LIFETIME_M}m"
     return f"{scheme}://{user}:{password}@{hostport}"
 
@@ -197,6 +201,13 @@ class YtDlpSource:
         self._settings = settings
         self._ytdlp = [sys.executable, "-m", "yt_dlp"]
         self._ffmpeg = os.environ.get("CHORDS_FFMPEG", "ffmpeg")
+        self._probe_timeout = int(getattr(settings, "probe_timeout_s", _PROBE_TIMEOUT_S))
+        self._fetch_timeout = int(getattr(settings, "fetch_timeout_s", _FETCH_TIMEOUT_S))
+        self._decode_timeout = int(getattr(settings, "decode_timeout_s", _DECODE_TIMEOUT_S))
+        # The proxy session this source is currently using, and the *cached probe
+        # result* that was resolved through it. See `_common_args`.
+        self._session: str | None = None
+        self._probed: tuple[str, str] | None = None
         # Optional cookies, and deliberately unset in this deployment: measured
         # against the bot check they made no difference at all (see
         # `_BOT_CHECK_MARKERS`). Kept because they remain yt-dlp's supported
@@ -291,8 +302,48 @@ class YtDlpSource:
                 target.write(self._cookies_data)
             os.chmod(path, 0o600)
             self._materialized = path
+            # Removed when the process ends. A Modal container's filesystem dies
+            # with it, so this is belt-and-braces there — but this source also runs
+            # under `ThreadJobRunner` in a long-lived local process and in the
+            # bench harness, and a 0600 file full of session cookies that outlives
+            # the run that needed it is a credential left lying around.
+            atexit.register(self._discard_cookie_file)
             log.info("cookies: materialized from CHORDS_YTDLP_COOKIES_CONTENT")
         return self._materialized
+
+    def _discard_cookie_file(self) -> None:
+        path, self._materialized = self._materialized, None
+        if not path:
+            return
+        try:
+            os.unlink(path)
+        except OSError:      # pragma: no cover - cleanup, never fatal
+            pass
+
+    # -- egress session ------------------------------------------------------
+
+    def _new_session(self) -> str:
+        """Start a fresh egress session. One per **analysis**, not per subprocess.
+
+        `probe` opens one and `decode` reuses it, and that is a correctness fix
+        rather than a saving. Two things follow from it:
+
+        - **The address that cleared the bot check is the one that downloads.** The
+          check is per egress IP at roughly 1-in-6, and a job needs *both* calls to
+          get through. Drawing independently meant two chances to be refused —
+          `1 − p²` rather than `1 − p` — so the old comment here ("two draws are
+          better than one") had it backwards: independent draws are better when
+          either one will do, and worse when you need both.
+        - **A googlevideo media URL is bound to the IP that resolved it.** With
+          separate sessions the metadata was resolved on one address and the bytes
+          requested from another, which is exactly the 403 `MediaUrlRefused`
+          documents on label-owned uploads.
+
+        Rotation between jobs is untouched: a retry lands on a new container, or on
+        a re-probe here, and either way asks the pool for a new address.
+        """
+        self._session = uuid.uuid4().hex[:12]
+        return self._session
 
     def _common_args(self) -> list[str]:
         args = ["--no-warnings", "--no-playlist", "--socket-timeout", "15",
@@ -301,24 +352,21 @@ class YtDlpSource:
         if cookies:
             args += ["--cookies", cookies]
         if self._proxy:
-            # A fresh session **per invocation**, which is the unit that has to be
-            # IP-stable: one `yt_dlp` subprocess resolves a media URL and then
-            # downloads it, and those two requests must leave from one address.
-            # `probe` and `_fetch` are separate subprocesses and deliberately get
-            # separate sessions — nothing carries between them, and two draws are
-            # better than one.
-            args += ["--proxy", _sticky_proxy(self._proxy)]
+            args += ["--proxy", _sticky_proxy(self._proxy, self._session or self._new_session())]
         return args
 
     # -- metadata only ------------------------------------------------------
 
     def probe(self, video_id: str) -> VideoMeta:
+        # A new session per analysis, opened here because `probe` is the first
+        # thing an analysis does. `decode` inherits it — see `_new_session`.
+        self._new_session()
         result = _run(
             self._ytdlp + self._common_args() + [
                 "--skip-download", "--dump-single-json",
                 f"https://www.youtube.com/watch?v={video_id}",
             ],
-            timeout=_PROBE_TIMEOUT_S,
+            timeout=self._probe_timeout,
         )
         if result.returncode != 0:
             if _looks_unavailable(result.stderr):
@@ -368,7 +416,7 @@ class YtDlpSource:
             "-i", str(media),
             "-ac", "1", "-ar", str(sample_rate), "-c:a", "pcm_s16le",
             str(wav),
-        ], timeout=_DECODE_TIMEOUT_S)
+        ], timeout=self._decode_timeout)
         if result.returncode != 0 or not wav.is_file():
             log.warning("decode failed for %s: %s", video_id, (result.stderr or "").strip()[:400])
             raise FetchError("That video’s audio couldn’t be decoded.")
@@ -413,7 +461,7 @@ class YtDlpSource:
                 "-o", template,
                 f"https://www.youtube.com/watch?v={video_id}",
             ],
-            timeout=_FETCH_TIMEOUT_S,
+            timeout=self._fetch_timeout,
             cwd=workdir,
         )
         if result.returncode != 0:

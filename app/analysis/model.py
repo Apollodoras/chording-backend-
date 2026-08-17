@@ -106,6 +106,13 @@ class SongModel:
     # do not. Default False so a hand-assembled model renders exactly as it did
     # before this stage existed.
     consolidated: bool = False
+    # Whether §20.9's belief reduction was part of the vote, carried for the same
+    # reason as `vote_groups` and `vote_key`: `render` replays the vote, and a
+    # replay that took a *different* reduction from the reference one would put
+    # the tiers back on separate structures — the exact fiction §20.6 exists to
+    # end. Default True because that is the deployed posture and because a model
+    # assembled by hand takes the same vote `build` would have taken.
+    weighed: bool = True
     confidence: float = 0.0
     total_bars: int = 0
     # How much of the reference tier survived normalization exactly (§5.4) —
@@ -164,7 +171,7 @@ def per_bar_energy(curve: EnergyCurve | None, axis: BeatAxis) -> list[float] | N
 
 def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
           energy: EnergyCurve | None = None, vote: bool = True,
-          consolidate: bool = True,
+          weigh: bool = True, consolidate: bool = True,
           correct_octave: bool = False) -> SongModel | None:
     """Features → the song model. **Pure**, and the half worth testing directly.
 
@@ -220,7 +227,7 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
     if vote:
         bars, report = consensus.apply(
             bars, vote_groups, bar_beats=bar_beats,
-            tonic_pc=key.tonic_pc, mode=key.scale,
+            tonic_pc=key.tonic_pc, mode=key.scale, weigh=weigh,
         )
         if report.touched:
             # The key was detected from the chords the engine reported, and the
@@ -250,7 +257,7 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
     return SongModel(
         meter=meter, axis=axis, key=key, sections=sections, groups=groups,
         patterns=patterns, consensus=report, vocabulary=vocab,
-        consolidated=consolidate,
+        consolidated=consolidate, weighed=weigh,
         confidence=postprocess.mean_confidence(spans),
         total_bars=sum(s.total_bars for s in sections),
         exact_ratio=postprocess.exact_ratio(spans),
@@ -303,7 +310,7 @@ def render(model: SongModel, raw: list[RawChordSpan], difficulty: str) -> list[S
         bars, _ = consensus.apply(
             bars, model.vote_groups, bar_beats=float(model.axis.bar_beats),
             tonic_pc=vote_key.tonic_pc, mode=vote_key.scale,
-            record=False,
+            record=False, weigh=model.weighed,
         )
     return impose(model.sections, bars)
 
