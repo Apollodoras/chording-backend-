@@ -17,7 +17,10 @@ the beat tracker are chosen by the §8-step-2 benchmark, and `engine_name` +
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime, types only
+    from .tuning import Tuning
 
 # The decoded-audio handle. Typed as Any rather than np.ndarray because numpy is
 # in the `audio` extra: the API container must not import it, and the type
@@ -173,7 +176,12 @@ class ChordEngine(Protocol):
     name: str
     version: str
 
-    def analyze(self, pcm: PCM, sr: int) -> list[RawChordSpan]: ...
+    # `tuning` is the recording's pitch reference, measured once by the
+    # pipeline (`analysis/tuning.py`). Keyword-only and optional so that an
+    # engine which does not care can ignore it, and so that omitting it means
+    # exactly what it used to mean: assume the record is at A440.
+    def analyze(self, pcm: PCM, sr: int, *,
+                tuning: "Tuning | None" = None) -> list[RawChordSpan]: ...
 
 
 @runtime_checkable

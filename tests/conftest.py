@@ -296,7 +296,7 @@ class FakeChordEngine:
     version: str = "1.0.0"
     spans: list[RawChordSpan] | None = None
 
-    def analyze(self, pcm, sr):
+    def analyze(self, pcm, sr, *, tuning=None):
         return list(self.spans) if self.spans is not None else known_chords()
 
 

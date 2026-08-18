@@ -56,6 +56,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.analysis import engines, postprocess  # noqa: E402
+from app.analysis import tuning as tuning_probe  # noqa: E402
 from app.analysis.axis import build_axis  # noqa: E402
 from app.analysis.downbeats import modal_bar_beats  # noqa: E402
 from app.analysis.downbeats import repair as repair_downbeats  # noqa: E402
@@ -146,7 +147,13 @@ def chords_for(name: str, case: Case) -> tuple[list[RawChordSpan], float]:
     if key not in _CHORD_RUNS:
         engine = engines._CHORD_ENGINES[name]()
         started = time.monotonic()
-        spans = engine.analyze(case.pcm, case.sample_rate)
+        # The recording's own pitch reference, measured the same way the
+        # pipeline measures it. Without this the bench scores every real track as
+        # though it were at A440 — which is exactly the assumption that put 82%
+        # of Mary Jane's Last Dance a semitone out, and a benchmark that cannot
+        # exercise the fix cannot show it working or catch it regressing.
+        spans = engine.analyze(case.pcm, case.sample_rate,
+                               tuning=tuning_probe.estimate(case.pcm, case.sample_rate).correction)
         _CHORD_RUNS[key] = (spans, time.monotonic() - started)
     return _CHORD_RUNS[key]
 

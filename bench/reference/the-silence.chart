@@ -1,0 +1,22 @@
+# Manchester Orchestra — The Silence. The owner's format specimen.
+# The A major carries C#, so the mode is Dorian rather than Aeolian; the
+# analysis reporting `aeolian` here is a real disagreement, not a rounding.
+Title: The Silence
+Artist: Manchester Orchestra
+Key: E minor (Dorian)
+Tempo: 75
+Time: 4/4
+
+[Intro]
+| Em | D | A | Em |
+| Em | D | A | Em |
+
+[Verse 1]
+| Em | D | A | Em |
+| Em | D | A | Em |
+| Em | D | A | Em |
+| Em | D | A | Em |
+
+[Chorus 1]
+| G | D | A | Em |
+| G | D | A | Em |

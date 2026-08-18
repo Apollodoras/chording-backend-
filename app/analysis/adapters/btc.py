@@ -38,6 +38,7 @@ import sys
 import threading
 from pathlib import Path
 
+from ..tuning import CONCERT_PITCH, Tuning
 from ..types import PCM, RawChordSpan
 
 log = logging.getLogger("chords.engines.btc")
@@ -335,7 +336,8 @@ class BtcEngine:
 
     # -- inference ---------------------------------------------------------
 
-    def analyze(self, pcm: PCM, sr: int) -> list[RawChordSpan]:
+    def analyze(self, pcm: PCM, sr: int, *,
+                tuning: Tuning | None = None) -> list[RawChordSpan]:
         import numpy as np
         import torch
 
@@ -346,7 +348,7 @@ class BtcEngine:
             pcm = librosa.resample(np.asarray(pcm, dtype="float32"),
                                    orig_sr=sr, target_sr=_SAMPLE_RATE)
 
-        features, times_s = _features(np, pcm)
+        features, times_s = _features(np, pcm, tuning or CONCERT_PITCH)
         if features.shape[0] == 0:
             return []
         features = (features - self._mean) / self._std
@@ -377,7 +379,7 @@ class BtcEngine:
         return _spans(self._labels, predictions, confidences, times_s)
 
 
-def _features(np, pcm):
+def _features(np, pcm, tuning: Tuning = CONCERT_PITCH):
     """log-CQT, framed in 10-second blocks. Returns `(features, frame_times_s)`.
 
     **The blocking is BTC's framing, not a way of transforming the audio.** BTC was
@@ -409,6 +411,11 @@ def _features(np, pcm):
     import librosa
 
     audio = np.asarray(pcm, dtype="float32")
+    # In the CQT's own bin units, which is what `cqt(tuning=...)` takes. Computed
+    # once: the pitch reference is a property of the recording, not of a block,
+    # and re-estimating per block would let it wander mid-song — the exact
+    # failure this parameter exists to remove.
+    tuning_bins = tuning.bins(_BINS_PER_OCTAVE)
     step = int(_SAMPLE_RATE * _CHUNK_S)
     context = _context_frames() * _HOP
     hop_s = _HOP / _SAMPLE_RATE
@@ -422,7 +429,8 @@ def _features(np, pcm):
         low = max(0, start - context)
         high = min(len(audio), start + block_len + context)
         spectrum = librosa.cqt(audio[low:high], sr=_SAMPLE_RATE, n_bins=_N_BINS,
-                               bins_per_octave=_BINS_PER_OCTAVE, hop_length=_HOP)
+                               bins_per_octave=_BINS_PER_OCTAVE, hop_length=_HOP,
+                               tuning=tuning_bins)
         # `center=True` centres frame k of this slice at sample `low + k · hop`, and
         # `start - low` is a whole number of hops by construction — so the block's
         # own frames start at exactly this offset and there is no resampling of the

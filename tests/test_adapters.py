@@ -367,7 +367,7 @@ def test_an_engine_is_built_once_and_reused():
         def __init__(self):
             built.append(1)
 
-        def analyze(self, pcm, sr):
+        def analyze(self, pcm, sr, *, tuning=None):
             return []
 
     engines.register_chord_engine("counted", Counted)

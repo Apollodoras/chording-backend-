@@ -21,6 +21,7 @@ nine spans and wreck the quantizer downstream.
 
 from __future__ import annotations
 
+from ..tuning import CONCERT_PITCH, Tuning
 from ..types import PCM, RawChordSpan
 
 # Sharps throughout; `app.chords.normalize` maps enharmonics, so the choice only
@@ -65,7 +66,8 @@ class ChromaTemplateEngine:
     name = "chroma"
     version = "1.0"
 
-    def analyze(self, pcm: PCM, sr: int) -> list[RawChordSpan]:
+    def analyze(self, pcm: PCM, sr: int, *,
+                tuning: Tuning | None = None) -> list[RawChordSpan]:
         import librosa
         import numpy as np
 
@@ -73,7 +75,13 @@ class ChromaTemplateEngine:
         # energy that lands in every pitch class, which is noise to a template
         # matcher. Cheaper than it looks, and worth several points.
         harmonic = librosa.effects.harmonic(pcm, margin=2.0)
-        chroma = librosa.feature.chroma_cqt(y=harmonic, sr=sr, hop_length=HOP)
+        # Same pitch-reference correction as the BTC adapter, for the same
+        # reason: `chroma_cqt` estimates its own tuning when handed None, and
+        # estimating it *here* would let the answer differ from the one the
+        # rest of the analysis was told. One measurement, passed down.
+        chroma = librosa.feature.chroma_cqt(
+            y=harmonic, sr=sr, hop_length=HOP,
+            tuning=(tuning or CONCERT_PITCH).bins(12))
         if chroma.shape[1] == 0:
             return []
 

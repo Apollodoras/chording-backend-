@@ -1,0 +1,88 @@
+# Metallica — So What (Anti-Nowhere League cover, Garage Inc.)
+# videoId ZaGrNq9VrCc ("Metallica - Topic")
+#
+# Note: Bars read off Chordify's beat grid for this recording. The verse
+# Note: measures D5(16 beats) A5(16) D5(16) A5(16) and the chorus
+# Note: F5(4) Bb5(4) A5(8) F5(4) Bb5(4) A5(16).
+#
+# Note: POWER CHORDS. Every guitar chord here is a fifth — there is no third in
+# Note: the recording, so "major or minor" is a question the audio does not
+# Note: answer. The app's grammar is a port of the client's ChordSymbol and has
+# Note: no `5` quality, so the system CANNOT emit A5; what it can emit is `A`,
+# Note: which is also what Ultimate Guitar prints. The gradeable claim is
+# Note: therefore: right root, and no invented third. `A` passes, `Am` fails.
+# Note: Chordify makes the same slip we do — its own grid contains a stray Dm
+# Note: and a 4-bar Am inside verse 4, on bars that are plainly D5 and A5.
+#
+# Note: MODE. A5 D5 F5 Bb5 is A Phrygian (the b2 is the Bb). Chordify reports
+# Note: key "A"; our analysis reported D minor, which is defensible modally —
+# Note: every chord is in D natural minor too — but A is the tonal centre.
+#
+# Note: Ultimate Guitar's "G A G A" intro is from a tab whose author says it is
+# Note: "a simplified version for newbies". The timed evidence says A5, and G
+# Note: does not appear in this recording at all.
+Title: So What
+Artist: Metallica
+Key: A minor (Phrygian)
+Tempo: 188
+Time: 4/4
+
+[Intro]
+| A5 | A5 | A5 | A5 |
+| A5 | A5 | A5 | A5 |
+
+[Verse 1]
+| D5 | D5 | D5 | D5 |
+| A5 | A5 | A5 | A5 |
+| D5 | D5 | D5 | D5 |
+| A5 | A5 | A5 | A5 |
+
+[Chorus 1]
+| F5 | Bb5 | A5 | A5 |
+| F5 | Bb5 | A5 | A5 |
+| A5 | A5 |
+
+[Verse 2]
+| D5 | D5 | D5 | D5 |
+| A5 | A5 | A5 | A5 |
+| D5 | D5 | D5 | D5 |
+| A5 | A5 | A5 | A5 |
+
+[Chorus 2]
+| F5 | Bb5 | A5 | A5 |
+| F5 | Bb5 | A5 | A5 |
+| A5 | A5 |
+
+[Verse 3]
+| D5 | D5 | D5 | D5 |
+| A5 | A5 | A5 | A5 |
+| D5 | D5 | D5 | D5 |
+| A5 | A5 | A5 | A5 |
+
+[Chorus 3]
+| F5 | Bb5 | A5 | A5 |
+| F5 | Bb5 | A5 | A5 |
+| A5 | A5 |
+
+[Verse 4]
+| D5 | D5 | D5 | D5 |
+| A5 | A5 | A5 | A5 |
+| D5 | D5 | D5 | D5 |
+| A5 | A5 | A5 | A5 |
+
+[Chorus 4]
+| F5 | Bb5 | A5 | A5 |
+| F5 | Bb5 | A5 | A5 |
+| A5 | A5 |
+
+[Verse 5]
+| D5 | D5 | D5 | D5 |
+| A5 | A5 | A5 | A5 |
+| D5 | D5 | F5 | F5 |
+| A5 | A5 | A5 | A5 |
+
+[Outro]
+| F5 | Bb5 | A5 | A5 |
+| F5 | Bb5 | A5 | A5 |
+| A5 | A5 | A5 | A5 |
+| A5 | A5 | A5 | A5 |

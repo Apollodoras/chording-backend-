@@ -45,6 +45,8 @@ from ..sync import DownbeatRepair, TheoryReport, VideoSync
 from . import model as song_model
 from .compile import build_sync, compile_song
 from .scratch import scratch
+from .tuning import CONCERT_PITCH, Tuning
+from . import tuning as tuning_probe
 from .types import BeatGrid, EnergyCurve, EngineInfo, Onset, RawChordSpan, VideoMeta
 
 log = logging.getLogger("chords.pipeline")
@@ -157,6 +159,15 @@ def analyze(
     with scratch(settings.scratch_root, label=video_id) as workdir:
         pcm, sample_rate = source.decode(video_id, workdir)
 
+        # BEFORE anything names a chord: what does this recording call A?
+        # A constant-Q filter bank is laid out from A440, and a record that
+        # is not at A440 puts every partial between two bins — which comes
+        # out as the right progression in the wrong key, with high
+        # confidence and nothing downstream able to see it. Measured once,
+        # here, because it is a property of the recording and every stage
+        # that transforms audio has to be told the same answer.
+        pitch = tuning_probe.estimate(pcm, sample_rate)
+
         report("analyzing", 0.35)
         # Beats first, then chords, then quantize chords to the grid: "a rhythm
         # game needs chord changes that land ON beats — raw frame-level chord
@@ -164,7 +175,7 @@ def analyze(
         # game, but a stroke lands on a stroke, so the requirement is the same.
         grid: BeatGrid = beat_tracker.track(pcm, sample_rate)
         report("analyzing", 0.6)
-        raw: list[RawChordSpan] = chord_engine.analyze(pcm, sample_rate)
+        raw: list[RawChordSpan] = chord_engine.analyze(pcm, sample_rate, tuning=pitch.correction)
         onsets: list[Onset] = onset_detector.detect(pcm, sample_rate) if onset_detector else []
         # §20.7 — a loudness envelope, the only evidence that can tell a chorus
         # from a verse. A scalar per hop, and the last thing to touch the audio.
@@ -186,11 +197,14 @@ def analyze(
     # From here on there is no audio anywhere in the process.
     report("analyzing", 0.85)
     elapsed = time.monotonic() - started
-    log.info("analysis of %s finished in %.1fs (%d chord spans, %d beats)",
-             video_id, elapsed, len(raw), len(grid.beats_ms))
+    log.info("analysis of %s finished in %.1fs (%d chord spans, %d beats, "
+             "tuning %+.0f cents%s)",
+             video_id, elapsed, len(raw), len(grid.beats_ms), pitch.cents,
+             " — CORRECTED" if pitch.ambiguous else "")
 
     return assemble(
         meta=meta, grid=grid, raw=raw, onsets=onsets, energy=energy, settings=settings,
+        tuning=pitch,
         chords_engine=EngineInfo(chord_engine.name, chord_engine.version),
         beats_engine=EngineInfo(beat_tracker.name, beat_tracker.version),
     )
@@ -206,6 +220,7 @@ def assemble(
     chords_engine: EngineInfo,
     beats_engine: EngineInfo,
     energy: EnergyCurve | None = None,
+    tuning: Tuning = CONCERT_PITCH,
 ) -> AnalysisOutcome:
     """Features → songs. **Pure** — this is the half the tests drive directly."""
     analyzed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -296,6 +311,8 @@ def assemble(
             inserted=model.meter.downbeats.inserted,
         ),
         exactRatio=round(model.exact_ratio, 3),
+        tuningCents=round(tuning.cents, 1),
+        tuningAmbiguous=tuning.ambiguous,
     )
 
     songs: dict[str, dict] = {}

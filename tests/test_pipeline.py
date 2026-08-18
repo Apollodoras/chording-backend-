@@ -146,7 +146,7 @@ def test_no_audio_survives_a_successful_job(settings, store):
 def test_no_audio_survives_a_failed_job(settings, store):
     """The failure path is the one that matters."""
     class Exploding(FakeChordEngine):
-        def analyze(self, pcm, sr):
+        def analyze(self, pcm, sr, *, tuning=None):
             raise RuntimeError("engine exploded")
 
     with pytest.raises(RuntimeError, match="engine exploded"):

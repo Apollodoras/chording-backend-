@@ -1,0 +1,96 @@
+# Tom Petty and The Heartbreakers — Mary Jane's Last Dance
+# videoId aowSGxim_O8 (TomPettyVEVO, the official music video)
+#
+# Note: The bar structure here is not guessed from a lyric-aligned tab. It is
+# Note: read off Chordify's beat grid for THIS recording, which is machine-timed
+# Note: against the same audio: the verse cycle measures G(2 beats) D(2) Am(4),
+# Note: and the chorus measures Em7(8) A(8) Em7(8) A(4) G(4). Ultimate Guitar
+# Note: prints the same cycle as "Am G Dsus2 Am", which is the same music with
+# Note: the barline drawn elsewhere and the sus spelled out.
+#
+# Note: WHERE THE BARLINE GOES. This was written first as "| Am | G D |" — Am on
+# Note: a whole bar, which is how it is conventionally printed — and that was
+# Note: wrong. The evidence is the seam: the chord immediately before every
+# Note: chorus is Am held TWO beats (Chordify reads "... G:2 D:2 Am:2 Em7:8"),
+# Note: and the chorus plainly starts on a downbeat. Two beats of Am can only
+# Note: end a bar if that bar is [D D Am Am] — so the phrase is "| Am G | D Am |"
+# Note: and the four-beat Am straddles the barline. The analysis got this right
+# Note: and the reference had it wrong, which is the failure mode this corpus has
+# Note: to be most careful about: a chart graded against a mistaken truth reads
+# Note: as an engine defect and costs a day chasing one.
+#
+# Note: MODE. Aeolian is wrong here: D major carries F#, and it is the chord the
+# Note: vamp turns on, so the verse is A Dorian. The chorus A major is the tonic
+# Note: borrowed major, not a key change. Published charts all say "Key: Am",
+# Note: which is the loose reading of the same thing.
+#
+# Note: FORM IS WEAK ON THIS SONG. Intro, verse and the instrumental links are
+# Note: harmonically identical, so where one ends and the next begins is a
+# Note: labelling choice, not a fact. Grade this song on roots, quality and
+# Note: vocabulary; read its form score as advisory.
+#
+# Note: This recording is 48 cents sharp of A440 — the fixture the corpus of
+# Note: backing tracks and modern covers structurally could not contain.
+Title: Mary Jane's Last Dance
+Artist: Tom Petty and The Heartbreakers
+Key: A minor (Dorian)
+Tempo: 84
+Time: 4/4
+
+[Intro]
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+
+[Verse 1]
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+
+[Verse 2]
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+
+[Chorus 1]
+| Em7 | Em7 | A | A |
+| Em7 | Em7 | A | G |
+
+[Verse 3]
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+
+[Chorus 2]
+| Em7 | Em7 | A | A |
+| Em7 | Em7 | A | G |
+
+[Verse 4]
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+
+[Chorus 3]
+| Em7 | Em7 | A | A |
+| Em7 | Em7 | A | G |
+
+[Outro]
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am G | D Am |
+| Am | Am |

@@ -171,6 +171,15 @@ class TheoryReport(BaseModel):
     # existed, and one that neither 1.0 ("all exact") nor 0.0 ("none of it") can
     # tell the truth about.
     exactRatio: Optional[float] = None
+    # How far this recording sits from A440, in cents, and whether that offset
+    # was close enough to a quarter tone that the semitone it snapped to was a
+    # coin flip. Published because it is the one number that distinguishes "the
+    # engine misheard the harmony" from "the engine heard it in the wrong key" —
+    # and a chart that is a semitone out is otherwise perfectly self-consistent,
+    # so no other field here can betray it. Zero on any recording at concert
+    # pitch, which is most of them.
+    tuningCents: float = 0.0
+    tuningAmbiguous: bool = False
 
 
 class VideoSync(BaseModel):
