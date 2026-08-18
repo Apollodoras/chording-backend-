@@ -271,7 +271,7 @@ def cmd_chart(args) -> int:
 
     for slug, entry in _selected(args).items():
         chart, _ = system_chart(slug, entry)
-        print(render_chart(chart))
+        print(render_chart(chart, wrap=args.width))
     return 0
 
 
@@ -300,7 +300,7 @@ def cmd_grade(args) -> int:
                 print(f"  low confidence: {'; '.join(outcome.low_confidence_reasons)}")
             if args.render:
                 print()
-                print(render_chart(chart))
+                print(render_chart(chart, wrap=args.width))
             if args.diff:
                 print()
                 print(diff_bars(reference, chart, limit=args.limit))
@@ -340,6 +340,8 @@ def main() -> int:
         child.add_argument("--render", action="store_true")
         child.add_argument("--verbose", "-v", action="store_true")
         child.add_argument("--limit", type=int, default=64)
+        child.add_argument("--width", type=int, default=4,
+                           help="bars per printed line (display only; see render_chart)")
         child.set_defaults(handler=handler)
     args = parser.parse_args()
     return args.handler(args)

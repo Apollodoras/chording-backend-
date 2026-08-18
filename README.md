@@ -369,19 +369,39 @@ occurrence played.
 
 ### What it is worth
 
-Measured on the ten-song chart corpus (`bench/lab.py grade`), the layer is
-**accuracy-neutral and shape-transforming**, and both halves of that are the
-point:
+Measured on the ten-song chart corpus (`bench/lab.py grade`, and
+`CHORDS_THEORY_FORM=off` for the other row):
 
-| | root | triad | vocabulary emitted |
-|---|---|---|---|
-| §21 off | 0.866 | 0.847 | Creep 10, Wonderwall 9, Smooth Criminal 15 |
-| §21 on | 0.857 | 0.850 | Creep **4**, Wonderwall 8, Smooth Criminal 13 |
+| | root | triad | form | vocabulary emitted |
+|---|---|---|---|---|
+| §21 off | 0.804 | 0.788 | 0.674 | Creep 10, Wonderwall 9, Smooth Criminal 15 |
+| §21 on | **0.853** | **0.846** | 0.688 | Creep **4**, Wonderwall 8, Smooth Criminal 13 |
 
-The chords were already close to right; what was wrong was that the chart said
-them 88 different ways. Creep now compiles as one eight-bar section with
-`repeats: 11` and a four-chord vocabulary, which is the chart, and Zombie as
-`| C | G | D | Em |` twenty times over.
+**+0.049 root and +0.058 triad**, and eight of the ten songs improve. That is a
+much larger effect than any of §20's three correcting layers (each worth about
++0.003), and the reason is worth stating because it is not "voting harder": those
+layers ask whether a *bar* was misheard and are gated so they mostly cannot
+answer, while this one asks what the *section* plays and always can.
+
+Two of the four largest gains come from `settle_to_bars` rather than from the
+vote — Viva La Vida +0.144 and Don't Stop Believin' +0.091 — and the mechanism is
+worth knowing: a bar holding the tail of one chord and the head of the next
+matches *neither* reference bar, so a change a beat early costs the root twice.
+Creep (+0.069) is the vote's own case, and it is the one where the shape matters
+more than the number: it now compiles as one eight-bar section with `repeats: 11`
+and a four-chord vocabulary, which is the chart, and Zombie as `| C | G | D | Em |`
+twenty times over.
+
+Smooth Criminal is the only song that goes down (−0.013), and it is the corpus's
+known outlier for reasons that have nothing to do with this layer.
+
+It runs to a **fixed point**, and that is where the last of the root goes. Each
+round ends by re-finding the form on the bars it just rewrote, and `form.detect`
+re-derives the period and the phase to do it — so the blocks it returns are
+often not the ones just made to agree, and after one round Wonderwall's chorus
+is two readings again and prints as one flat run of thirty bars. The corpus
+converges in three rounds; a fourth is a no-op on all ten songs. Against a single
+round that is form +0.014 and root −0.004.
 
 ### Two changes that did not ship, and why
 
@@ -405,9 +425,9 @@ kind of change from an improvement:
 Ten popular songs with hand-written reference charts in `bench/reference/`, and
 a cached-features harness (`bench/lab.py`) that regrades all ten in about a
 second. Root scores after §21, best to worst: Creep 1.000, I'm Yours 0.985, Viva
-La Vida 0.971, Zombie 0.943, Three Little Birds 0.902, Someone Like You 0.885,
-Wonderwall 0.861, Country Roads 0.840, Don't Stop Believin' 0.838, Smooth
-Criminal 0.342. Nine of ten keys are exact.
+La Vida 0.971, Zombie 0.943, Someone Like You 0.885, Three Little Birds 0.882,
+Wonderwall 0.852, Country Roads 0.840, Don't Stop Believin' 0.838, Smooth
+Criminal 0.330. Nine of ten keys are exact.
 
 Smooth Criminal is the outlier and it is the owner's own failing case, on the
 9:26 short film: the first minute is dialogue, the beat tracker emits **no beats

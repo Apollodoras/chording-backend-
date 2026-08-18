@@ -409,11 +409,21 @@ def _bars_from_section(wire: dict, beats_per_bar: int) -> list[Bar]:
 # Printing
 # --------------------------------------------------------------------------
 
-def render_chart(chart: Chart, *, width: int = 6) -> str:
+def render_chart(chart: Chart, *, width: int = 6, wrap: int | None = None) -> str:
     """Back to the text format. Round-trips `parse_chart`.
 
     This is what makes a failing grade *readable*: reference and output printed
     in one shape, so the difference is visible rather than inferred from a score.
+
+    `wrap` breaks a long phrase across lines of at most that many bars. **Off by
+    default, and it has to be**: one line is one phrase in this format, so
+    wrapping changes the parse — a 30-bar phrase printed four bars to a line reads
+    back as eight phrases. It exists because the payload cannot always say
+    `repeats`: a section with a mid-bar change compiles in bars mode, where the
+    app ignores `repeats` (see `compile._section`), so the repeats are expanded
+    and Wonderwall's chorus arrives here as one 30-bar phrase that prints as a
+    single unreadable line. Pass it when a human is going to read the output;
+    never when the result is going to be parsed again.
     """
     out = []
     if chart.title:
@@ -430,9 +440,16 @@ def render_chart(chart: Chart, *, width: int = 6) -> str:
         out.append("")
         out.append(f"[{section.label}]")
         for phrase in section.phrases:
-            cells = " ".join(f"| {' '.join(bar.chords):<{width}}" for bar in phrase)
-            out.append(f"{cells} |")
+            for line in _lines(phrase, wrap):
+                cells = " ".join(f"| {' '.join(bar.chords):<{width}}" for bar in line)
+                out.append(f"{cells} |")
     return "\n".join(out) + "\n"
+
+
+def _lines(phrase: tuple[Bar, ...], wrap: int | None) -> list[tuple[Bar, ...]]:
+    if not wrap or len(phrase) <= wrap:
+        return [phrase]
+    return [phrase[i:i + wrap] for i in range(0, len(phrase), wrap)]
 
 
 def describe(chart: Chart) -> str:
