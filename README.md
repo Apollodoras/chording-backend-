@@ -19,7 +19,7 @@ mirrors deliberately — §16).
 
 **Working end to end, in the deployed shape, and now measured on the thing that
 actually matters.** A YouTube id (or an uploaded file) goes in; a linted
-`CompositionPayload` v2 and a `videoSync` sidecar come out. 619 tests, green, no
+`CompositionPayload` v2 and a `videoSync` sidecar come out. 656 tests, green, no
 audio and no network required to run them.
 
 That last clause is new and it was the important one. Every number this repo
@@ -59,6 +59,7 @@ App Review 5.2.3 stays a non-event — is [`RIGHTS.md`](RIGHTS.md).
 | Deploy gate | ✅ `scripts/smoke.py` — `/healthz` audit, one real analysis, and a proof that the cache hit is free |
 | Seeded catalog | ⚠️ `scripts/seed_catalog.py` — 12 known songs graded against published transcriptions: 9 correct, 1 mostly, **1 wrong, 1 unanalyzable** ([below](#what-the-seeded-catalog-says)) |
 | Service audit (2026-08-17) | ✅ four ship blockers, four performance findings, two audio-accuracy findings and fourteen smaller ones — all fixed, with the measurements ([below](#the-service-audit-2026-08-17)) |
+| Fetch (2026-08-17) | ✅ `player_client=android` — yt-dlp's default returned 403 on the bytes for *every* video; the suite could not see it ([below](#the-media-url-403-and-the-client-that-is-served)) |
 
 One real analysis, start to finish, on this machine:
 
@@ -579,6 +580,8 @@ See [`RIGHTS.md`](RIGHTS.md).
 | `scripts/smoke.py` | the deploy gate — audits a live `/healthz`, then analyzes one video for real |
 | `scripts/real_song_check.py` | *does* the pipeline run on real audio — the third gate |
 | `scripts/seed_catalog.py` | *is the chart right* — seeds `chord_maps` and grades it against published transcriptions |
+| `scripts/secret_check.py` | what each Modal secret really carries — key names, the proxy's shape, and the time budget re-derived from the values |
+| `scripts/worker_check.py` | *did the worker image build an engine* — the gap a green `/healthz` cannot see |
 | `scripts/admin.py` | §3's takedown CLI, from a laptop |
 
 ---
@@ -708,7 +711,7 @@ Dechorder" lands as that slug.)
 CHORDS_SCALE_OUT=1 modal deploy modal_app.py                 # 1 ⇒ chords-secrets holds a Postgres DSN
 CHORDS_BASE_URL=https://…modal.run python scripts/smoke.py   # the API container
 modal run scripts/worker_check.py                            # the worker image
-modal run scripts/worker_env_check.py                        # the worker secret
+modal run scripts/secret_check.py                            # both secrets
 ```
 
 `CHORDS_SCALE_OUT` is the operator asserting what is in `chords-secrets`, so the
@@ -849,7 +852,7 @@ rather than silently losing writes.
 
 What is *in* the worker secret is invisible from outside — `/healthz` reports the
 API container's own posture, and on this two-container shape that is correctly
-"no fetch, no engines, no egress". `scripts/worker_env_check.py` asks the worker
+"no fetch, no engines, no egress". `scripts/secret_check.py` asks the worker
 instead, and prints key names and the proxy's scheme and host, never a value.
 
 Keep this deployment's credentials separate from Mo's (§19.2). Same Firebase
@@ -896,11 +899,20 @@ Three consequences worth building on:
    written — about five minutes, which is why the iOS client's poll deadline had
    to move 240 s → 480 s.
 
-   **The player client is not a lever, and was measured before being dismissed.**
-   Six containers × eight clients (`default`, `web_safari`, `mweb`, `android`,
-   `ios`, `tv`, `tv_embedded`, `web_embedded`): the one clean IP served all eight,
-   the five blocked IPs refused all eight. So a `player_client` knob was
-   deliberately **not** added — it would only look like a lever.
+   **The player client is not a lever *against the bot check*, and was measured
+   before being dismissed.** Six containers × eight clients (`default`,
+   `web_safari`, `mweb`, `android`, `ios`, `tv`, `tv_embedded`, `web_embedded`):
+   the one clean IP served all eight, the five blocked IPs refused all eight. The
+   check is on the address, so no client can move it.
+
+   That sentence used to end "so a `player_client` knob was deliberately **not**
+   added — it would only look like a lever", and the second half of that did not
+   survive [the 403 below](#the-media-url-403-and-the-client-that-is-served),
+   which is a different failure reachable from the same place and which the client
+   is the *only* thing that moves. The knob exists now
+   (`CHORDS_YTDLP_PLAYER_CLIENT`). Both facts are true at once, and the useful
+   lesson is that "measured and dismissed" was recorded against a conclusion
+   broader than the measurement.
 
 2. **The fix is egress, and the retry budget now says so** (2026-08-04). Set
    **`CHORDS_YTDLP_PROXY`** to a *rotating residential* pool and the first
@@ -950,28 +962,84 @@ Three consequences worth building on:
    | `36X3wecT2z8` blues-in-e | 2/3 | 3/3 |
    | `85Sqw6FTxm4` canon-fingerstyle | 2/3 | 3/3 |
 
-   The binding is enforced on label-owned content and slack on ordinary uploads —
-   which is precisely why all three gates stayed green while a real user could not
-   play an official music video. `ytdlp_source._sticky_proxy` therefore pins a
-   fresh `_session-<id>_lifetime-10m` per yt-dlp invocation: sticky *within* one
-   fetch, a new draw *between* fetches, so `EgressBlocked` still has somewhere to
+   `ytdlp_source._sticky_proxy` therefore pins a fresh
+   `_session-<id>_lifetime-10m` per **analysis** — probe and fetch inherit one
+   session, a new draw between analyses, so `EgressBlocked` still has somewhere to
    retry into. Do **not** pin a session in `CHORDS_YTDLP_PROXY` itself — that is
    one address for every job forever, i.e. the static-datacentre failure above.
    `real_song_check.py`'s `label-owned-fetch` entry exists to fail if this
-   regresses.
+   regresses, and did exactly that on 2026-08-17 — for the other reason, below.
 
-3. **Label-owned music is a second, separate wall.** Every official Beatles
-   upload in `bench/corpus.json` is refused in every player client. On the one
-   occasion cookies *did* clear the bot check, YouTube answered with storyboard
-   images (`sb0`–`sb3`, mhtml) and no audio format at all — the PO-token/SABR
-   path, which needs a token provider, not a credential. The corpus ids are kept
-   under `--songs isophonics` so the situation stays checkable.
+   The reading recorded here at the time was that "the binding is enforced on
+   label-owned content and slack on ordinary uploads". The table is real and it is
+   the measurement that motivated the sticky session, but that generalisation was
+   drawn from three videos and it is **wrong**: re-measured on 2026-08-17, the
+   ordinary uploads fail on exactly the same clients as the label-owned one. What
+   the sticky session fixes is the *rotation*, for everyone.
 
-   A PO-token provider is **not** the missing piece, and it is worth not
-   spending a week finding that out: yt-dlp's own provider documentation now
-   states that passing PO tokens no longer clears the bot check in the majority
-   of cases. It is a moving target maintained against a service that keeps
-   changing it. Egress is the stable lever.
+3. <a name="the-media-url-403-and-the-client-that-is-served"></a>**And the
+   client the media URL is resolved through — which broke every fetch**
+   (2026-08-17). A sticky session is necessary and stopped being sufficient. Every
+   video in the corpus came back `MediaUrlRefused`: probe served, formats listed,
+   403 on the bytes, from the *same* address that had just resolved them
+   (verified: three requests through one pinned session, one IP, three times).
+
+   The variable that moved it was the **player client**. Measured in the worker
+   image, one sticky session per attempt, on an ordinary upload, an official label
+   upload and a Beatles remaster:
+
+   | player client | `36X3wecT2z8` | `8ui9umU0C2g` | `CGj85pVzRJs` |
+   |---|---|---|---|
+   | `default` (`android vr`) | 403 | bot check | bot check |
+   | **`android`** | **ok (fmt 18)** | **ok (fmt 18)** | **ok (fmt 18)** |
+   | `android_music` | 403 | 403 | 403 |
+   | `android_creator` | 403 | 403 | 403 |
+   | `tv_embedded` | 403 | 403 | 403 |
+   | `web`, `web_embedded` | no format available | no format available | no format available |
+   | `tv` | DRM protected | — | — |
+
+   Every client that offers the audio-only `140` stream is refused the bytes, and
+   the one client that is served offers only progressive `18`. So the fetch now
+   downloads ~11 MB of video for a four-minute song and throws the picture away in
+   ffmpeg — paid once per song ever, because the map is cached and shared, and
+   strictly better than the alternative of not fetching at all. `_PLAYER_CLIENT`
+   in `ytdlp_source` carries the table; `CHORDS_YTDLP_PLAYER_CLIENT` overrides it,
+   because the one certainty is that this moves again.
+
+   It was **not** a stale yt-dlp: the worker had 2026.07.04 and `pip install -U`
+   in the same container returned the same version. Nothing in this repo changed
+   to cause it and nothing in this repo could have caught it — no unit test
+   reaches YouTube, so the 656-test suite, `/healthz` and `smoke.py`'s cache-hit
+   proof were all green while every real analysis failed.
+
+4. **Label-owned music is not a separate wall.** This section used to say the
+   opposite — "every official Beatles upload in `bench/corpus.json` is refused in
+   every player client", offered as a second, categorical obstacle — and the
+   2026-08-17 re-measurement retires it. Under the residential pool and the
+   `android` client, `--songs isophonics` analyzes **2 of 3** Beatles remasters
+   end to end, with the tempo landing on the Isophonics ground truth:
+
+   | | chords | tempo | truth |
+   |---|---|---|---|
+   | Let It Be | 150, 98% on C/G/Am/F | 70.0 bpm | 69.85 |
+   | Michelle | 111, 64% on expected roots | 115.0 bpm | 117.42 |
+   | Norwegian Wood | bot check on both attempts — retryable, not a wall | | |
+
+   Why the old claim looked solid: it was measured unproxied, where the bot check
+   made every attempt fail, and "the Beatles are blocked" is a more satisfying
+   story than "this IP is blocked". The three ids are ordinary videos to YouTube's
+   delivery layer. What is *not* retired is the rights posture — nothing about
+   fetchability changes what [`RIGHTS.md`](RIGHTS.md) says about what may be
+   stored or shipped, and the Isophonics ids stay out of the seeded catalog for
+   that reason and not for this one.
+
+   One artefact of the old era is worth keeping: on the single occasion cookies
+   cleared the bot check, YouTube answered with storyboard images (`sb0`–`sb3`,
+   mhtml) and no audio format — the PO-token/SABR path. A PO-token provider is
+   still **not** the missing piece, and it is worth not spending a week finding
+   that out: yt-dlp's own provider documentation states that passing PO tokens no
+   longer clears the bot check in the majority of cases. Egress plus the right
+   client is the stable lever.
 
 `ytdlp_source` still accepts both cookie settings. They are the right mechanism
 for age-restricted and members-only video, and worth revisiting if egress ever

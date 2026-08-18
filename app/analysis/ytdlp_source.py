@@ -86,15 +86,56 @@ _BOT_CHECK_MARKERS = (
 )
 
 # The *download* refusing an URL the *probe* was given happily. See
-# `MediaUrlRefused` for the mechanism and the measurement; the short version is
-# that a googlevideo URL is bound to the IP that resolved it, so this is what a
-# per-request rotating proxy looks like from the media endpoint. Matched only on
-# the fetch, never on the probe: a 403 there is a different animal, and marking
-# it retryable would buy cold starts for videos that fail identically forever.
+# `MediaUrlRefused`, whose docstring carries both mechanisms this has now been
+# measured to have — a media URL fetched from an address other than the one that
+# resolved it (fixed by `_sticky_proxy`), and a media URL resolved through a
+# player client YouTube declines to serve (fixed by `_PLAYER_CLIENT`). Matched
+# only on the fetch, never on the probe: a 403 there is a different animal, and
+# marking it retryable would buy cold starts for videos that fail identically
+# forever.
 _MEDIA_REFUSED_MARKERS = (
     "http error 403",
     "403: forbidden",
 )
+
+# Which yt-dlp **player client** resolves the media URL, and as of 2026-08-17 the
+# difference between an analysis and a 403 on every video in the corpus.
+#
+# This file used to say, in `__init__`, that the player client was measured and
+# is not a lever. That measurement was real and it is still true *about the thing
+# it measured*: against the **bot check**, six Modal IPs × eight clients came back
+# all-or-nothing per IP — the clean address served every client, the blocked ones
+# refused every client. The check is on the address, so the client cannot move it.
+#
+# The 403 on the media URL is a different failure that happens to be reachable
+# from the same place, and there the client is the only thing that matters.
+# Measured in the worker image, one sticky session per attempt, on three videos —
+# an ordinary upload, an official label upload, and a Beatles remaster:
+#
+#     client            36X3wecT2z8    8ui9umU0C2g    CGj85pVzRJs
+#     default (vr)      403            bot check      bot check
+#     android           **ok (18)**    **ok (18)**    **ok (18)**
+#     android_music     403            403            403
+#     android_creator   403            403            403
+#     tv_embedded       403            403            403
+#     web / web_embedded   no format available on any of the three
+#     tv                DRM protected
+#
+# So: every client that offers the audio-only `140` stream is refused the bytes,
+# and the one client that is served hands back progressive `18` instead. That is
+# the whole reason `-f` still ends in a `/best` fallback — under this client there
+# is no audio-only format to prefer, and the pipeline throws the video away in
+# ffmpeg a moment later. The cost is transfer, not correctness: ~11 MB for a
+# four-minute song against ~2 MB for `140`, paid once per song ever because the
+# map is cached and shared (§5.3).
+#
+# Overridable, because the one certainty here is that this moves: YouTube retires
+# clients and yt-dlp adds them. `CHORDS_YTDLP_PLAYER_CLIENT=""` restores yt-dlp's
+# own default, which is the setting this had for the first two weeks of August and
+# which returns 403 today. `scripts/real_song_check.py` is where a regression
+# shows up, and it is the only gate that can see one: no unit test reaches
+# YouTube, and the failure is invisible to every green suite.
+_PLAYER_CLIENT = "android"
 
 # How long a sticky egress session is held. It has to outlive one **analysis** —
 # probe plus fetch, so `probe_timeout_s + fetch_timeout_s`, comfortably inside ten
@@ -218,12 +259,19 @@ class YtDlpSource:
         self._cookies_path = os.environ.get("CHORDS_YTDLP_COOKIES") or None
         self._cookies_data = os.environ.get("CHORDS_YTDLP_COOKIES_CONTENT") or None
         self._materialized: str | None = None
+        # Which player client resolves the media URL — see `_PLAYER_CLIENT` for
+        # the measurement, and for why "the player client is not a lever" was
+        # true of the bot check and false of the 403 that replaced it.
+        self._player_client = os.environ.get(
+            "CHORDS_YTDLP_PLAYER_CLIENT", _PLAYER_CLIENT).strip() or None
         # **The actual lever on the bot check**, and the only one measurement
         # supports. Cookies changed nothing (6/30 both arms) and neither did the
         # player client (six IPs × eight clients: the clean IP served all eight,
-        # the blocked ones refused all eight). The check is on the *address*, so
-        # the fix is to leave from somewhere else — a **rotating residential**
-        # proxy, as `scheme://user:pass@host:port`.
+        # the blocked ones refused all eight) — that last clause is about the bot
+        # check *only*, and `_PLAYER_CLIENT` is the failure it does not cover.
+        # The check is on the *address*, so the fix is to leave from somewhere
+        # else — a **rotating residential** proxy, as
+        # `scheme://user:pass@host:port`.
         #
         # Rotating and residential are both load-bearing words. A *static*
         # datacentre address — which is what a cloud provider's static-egress
@@ -348,6 +396,14 @@ class YtDlpSource:
     def _common_args(self) -> list[str]:
         args = ["--no-warnings", "--no-playlist", "--socket-timeout", "15",
                 "--retries", "2", "--no-progress"]
+        if self._player_client:
+            # On both calls, not just the download. The probe is what resolves the
+            # formats the download then asks for, so a probe on one client and a
+            # fetch on another is the same shape of mistake as a probe on one IP
+            # and a fetch on another — it picks a format the second client was
+            # never offered, and `_UNAVAILABLE_MARKERS` reports "requested format
+            # is not available", which reads as a fact about the video.
+            args += ["--extractor-args", f"youtube:player_client={self._player_client}"]
         cookies = self._cookie_file()
         if cookies:
             args += ["--cookies", cookies]
@@ -456,6 +512,12 @@ class YtDlpSource:
                 # Audio-only, preferring the smallest acceptable stream: the
                 # pipeline resamples to 22.05 kHz mono regardless, so a
                 # high-bitrate download buys nothing but transfer time.
+                #
+                # The trailing `/best` is not decoration. Under the player client
+                # this has to use (see `_PLAYER_CLIENT`) YouTube offers no
+                # audio-only format at all, so every fetch lands here and takes
+                # progressive `18` — video included, thrown away by ffmpeg one
+                # step later. ~11 MB rather than ~2 MB, once per song ever.
                 "-f", "worstaudio[abr>=64]/bestaudio/best",
                 "--max-filesize", str(_MAX_DOWNLOAD_BYTES),
                 "-o", template,
@@ -471,12 +533,17 @@ class YtDlpSource:
                 log.error(
                     "yt-dlp resolved a media URL and was then refused it (403) — "
                     "nothing is wrong with this video, and the probe for it "
-                    "succeeded. A googlevideo URL is bound to the IP that "
-                    "resolved it, so this is what per-request proxy rotation "
-                    "looks like from the media endpoint. Retrying on a fresh "
-                    "container draws a fresh sticky session. If it persists, the "
-                    "pool is rotating inside a single fetch: CHORDS_YTDLP_PROXY "
-                    "must support session pinning (see `_sticky_proxy`)."
+                    "succeeded. Two causes, in the order worth checking: (1) the "
+                    "player client is one YouTube will not serve bytes to, which "
+                    "fails for *every* video and is what CHORDS_YTDLP_PLAYER_"
+                    "CLIENT exists for — currently %s; (2) a googlevideo URL is "
+                    "bound to the IP that resolved it, so per-request proxy "
+                    "rotation gets refused at the media endpoint, and "
+                    "CHORDS_YTDLP_PROXY must support session pinning (see "
+                    "`_sticky_proxy`). A retry lands on a fresh container and "
+                    "draws a fresh sticky session, which settles (2) and cannot "
+                    "touch (1): if every video fails, it is (1).",
+                    self._player_client or "yt-dlp's own default",
                 )
                 raise MediaUrlRefused()
             log.warning("fetch failed for %s: %s", video_id, (result.stderr or "").strip()[:400])

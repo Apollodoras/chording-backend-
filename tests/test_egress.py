@@ -288,3 +288,49 @@ def test_healthz_reports_no_egress_at_all_on_a_container_that_cannot_fetch(setti
     app = create_app(settings, store=store, source=None)
     with TestClient(app) as client:
         assert client.get("/healthz").json()["egress"] is None
+
+
+# --- the player client -------------------------------------------------------
+
+def _extractor_arg(args: list[str]) -> str | None:
+    if "--extractor-args" not in args:
+        return None
+    return args[args.index("--extractor-args") + 1]
+
+
+def test_the_player_client_is_pinned_on_probe_and_fetch(monkeypatch):
+    """One client for the whole analysis, for the same reason as one address.
+
+    The probe resolves the formats the fetch then asks for by id. Probing on one
+    client and downloading on another asks for a format the second client was
+    never offered, and yt-dlp reports "requested format is not available" — which
+    `_UNAVAILABLE_MARKERS` turns into a calm, permanent "can't have this video",
+    i.e. a fact about the recording rather than about our own arguments.
+    """
+    monkeypatch.delenv("CHORDS_YTDLP_PLAYER_CLIENT", raising=False)
+    source = ytdlp_source.YtDlpSource()
+
+    probe_args = _extractor_arg(source._common_args())
+    fetch_args = _extractor_arg(source._common_args())
+
+    assert probe_args == "youtube:player_client=android"
+    assert fetch_args == probe_args
+
+
+def test_the_player_client_is_overridable(monkeypatch):
+    """The one certainty about this setting is that it moves: YouTube retires
+    clients and yt-dlp adds them, and the next change must not need a deploy of
+    this repo to answer."""
+    monkeypatch.setenv("CHORDS_YTDLP_PLAYER_CLIENT", "ios")
+
+    assert _extractor_arg(ytdlp_source.YtDlpSource()._common_args()) == \
+        "youtube:player_client=ios"
+
+
+def test_an_empty_player_client_restores_yt_dlps_own_default(monkeypatch):
+    """The escape hatch, and deliberately spelled as *absent* rather than as the
+    literal string "default" — `--extractor-args youtube:player_client=default`
+    means something specific to yt-dlp, and it is not "leave this alone"."""
+    monkeypatch.setenv("CHORDS_YTDLP_PLAYER_CLIENT", "")
+
+    assert "--extractor-args" not in ytdlp_source.YtDlpSource()._common_args()

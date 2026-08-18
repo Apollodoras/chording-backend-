@@ -17,13 +17,21 @@ recording, inside the deployed image, with the real worker secret.
 ## Why not the Isophonics corpus
 
 `bench/corpus.json` has YouTube ids with real ground truth, which would be the
-obvious thing to check against. They are all unfetchable from Modal: every one
-of the official Beatles uploads answers a datacentre IP with the bot check, in
-every player client, **with or without cookies**. Ordinary uploads — covers,
-backing tracks, small channels — resolve from the same IP in the same second, so
-this is not a blanket IP ban but per-video enforcement on label-owned music.
-They are kept under `--songs isophonics` so the situation stays checkable, not
-because they are expected to pass.
+obvious thing to check against, and they are kept here under `--songs isophonics`.
+
+This docstring used to say they were unfetchable — "per-video enforcement on
+label-owned music", measured unproxied, where in fact *everything* was failing
+the bot check and the Beatles were simply what got tried. Re-measured 2026-08-17
+through the residential pool on the `android` client, 2 of the 3 analyze end to
+end with the tempo landing on the Isophonics ground truth (Let It Be 70.0 vs
+69.85; Michelle 115.0 vs 117.42); Norwegian Wood met the bot check on both
+attempts, which is the ordinary per-IP lottery and retryable.
+
+They are still not the *default* set, for a different and better reason than the
+one that used to be given: ground truth makes them a **bench** corpus, and the
+bench runs on local audio where alignment is controlled. This gate answers "does
+the deployment work on real audio", and a song with a famous recording is not the
+easiest place to see that.
 
 The default set is therefore chosen for *verifiability by eye* instead: a 12-bar
 blues is E/A/B and nothing else, and Canon in D is a fixed eight-chord cycle. If
@@ -76,17 +84,18 @@ SONGS = {
         "title": "Manchester Orchestra - The Silence (Official Music Video)",
         "expect": set(),
         "fetchOnly": True,
-        "note": ("An *official label upload that is nonetheless fetchable*, and the "
-                 "only entry here that is. Every other default is an ordinary "
-                 "upload, and the Isophonics ids are label-owned but blocked — so "
-                 "between them they left a gap that a real user fell into: "
-                 "label-owned media URLs are IP-bound, which made per-request "
-                 "proxy rotation 403 the download 3/3 while the probe succeeded "
-                 "and while all four ordinary uploads passed. This exists to fail "
-                 "if `_sticky_proxy` ever stops pinning a session. Chord roots are "
-                 "deliberately not asserted — it is here for the fetch, and "
-                 "inventing an expected key for a song nobody verified would make "
-                 "the gate lie in the other direction."),
+        "note": ("Here for the **fetch**, not for the chords. It was added when "
+                 "per-request proxy rotation 403'd the download 3/3 while the "
+                 "probe succeeded and all four ordinary uploads passed, and it "
+                 "was read at the time as a property of label-owned content. It "
+                 "is not — on 2026-08-17 the same 403 arrived on every video "
+                 "here, ordinary uploads included, and the variable was the "
+                 "player client rather than the ownership. Keeping the entry "
+                 "anyway: it is a fetch that failed twice for two different "
+                 "reasons, which makes it the most productive URL in the file. "
+                 "Chord roots are deliberately not asserted — inventing an "
+                 "expected key for a song nobody verified would make the gate lie "
+                 "in the other direction."),
     },
     # -- the Isophonics ids, kept for the record. All bot-checked. -------------
     "iso-let-it-be": {"videoId": "CGj85pVzRJs", "title": "Let It Be (Isophonics)",
@@ -346,7 +355,7 @@ def _verdict(reports: list[dict]) -> int:
             # Still fatal above if it produced no chords — that is the fetch
             # working. Just no accuracy verdict, because no key was asserted.
             notes.append(f"{name}: {report['chordCount']} chords — fetch path OK "
-                         "(label-owned; roots not asserted)")
+                         "(fetch-only entry; roots not asserted)")
         else:
             share = report.get("shareInExpectedRoots", 0)
             verdict = "strong" if share >= 0.7 else "partial" if share >= 0.4 else "WEAK"

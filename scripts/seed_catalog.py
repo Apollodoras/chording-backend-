@@ -31,12 +31,15 @@ chord. `tempo` is the recording's, and half/double time is reported as such
 rather than failed — a tracker that hears 140 in a 70bpm ballad is not wrong
 about the music, only about which layer of it to call the beat.
 
-Covers, backing tracks and karaoke uploads, deliberately: the Isophonics ids are
-label-owned and answer a datacentre IP with the bot check (see
-`real_song_check.py`), and these resolve. It also means the *arrangement* may not
-match the famous one — a cover can transpose, drop a bridge or vamp an outro —
-so a key mismatch is reported with the cover's own key rather than treated as
-proof the engine is broken.
+Covers, backing tracks and karaoke uploads, deliberately — though the reason has
+changed and the choice has not. It used to be that the famous originals could not
+be fetched at all; since 2026-08-17 they can (see `real_song_check.py`), and the
+reason to keep this list as it is now is [`RIGHTS.md`](../RIGHTS.md): the seeded
+catalog is the one place this service *publishes* a chart to every player, and
+what is publishable is a rights question rather than a fetch question. It also
+means the *arrangement* may not match the famous one — a cover can transpose,
+drop a bridge or vamp an outro — so a key mismatch is reported with the cover's
+own key rather than treated as proof the engine is broken.
 """
 
 # The **local** half of this file is imported by the `modal` CLI, which runs on

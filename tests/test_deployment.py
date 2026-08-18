@@ -458,22 +458,28 @@ def test_the_deploy_says_out_loud_which_container_shape_it_chose():
 # *successful but slow* fetch SIGKILLed with no terminal status written, leaving the
 # player watching a spinner until the 900 s lease reaper noticed.
 
-def _modal_constant(name: str):
-    """One module-level `NAME = <literal>` out of `modal_app.py`.
+def _source_constant(relative_path: str, name: str):
+    """One module-level `NAME = <literal>` out of a file in the repo root.
 
     Read rather than imported for the reason the whole module gives: `modal` is not
-    a dependency of this package.
+    a dependency of this package, and both files this is used on import it at
+    module level.
     """
     import ast
     from pathlib import Path
 
-    tree = ast.parse((Path(__file__).resolve().parents[1] / "modal_app.py").read_text())
+    path = Path(__file__).resolve().parents[1] / relative_path
+    tree = ast.parse(path.read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == name:
                     return node.value.value
-    raise AssertionError(f"modal_app.py no longer defines {name}")
+    raise AssertionError(f"{relative_path} no longer defines {name}")
+
+
+def _modal_constant(name: str):
+    return _source_constant("modal_app.py", name)
 
 
 def test_the_stage_ceilings_fit_inside_the_job_deadline():
@@ -520,6 +526,22 @@ def test_the_worker_timeout_sits_outside_the_job_deadline():
         f"the lease ({Store._JOB_LEASE_S}s) must outlast the container timeout "
         f"({worker_timeout}s), or the reaper collects jobs that are still running"
     )
+
+
+def test_the_secret_checker_restates_the_budget_correctly():
+    """`scripts/secret_check.py` re-derives the chain from what a secret carries,
+    and to do that on a slim image it restates two constants it cannot import.
+
+    The whole point of that script is to catch a value that drifted out of sight;
+    a diagnostic whose own copy of the ceiling has drifted would report a healthy
+    chain while the deployment breaks, which is the failure it exists to prevent.
+    """
+    from app.store import Store
+
+    restated = lambda name: _source_constant("scripts/secret_check.py", name)  # noqa: E731
+
+    assert restated("WORKER_TIMEOUT_S") == _modal_constant("WORKER_TIMEOUT_S")
+    assert restated("JOB_LEASE_S") == Store._JOB_LEASE_S
 
 
 def test_a_timed_out_job_is_refunded():

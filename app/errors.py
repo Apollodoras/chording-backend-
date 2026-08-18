@@ -104,20 +104,34 @@ class EgressBlocked(VideoUnavailable):
 
 
 class MediaUrlRefused(EgressBlocked):
-    """The media URL was resolved on one address and fetched from another.
+    """The probe was served and the bytes were not — **403 on the media URL**.
 
-    YouTube binds a `googlevideo` media URL to the IP that asked for it. A
-    *per-request* rotating proxy hands each of yt-dlp's requests a different
-    residential address, so the player response is fetched from one and the bytes
-    are requested from another — and the download comes back **403 Forbidden**
-    while the metadata probe, which needs no such consistency, succeeds.
+    Two different causes have produced this, both measured, and the reason they
+    share an exception is that they share a shape: metadata comes back fine and
+    the download is refused, so nothing is wrong with the video.
 
-    Measured 2026-08-05 in the worker image, download stage, per attempt: the
-    official label upload `8ui9umU0C2g` scored **0/3** through the pool as it was
-    configured (403, 403, bot check) and 2/3 with a sticky session, while two
-    ordinary uploads scored 2/3 and 3/3 either way. So the binding is enforced on
-    label-owned content and slack on the rest — which is exactly why every deploy
-    gate stayed green: `real_song_check.py`'s corpus is ordinary uploads.
+    1. **The URL was resolved on one address and fetched from another** (measured
+       2026-08-05). YouTube binds a `googlevideo` media URL to the IP that asked
+       for it, and a *per-request* rotating proxy hands each of yt-dlp's requests
+       a different residential address. Fixed by `ytdlp_source._sticky_proxy`,
+       which pins one session for the life of an analysis.
+
+    2. **The URL was resolved through a player client YouTube declines to serve**
+       (measured 2026-08-17). Every client that offers the audio-only `140`
+       stream — yt-dlp's `android vr` default, `android_music`, `android_creator`,
+       `tv_embedded` — was refused the bytes on all three probe videos, while
+       `android` was served on all three. Fixed by
+       `ytdlp_source._PLAYER_CLIENT`, whose comment carries the table.
+
+    The second one is worth stating plainly because it broke **every** fetch, not
+    a category of them. This docstring used to conclude from cause 1 that "the
+    binding is enforced on label-owned content and slack on the rest". That
+    reading did not survive re-measurement: on 2026-08-17 an ordinary upload
+    (`36X3wecT2z8`), an official label upload (`8ui9umU0C2g`) and a Beatles
+    remaster (`CGj85pVzRJs`) all failed identically on the refusing clients and
+    all succeeded identically on `android`. Label ownership was a coincidence of
+    which videos happened to be tried, and building a category out of it sent the
+    next reader looking for a rights wall that is not there.
 
     A subclass of `EgressBlocked` because the response is the same one: this is a
     property of *how this container left the network*, not of the video, so a

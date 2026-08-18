@@ -519,8 +519,9 @@ chroma, **C is the least present of the twelve pitch classes** (0.042), and
 Zombie in Em spends a quarter of its length on C.
 
 This is the standing hazard of grading against covers, and the reason the ids in
-`seed_catalog.py` are ordinary uploads in the first place (the label-owned
-originals answer a datacentre IP with the bot check). A chart that disagrees with
+`seed_catalog.py` are ordinary uploads in the first place. (That reason was
+originally "the originals cannot be fetched"; since 2026-08-17 they can, and the
+reason is now the rights posture — see `seed_catalog.py`'s own note.) A chart that disagrees with
 the songbook is always two hypotheses — the engine misheard, or the performance
 is not in the songbook's key — and the second one has to be excluded with a
 measurement before the first is written down as a defect.
