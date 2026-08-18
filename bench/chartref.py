@@ -44,7 +44,13 @@ Cell conventions, all of them standard leadsheet:
 - `%` or an empty cell repeats the previous bar.
 - `N.C.` is no chord.
 - Several chords in one cell divide that bar: `| Cm F |`.
-- `#` starts a comment; blank lines are ignored.
+- `#` starts a comment — but only where it could not be a chord. `# a note` is a
+  comment and `F#` is a chord, and the rule that separates them is that a comment
+  marker is at the start of a line or has whitespace in front of it. Reading `#`
+  as a comment unconditionally is not a hypothetical mistake: it silently turned
+  every `F#` in the corpus into `F` and every `G#m` into `G`, so I'm Yours parsed
+  as a fifty-bar song in a two-chord vocabulary and looked, from the grade sheet,
+  like an engine that could not hear a sharp.
 """
 
 from __future__ import annotations
@@ -60,6 +66,10 @@ from app.chords import normalize_name
 # `ChordSymbol`) has no `5` quality, so this is a name the reference may use and
 # the system may never emit — see `POWER` handling in `grade_chart.py`.
 POWER = "power"
+
+# A comment marker: a `#` at the start of the line or with whitespace before it.
+# Anything else is the sharp of the chord it is attached to.
+_COMMENT = re.compile(r"(?:^|(?<=\s))#")
 
 _HEADER = re.compile(r"^([A-Za-z ]+):\s*(.*)$")
 _SECTION = re.compile(r"^\[(.+)\]\s*$")
@@ -252,7 +262,8 @@ def parse_chart(text: str, *, source: str = "") -> Chart:
         label, phrases = None, []
 
     for lineno, raw in enumerate(text.splitlines(), start=1):
-        line = raw.split("#", 1)[0].rstrip()
+        comment = _COMMENT.search(raw)
+        line = (raw[:comment.start()] if comment else raw).rstrip()
         if not line.strip():
             continue
 

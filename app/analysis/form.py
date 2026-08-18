@@ -74,6 +74,22 @@ CLUSTER_SIMILARITY = 0.75
 # shortest candidate within this margin of the best wins, because a song whose
 # real unit is 4 bars also matches at 8 and 16, and picking the longest would
 # bury the repeat structure `repeats` exists to express.
+#
+# **And only a shortest candidate that divides the best-scoring one.** That is the
+# whole content of the argument above: 4 beating 16 is the same loop written more
+# compactly, and 4 divides 16. A shorter candidate that does *not* divide the best
+# is a different hypothesis about the song, not a tidier statement of the same
+# one, and it has to win on the score rather than on being shorter. Country Roads
+# scores 0.497 at 8 bars and 0.467 at 6, and without the divisibility test it was
+# charted in six-bar sections: eighteen sections for a song with two progressions
+# in it, and not one of its blocks the length of one of its phrases.
+#
+# Score-neutral on the chart corpus, and worth saying so — root and form both come
+# out identical to four decimal places, because Country Roads' remaining error is
+# in its beat grid rather than in its blocks. What changes is that the one song
+# this rule touches is now cut into phrase-length pieces (eight bars of a doubled
+# grid, which is its four-bar phrase) instead of six-bar ones, which is the answer
+# a musician would give and the one `repeats` can express.
 PERIOD_MARGIN = 0.05
 
 # Beats sampled per bar when comparing two bars. Comparing at a fixed grid is
@@ -268,10 +284,14 @@ def period(bars: list[list[BarChord]], bar_beats: float) -> int:
     best = max(scores.values())
     if best <= 0.0:
         return CANDIDATE_UNITS[0]
+    # The longest candidate that scored best, so "divides the winner" is asked of
+    # the fullest statement of the song's period rather than of whichever of its
+    # own multiples happened to tie first.
+    winner = max((c for c in scores if scores[c] >= best - 1e-9), default=CANDIDATE_UNITS[0])
     for candidate in sorted(scores):
-        if scores[candidate] >= best - PERIOD_MARGIN:
+        if scores[candidate] >= best - PERIOD_MARGIN and winner % candidate == 0:
             return candidate
-    return CANDIDATE_UNITS[0]
+    return winner
 
 
 def _chunk(bars: list[list[BarChord]], unit: int, phase: int) -> list[Block]:
@@ -360,6 +380,16 @@ def cluster(blocks: list[Block], bar_beats: float) -> tuple[list[RepeatGroup], l
     representative it matches, or starts a new one. Deterministic by
     construction, which §16.5 requires — and in song order specifically, so
     group A is always the music the song opens with.
+
+    **First match rather than best match**, and that is measured rather than
+    careless — the obvious improvement was tried and does not pay. Giving each
+    block its *best* available match over the ten-song chart corpus moves form by
+    +0.012 and root by −0.008, which is the shape of a change that has bought
+    nothing. Three Little Birds loses five points of root to it: a block
+    reassigned to a better-matching group is then made to agree with that group
+    (§21), so a better cluster produces a worse chart. The corpus cannot resolve
+    an effect this size in either direction, and first-match is what every
+    threshold here was calibrated against.
     """
     groups: list[RepeatGroup] = []
     assignment: list[int] = []

@@ -1,0 +1,83 @@
+Title: Wonderwall
+Artist: Oasis
+Key: F# minor
+Tempo: 86
+Time: 4/4
+
+# **In the key the recording sounds in, not the key it is fingered in.** Oasis
+# play Em7 / G / Dsus4 / A7sus4 shapes with a capo at the second fret, so every
+# published chart is a whole tone flat of the record. Transposed here: Em7→F#m7,
+# G→A, Dsus4→Esus4, A7sus4→B7sus4, Cadd9→D. A chart in E minor would grade as a
+# system two semitones sharp, which is the exact reading the transposition sweep
+# exists to tell apart from a harmony error.
+#
+# Two chords to a bar and two bars to the loop, which is the recording's own
+# harmonic rhythm: the intro's four passes of the riff run 0:00 → 0:22 at 86 bpm,
+# so a cycle is two bars and not four.
+#
+# Sus and add tones are written as the triads the app's grammar can carry — the
+# recording's Esus4 is emitted as E, its B7sus4 as B. Quality beyond the third
+# is not graded (see grade_chart.py), so this loses nothing measurable.
+
+[Intro]
+| F#m7 A | E B |
+| F#m7 A | E B |
+| F#m7 A | E B |
+| F#m7 A | E B |
+
+[Verse 1]
+| F#m7 A | E B |
+| F#m7 A | E B |
+| F#m7 A | E B |
+| F#m7 A | E B |
+| F#m7 A | E B |
+| F#m7 A | E B |
+| F#m7 A | E B |
+| F#m7 A | E B |
+
+[Pre-Chorus 1]
+| D E | F#m |
+| D E | F#m |
+| D E | A |
+| B | B |
+
+[Chorus 1]
+| D F#m | A F#m |
+| D F#m | A F#m |
+| D F#m | A F#m |
+| B | B |
+
+[Verse 2]
+| F#m7 A | E B |
+| F#m7 A | E B |
+| F#m7 A | E B |
+| F#m7 A | E B |
+
+[Pre-Chorus 2]
+| D E | F#m |
+| D E | F#m |
+| D E | A |
+| B | B |
+
+[Chorus 2]
+| D F#m | A F#m |
+| D F#m | A F#m |
+| D F#m | A F#m |
+| B | B |
+
+[Chorus 3]
+| D F#m | A F#m |
+| D F#m | A F#m |
+| D F#m | A F#m |
+| D F#m | A F#m |
+
+[Outro]
+| D F#m | A F#m |
+| D F#m | A F#m |
+| D F#m | A F#m |
+| D F#m | A F#m |
+| D F#m | A F#m |
+| D F#m | A F#m |
+| D F#m | A F#m |
+| D F#m | A F#m |
+| D F#m | A F#m |

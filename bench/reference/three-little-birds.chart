@@ -1,0 +1,44 @@
+Title: Three Little Birds
+Artist: Bob Marley & The Wailers
+Key: A major
+Tempo: 150
+Time: 4/4
+
+# Three chords: A, D, E. The refrain ("don't worry about a thing") is eight bars
+# and stays on the tonic for half of them; the verse ("rise up this mornin'") is
+# sixteen and is where the E lives. 150 bpm is the recording's own tempo.
+#
+# Note: the beat tracker reads this one at 0.37 confidence and emits three beats
+# to the bar before the repair (bench/inspect_song.py), so the bar count here is
+# the music's rather than the tracker's, and a bar-count mismatch on this song is
+# a grid finding, not a harmony one.
+
+[Intro]
+| A | A | A | A |
+
+[Chorus 1]
+| A | A | A | A | D | D | A | A |
+| A | A | A | A | D | D | A | A |
+
+[Verse 1]
+| A | A | A | A | E | E | A | A |
+| D | D | A | A | E | E | A | A |
+
+[Chorus 2]
+| A | A | A | A | D | D | A | A |
+| A | A | A | A | D | D | A | A |
+
+[Verse 2]
+| A | A | A | A | E | E | A | A |
+| D | D | A | A | E | E | A | A |
+
+[Chorus 3]
+| A | A | A | A | D | D | A | A |
+| A | A | A | A | D | D | A | A |
+
+[Chorus 4]
+| A | A | A | A | D | D | A | A |
+| A | A | A | A | D | D | A | A |
+
+[Outro]
+| A | A |

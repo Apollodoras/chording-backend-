@@ -1,0 +1,50 @@
+Title: I'm Yours
+Artist: Jason Mraz
+Key: B major
+Tempo: 150
+Time: 4/4
+
+# B F# G#m E, two bars to a chord, all the way through — the intro, both verses
+# and every chorus are the same eight bars. 150 bpm is the song's own tempo and
+# not a doubled reading of 75: the cycle measures 12.7 s on the recording
+# (bench/inspect_song.py, bar 4 → bar 12), which is eight bars at 150.
+#
+# The middle eight is the one place the harmony moves: it runs at *one* bar a
+# chord and reaches the II (C#), which is the only chord in the song outside the
+# four above.
+#
+# Note: verse and chorus are harmonically identical here, so their boundary is a
+# lyric fact rather than a harmonic one.
+
+[Intro]
+| B | B | B | B |
+
+[Verse 1]
+| B | B | F# | F# | G#m | G#m | E | E |
+| B | B | F# | F# | G#m | G#m | E | E |
+| B | B | F# | F# | G#m | G#m | E | E |
+
+[Chorus 1]
+| B | B | F# | F# | G#m | G#m | E | E |
+| B | B | F# | F# | G#m | G#m | E | E |
+
+[Verse 2]
+| B | B | F# | F# | G#m | G#m | E | E |
+| B | B | F# | F# | G#m | G#m | E | E |
+
+[Chorus 2]
+| B | B | F# | F# | G#m | G#m | E | E |
+| B | B | F# | F# | G#m | G#m | E | E |
+
+[Bridge]
+| B | F# | G#m | F# | E | E | C# | C# |
+| B | F# | G#m | F# | E | E | C# | C# |
+
+[Verse 3]
+| B | B | F# | F# | G#m | G#m | E | E |
+| B | B | F# | F# | G#m | G#m | E | E |
+| B | B | F# | F# | G#m | G#m | E | E |
+
+[Outro]
+| B | B | F# | F# | G#m | G#m | E | E |
+| B | B | F# | F# | G#m | G#m | E | E |

@@ -71,6 +71,44 @@ _ROOT_ONLY = 0.45
 # share every diatonic chord, so without this they score identically.
 _TONIC_ENDPOINT_BONUS = 0.35
 
+# How much a key is rewarded for its tonic chord **actually sounding**, as a share
+# of the song's duration spent on that root.
+#
+# This is the term that decides a key against its relative, and it had to be added
+# because the endpoint bonus above — written for exactly that job — is not big
+# enough to do it. The two share a diatonic collection, so membership scores them
+# identically and the whole decision falls to one capped bonus worth under a
+# hundredth of the total. Measured on the ten-song chart corpus, three of ten keys
+# came out as the relative of the right one: Creep as E minor, Don't Stop
+# Believin' as C# minor, Wonderwall as A major. Creep does not contain a single E
+# chord.
+#
+# That last fact is the rule in one line: **a song in E minor plays an E minor
+# chord.** A key whose tonic never sounds is not a key the song is in, however
+# well its scale fits, and a relative pair is precisely the case where the scale
+# cannot say anything else.
+#
+# The **cap** is doing more of the work than the weight, and that is the point:
+# the claim being made is "the tonic sounds a normal amount", not "the tonic
+# sounds a lot". A share of 0.15 is about what a four-chord song spends on any one
+# of its chords, so a key clears this term completely or fails it, and a song that
+# parks on one chord gains nothing extra for it.
+#
+# Swept over the chart corpus (weight × cap, counting correct tonics): every
+# weight from 0.15 to 0.6 at a cap of 0.15 scores 9/10, and *every* setting with a
+# looser cap scores 8 or fewer — an uncapped term hands the key to whichever chord
+# the song plays most, which on Viva La Vida is the vi and on Someone Like You is
+# the vi as well. 0.25 sits in the middle of the flat band, so the value is not
+# perched on the edge of the measurement.
+#
+# The one it does not fix is Creep, where G major and C major score *identically*
+# on every term here — same collection, both tonics sounded (`Cm` shares C's
+# root), and the endpoint bonus split one each. What decides that song is that
+# every one of its eleven passes begins on G, which is positional evidence about
+# the *form* and not something a duration-weighted bag of chords can hold.
+_TONIC_MASS_WEIGHT = 0.25
+_TONIC_MASS_CAP = 0.15
+
 _UNRESOLVED = {AUGMENTED}   # belongs to no diatonic degree; ignored rather than penalised
 
 # The modes worth *scoring a key against*, which is a much shorter list than the
@@ -170,6 +208,12 @@ def _degrees(mode: str) -> dict[int, frozenset[str]]:
 def detect_key(spans: list[GridSpan]) -> DetectedKey:
     """Best-fitting key for a chord track, with a confidence in 0…1.
 
+    Three things are scored: how well the song's chords sit in the key
+    (`_score`), how much of the song is spent **on the tonic chord**
+    (`_TONIC_MASS_WEIGHT` — the term that decides a key against its relative,
+    since the two share a scale and nothing else can), and a small prior over
+    modes to break exact ties deterministically.
+
     Confidence is the **margin** over the runner-up *in a different projected
     key*, not over the runner-up outright: the seven modes of one collection are
     near-synonyms here, and two of them disagreeing about which is G mixolydian
@@ -186,10 +230,29 @@ def detect_key(spans: list[GridSpan]) -> DetectedKey:
     # over every span inside it did the same sort 48 times per key detection, and
     # `detect_key` itself is called up to four times per analysis.
     typical = median(s.length_beats for s in spans)
+    # How much of the song sounds on each root, for the tonic-mass term below.
+    # Computed once here rather than inside `_score`, which runs 48 times.
+    #
+    # Every span is capped at the median length, for the same reason the endpoint
+    # bonus is: this has to mean "the tonic sounds a normal amount", and raw
+    # duration lets one dragged chord answer the question by itself. A track
+    # ending on a 400-beat A minor is not in A minor because of that chord, and
+    # uncapped mass says it is — which is the failure
+    # `test_the_tonic_bonus_is_not_swamped_by_a_long_final_chord` was already
+    # guarding against for the other positional term.
+    mass: dict[int, float] = {}
+    heard_total = 0.0
+    for span in spans:
+        weight = min(span.length_beats, typical)
+        mass[span.root_pc % 12] = mass.get(span.root_pc % 12, 0.0) + weight
+        heard_total += weight
+    heard_total = heard_total or 1.0
     scored: list[tuple[float, str, int]] = []
     for tonic_pc in range(12):
         for mode in KEY_MODES:
-            score = _score(spans, tonic_pc, _degrees(mode), typical) / total + _MODE_PRIOR[mode]
+            fit = _score(spans, tonic_pc, _degrees(mode), typical) / total
+            heard = min(mass.get(tonic_pc, 0.0) / heard_total, _TONIC_MASS_CAP)
+            score = fit + heard * _TONIC_MASS_WEIGHT + _MODE_PRIOR[mode]
             scored.append((score, mode, tonic_pc))
     scored.sort(key=lambda item: (-item[0], item[2], item[1]))
 

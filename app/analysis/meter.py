@@ -188,10 +188,19 @@ def reconcile(grid: BeatGrid, raw: list[RawChordSpan], *,
         else:
             shift = 0
 
-    if time_signature != corrected.time_signature:
+    # The tempo the *beats* run at, derived rather than carried. See
+    # `_measured_bpm`: it agrees with the tracker's headline on every track
+    # measured, and the point is that from here on it cannot stop agreeing.
+    measured = _measured_bpm(corrected)
+    if measured is not None and abs(measured - corrected.bpm) > 0.5:
+        log.info("tempo measured from the grid: %.1f bpm (tracker reported %.1f)",
+                 measured, corrected.bpm)
+
+    if time_signature != corrected.time_signature or measured is not None:
         corrected = BeatGrid(
             beats_ms=corrected.beats_ms, downbeats_ms=corrected.downbeats_ms,
-            bpm=corrected.bpm, confidence=corrected.confidence,
+            bpm=measured if measured is not None else corrected.bpm,
+            confidence=corrected.confidence,
             time_signature=time_signature,
         )
 
@@ -213,6 +222,49 @@ def reconcile(grid: BeatGrid, raw: list[RawChordSpan], *,
         meter_source=source,
         downbeats=downbeat_report,
     )
+
+
+# --- the tempo the beats actually run at -------------------------------------
+
+def _measured_bpm(grid: BeatGrid) -> float | None:
+    """The song's tempo, read off its own beat list.
+
+    Not a correction — on the ten-song bench corpus this reproduces
+    `BeatGrid.bpm` to two decimal places on every track, including the four whose
+    grids are otherwise poor. What it buys is that the number the payload
+    publishes is **derived from the timeline the chart is actually on** rather
+    than carried alongside it, so the two cannot drift apart:
+
+    - `axis.py` lays its timeline on `beats_ms`, the bars are sliced out of that
+      axis, and the anchors are read off it. Everything internal already uses the
+      beats. The client is the one consumer that does not — it derives its whole
+      bar grid from the single song-level `tempo` (`JamSongSheet.from`, and see
+      `lint_sync` on why an override is forbidden) — so that number has to be a
+      statement about the same grid.
+    - `_halve` and `_double` already rewrite `bpm` by hand alongside the beats
+      they thin or thicken. Deriving it removes the chance of those two lines
+      disagreeing, which is the kind of arithmetic that is right until it isn't.
+
+    The **median** interval, not the mean, and the corpus is emphatic about why:
+    a tracker emits no beats over material that has no pulse, and the mean sees
+    that as tempo. Smooth Criminal's grid contains a single **51-second** gap
+    (the short film's spoken opening), Country Roads has a rubato intro, and Don't
+    Stop Believin' has an 80 ms stutter. Their mean beat rates are 91, 149 and 130
+    against true rates of 115, 167 and 120; every one of their medians is exact.
+
+    `None` when there is not enough grid to measure, which leaves the tracker's
+    own answer standing — the only other answer available.
+    """
+    beats = sorted(set(int(t) for t in grid.beats_ms))
+    if len(beats) < 8:
+        return None
+    gaps = sorted(b - a for a, b in zip(beats, beats[1:]) if b > a)
+    if not gaps:
+        return None
+    middle = len(gaps) // 2
+    interval = (gaps[middle] if len(gaps) % 2
+                else (gaps[middle - 1] + gaps[middle]) / 2)
+    return round(60000.0 / interval, 2) if interval > 0 else None
 
 
 # --- the phase vote ---------------------------------------------------------

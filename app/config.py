@@ -175,6 +175,15 @@ class Settings:
     # carry ships low-confidence, and one it cannot fails with a message that
     # names the tempo (`analysis/meter.py`, `pipeline.assemble`).
     theory_tempo_octave: bool = False
+    # §21 — let every occurrence of a repeated section play that section's own
+    # progression, so the chart states the song's form instead of transcribing
+    # each pass separately. A flag for the same reason as the three above, and
+    # **on** by default because without it `repeats` never fires on a real
+    # recording and a four-chord song compiles as eighty-eight distinct bars.
+    # It is not a correction layer: unlike `theory_consensus` it makes no claim
+    # that the engine misheard anything, only that a verse is the same verse
+    # every time the song plays it (`analysis/canon.py`).
+    theory_form: bool = True
     # Which chord engine / beat tracker to use. Chosen by the §8-step-2
     # benchmark (`bench/run_bench.py`, results in README):
     #
@@ -286,6 +295,7 @@ def load_settings() -> Settings:
         theory_vocabulary=_bool("CHORDS_THEORY_VOCABULARY", True),
         theory_belief=_bool("CHORDS_THEORY_BELIEF", True),
         theory_tempo_octave=_bool("CHORDS_THEORY_TEMPO_OCTAVE", False),
+        theory_form=_bool("CHORDS_THEORY_FORM", True),
         chord_engine=os.environ.get("CHORDS_CHORD_ENGINE") or "btc",
         beat_tracker=os.environ.get("CHORDS_BEAT_TRACKER") or "beat_this",
         onset_detector=os.environ.get("CHORDS_ONSET_DETECTOR") or "harmonic",

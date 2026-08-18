@@ -1,0 +1,43 @@
+Title: Creep
+Artist: Radiohead
+Key: G major
+Tempo: 94
+Time: 4/4
+
+# The whole song is one four-chord progression, two bars to a chord — 88 bars,
+# eleven passes, no exceptions. Verified against the recording's own bar grid
+# (bench/inspect_song.py): the cycle runs 0:00.2 → 0:20.3, which is eight bars
+# at 94 bpm and not four, so a chart writing one bar per chord is at half the
+# song's harmonic rhythm.
+#
+# Note: harmonically uniform, so where the intro ends and verse 1 begins is a
+# labelling choice and nothing in the chords can settle it. The section split
+# below is the published arrangement; `form` is graded on the pattern of
+# contrast, which for this song is a single letter either way.
+
+[Intro]
+| G | G | B | B | C | C | Cm | Cm |
+
+[Verse 1]
+| G | G | B | B | C | C | Cm | Cm |
+| G | G | B | B | C | C | Cm | Cm |
+
+[Chorus 1]
+| G | G | B | B | C | C | Cm | Cm |
+
+[Verse 2]
+| G | G | B | B | C | C | Cm | Cm |
+| G | G | B | B | C | C | Cm | Cm |
+
+[Chorus 2]
+| G | G | B | B | C | C | Cm | Cm |
+
+[Bridge]
+| G | G | B | B | C | C | Cm | Cm |
+
+[Chorus 3]
+| G | G | B | B | C | C | Cm | Cm |
+| G | G | B | B | C | C | Cm | Cm |
+
+[Outro]
+| G | G | B | B | C | C | Cm | Cm |

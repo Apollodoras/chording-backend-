@@ -24,3 +24,4 @@ bench/audio/
 
 # Third-party checkouts (BTC weights are 24MB; cloned, not vendored)
 vendor/
+bench/cache/

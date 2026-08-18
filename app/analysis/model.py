@@ -44,8 +44,9 @@ from dataclasses import dataclass, field, replace
 
 from ..chords import HARD
 from ..errors import AnalysisError
-from . import consensus, form, postprocess, vocabulary
+from . import canon, consensus, form, postprocess, vocabulary
 from .axis import BeatAxis, build_axis
+from .canon import CanonReport
 from .consensus import ConsensusReport
 from .keyfinder import DetectedKey, detect_key
 from .meter import Meter, reconcile
@@ -94,6 +95,11 @@ class SongModel:
     # also why the pooled extraction had more evidence to work from.
     patterns: dict[str, ExtractedPattern] = field(default_factory=dict)
     consensus: ConsensusReport = field(default_factory=ConsensusReport)
+    # §21's edits — bars brought into line with their own section's progression.
+    # Separate from `consensus` for the same reason `vocabulary` is: the two
+    # answer different questions with different evidence, and a song can be
+    # transformed by one and untouched by the other.
+    canon: CanonReport = field(default_factory=CanonReport)
     # §20.8's edits — what the song's own vocabulary corrected before the vote
     # ever ran. Separate from `consensus` because the two answer with different
     # evidence (the rest of the song, versus the same bar in another pass) and a
@@ -140,6 +146,13 @@ class SongModel:
     # reason it replays the vote with `vote_key` — a tier is a render of the
     # reference decisions, not a fresh chance to decide differently.
     seed_key: DetectedKey | None = None
+    # The groups §21 made canonical, and the key it used — carried for exactly
+    # the reason `vote_groups`/`vote_key` are. These are the *encoding* pass's
+    # groups (found on the voted bars), which is a different set from the vote's,
+    # and a render has to reproduce the reference decision rather than take its
+    # own over whatever boundaries its own tier happens to produce.
+    canon_groups: list[form.RepeatGroup] = field(default_factory=list)
+    canon_key: DetectedKey | None = None
 
     @property
     def bar_beats(self) -> int:
@@ -172,7 +185,7 @@ def per_bar_energy(curve: EnergyCurve | None, axis: BeatAxis) -> list[float] | N
 def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
           energy: EnergyCurve | None = None, vote: bool = True,
           weigh: bool = True, consolidate: bool = True,
-          correct_octave: bool = False) -> SongModel | None:
+          correct_octave: bool = False, form_canonical: bool = True) -> SongModel | None:
     """Features → the song model. **Pure**, and the half worth testing directly.
 
     Returns None when there is not enough *rhythm* to lay bars over, and raises
@@ -242,10 +255,65 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
             # with no reason behind it.
             key = detect_key(spans_from_bars(bars, axis.bar_beats))
 
-    # Second pass: encode them. Occurrences the vote brought into line can now
-    # collapse with `repeats`, which they could not before.
+    # Second pass: find the groups again, on the corrected bars. These are the
+    # boundaries §21 makes canonical, and they are not the vote's: the vote may
+    # have changed which period and phase the song reads best at, and the form a
+    # chart states should be the form of the chart's own chords.
     sections, groups = form.detect(bars, bar_beats=bar_beats, energy=bar_energy,
                                    tonic_pc=key.tonic_pc)
+
+    # §21 — every occurrence of a section plays the section's progression. This
+    # is what lets the *third* pass below do what §20.6 says the second one was
+    # for: occurrences that are now identical collapse with `repeats`, so a song
+    # compiles as its form rather than as one flat run of every bar the engine
+    # ever emitted. Before this existed `repeats` fired only on synthetic input.
+    canon_key = key
+    canon_report = CanonReport()
+    canon_groups: list[form.RepeatGroup] = []
+    bar_rhythm = False
+    if form_canonical:
+        # §21b first, because it is about *when* the harmony moves and everything
+        # after it is about *what* it moves to. Settling the barlines before the
+        # groups are made to agree means the vote compares bars that already
+        # share a rhythm, so its per-beat tallies are about the chords rather
+        # than about which pass the engine put the change a beat early in.
+        bar_rhythm = canon.settles_on_barlines(spans, axis.bar_beats)
+        settled = 0
+        if bar_rhythm:
+            bars, settled = canon.settle_to_bars(bars, axis.bar_beats)
+            if settled:
+                # The groups were found over the unsettled bars, and settling can
+                # change which blocks resemble which. Re-found before the vote so
+                # the occurrences being compared are the ones the chart has.
+                sections, groups = form.detect(bars, bar_beats=bar_beats,
+                                               energy=bar_energy, tonic_pc=key.tonic_pc)
+        canon_groups = groups
+        bars, canon_report = canon.canonicalize(
+            bars, canon_groups, bar_beats=axis.bar_beats,
+            tonic_pc=key.tonic_pc, mode=key.scale,
+        )
+        canon_report = replace(canon_report, bar_rhythm=bar_rhythm, settled_bars=settled)
+        if canon_report.touched:
+            # Third pass: encode. The groups the sections carry must be the ones
+            # found over the bars being shipped, or a section's rehearsal letter
+            # names music it no longer holds.
+            sections, groups = form.detect(bars, bar_beats=bar_beats,
+                                           energy=bar_energy, tonic_pc=key.tonic_pc)
+            # And the key is **not** re-read here, which is the one place this
+            # differs from the vote above. The vote leaves a set of independent
+            # readings that happen to have been corrected; §21 deliberately
+            # destroys their independence — eleven passes of a verse become
+            # eleven copies of one reading — so a duration-weighted count taken
+            # afterwards is measuring the *form* rather than the song. Whatever
+            # the largest group holds is multiplied by its occurrence count, and
+            # `detect_key`'s tonic-mass term reads exactly that number.
+            #
+            # `vocabulary.py` states the same rule for the same reason ("mass
+            # counts readings that have not been corrected yet, so a systematic
+            # mishearing inflates its own evidence"). Measured: re-reading here
+            # costs Wonderwall its key, calling an F# minor song A major off a
+            # chorus group that occurs twenty-one times. 9/10 correct tonics
+            # against 8/10.
 
     # The song's own meter, not `f"{bar_beats}/4"`: `bar_beats` is quarter-note
     # beats, so synthesising a signature from it labelled every 6/8 song's
@@ -256,12 +324,13 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
 
     return SongModel(
         meter=meter, axis=axis, key=key, sections=sections, groups=groups,
-        patterns=patterns, consensus=report, vocabulary=vocab,
+        patterns=patterns, consensus=report, vocabulary=vocab, canon=canon_report,
         consolidated=consolidate, weighed=weigh,
         confidence=postprocess.mean_confidence(spans),
         total_bars=sum(s.total_bars for s in sections),
         exact_ratio=postprocess.exact_ratio(spans),
         vote_groups=vote_groups, vote_key=vote_key, seed_key=seed_key,
+        canon_groups=canon_groups, canon_key=canon_key,
     )
 
 
@@ -311,6 +380,24 @@ def render(model: SongModel, raw: list[RawChordSpan], difficulty: str) -> list[S
             bars, model.vote_groups, bar_beats=float(model.axis.bar_beats),
             tonic_pc=vote_key.tonic_pc, mode=vote_key.scale,
             record=False, weigh=model.weighed,
+        )
+    if model.canon.bar_rhythm:
+        # §21b, replayed. Measured on the reference tier and *applied* here
+        # without re-measuring, for the reason every replay in this function has:
+        # a tier is a render of decisions already taken, and `easy` dropping a
+        # passing chord could flip the measurement on its own.
+        bars, _ = canon.settle_to_bars(bars, model.axis.bar_beats)
+    if model.canon_groups:
+        # Replayed over the reference groups, with the reference key, and told
+        # not to record — the three conditions the vote replay above is under,
+        # and every one of them for the same reason. `canon_groups` in
+        # particular is *not* `model.groups`: those were re-found after this ran,
+        # so voting over them would canonicalize a tier against boundaries the
+        # reference analysis never used.
+        canon_key = model.canon_key or model.key
+        bars, _ = canon.canonicalize(
+            bars, model.canon_groups, bar_beats=model.axis.bar_beats,
+            tonic_pc=canon_key.tonic_pc, mode=canon_key.scale, record=False,
         )
     return impose(model.sections, bars)
 

@@ -1,0 +1,69 @@
+Title: Don't Stop Believin'
+Artist: Journey
+Key: E major
+Tempo: 120
+Time: 4/4
+
+# Two four-bar loops, one bar to a chord: E B C#m A for the verses, and
+# E B G#m A for the pre-chorus lift — they differ in one bar out of four, which
+# is a real test of whether the clustering can tell two sections apart on a
+# single chord.
+#
+# The title chorus arrives **once**, at 3:20, over A A E B. A form that is right
+# about everything else and invents an early chorus is wrong about the one thing
+# this song is famous for.
+
+[Intro]
+| E | B | C#m | A |
+| E | B | G#m | A |
+
+[Verse 1]
+| E | B | C#m | A |
+| E | B | G#m | A |
+| E | B | C#m | A |
+| E | B | G#m | A |
+
+[Interlude 1]
+| E | B | C#m | A |
+| E | B | G#m | A |
+
+[Verse 2]
+| E | B | C#m | A |
+| E | B | G#m | A |
+| E | B | C#m | A |
+| E | B | G#m | A |
+
+[Pre-Chorus 1]
+| A | A | E | E |
+| A | A | E | E |
+| A | A | E | E |
+| A | A | E | B |
+
+[Interlude 2]
+| E | B | C#m | A |
+| E | B | G#m | A |
+
+[Verse 3]
+| E | B | C#m | A |
+| E | B | G#m | A |
+
+[Pre-Chorus 2]
+| A | A | E | E |
+| A | A | E | E |
+| A | A | E | E |
+| A | A | E | B |
+
+[Solo]
+| E | B | C#m | A |
+| E | B | G#m | A |
+| E | B | C#m | A |
+| E | B | G#m | A |
+
+[Chorus]
+| A | A | E | B |
+| A | A | E | B |
+| A | A | E | B |
+| A | A | E | B |
+
+[Outro]
+| A | A | E |

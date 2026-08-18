@@ -1,0 +1,56 @@
+Title: Someone Like You
+Artist: Adele
+Key: A major
+Tempo: 135
+Time: 4/4
+
+# A / C#m / F#m / D, two bars to a chord in the verse and one to a chord in the
+# chorus — the harmonic rhythm doubles where the song lifts, which is most of
+# what makes the chorus sound like one.
+#
+# 135 bpm is the recording's own tempo and not a doubled 67: the verse cycle
+# measures 14.2 s (bench/inspect_song.py, bar 0 → bar 8), which is eight bars at
+# 135.
+#
+# Note: piano and voice only, arpeggiated, no strummed guitar anywhere. The chord
+# engine has the least evidence per frame of anything in this corpus, and the
+# third of an arpeggio arrives late — so C#m read as E, and F#m read as F#, are
+# the errors to expect here rather than a structural failure.
+
+[Verse 1]
+| A | A | C#m | C#m | F#m | F#m | D | D |
+| A | A | C#m | C#m | F#m | F#m | D | D |
+| A | A | C#m | C#m | F#m | F#m | D | D |
+| A | A | C#m | C#m | F#m | F#m | D | D |
+
+[Pre-Chorus 1]
+| F#m | F#m | D | D | F#m | F#m | D | D |
+
+[Chorus 1]
+| A | E | F#m | D | A | E | F#m | D |
+| A | E | F#m | D | A | E | F#m | D |
+| A | E | F#m | D | A | E | F#m | D |
+
+[Verse 2]
+| A | A | C#m | C#m | F#m | F#m | D | D |
+| A | A | C#m | C#m | F#m | F#m | D | D |
+
+[Pre-Chorus 2]
+| F#m | F#m | D | D | F#m | F#m | D | D |
+
+[Chorus 2]
+| A | E | F#m | D | A | E | F#m | D |
+| A | E | F#m | D | A | E | F#m | D |
+
+[Bridge]
+| D | D | A | A | D | D | A | A |
+| D | D | E | E | F#m | F#m | D | D |
+
+[Chorus 3]
+| A | E | F#m | D | A | E | F#m | D |
+| A | E | F#m | D | A | E | F#m | D |
+| A | E | F#m | D | A | E | F#m | D |
+| A | E | F#m | D | A | E | F#m | D |
+
+[Outro]
+| D | D |

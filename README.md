@@ -301,6 +301,10 @@ Read honestly, because the temptation is to read it the other way:
   is still right on its own terms (`G F C G` was called *A minor*; it is G
   mixolydian), and so is capping the tonic-endpoint bonus.
 
+`CHORDS_THEORY_FORM` is the fourth flag and the only one **on** by default that
+edits the chart's shape — see [§21](#21--the-chart-states-the-songs-form), which
+is a claim about the song's form rather than about the engine's mistakes.
+
 There is a third flag beside those two, off by default:
 **`CHORDS_THEORY_TEMPO_OCTAVE`**
 lets §20.2 halve or double a beat grid whose tempo reads an octave out, instead
@@ -310,6 +314,112 @@ it. With it off a suspect tempo the container can still carry ships
 `lowConfidence`, and one it cannot fails with a message that names the reading
 rather than the generic "didn't produce a song we could play"
 ([`PIPELINE-AUDIT.md`](PIPELINE-AUDIT.md) D1).
+
+---
+
+## §21 — the chart states the song's form
+
+The complaint: *"clearly our system doesn't know that a verse (or any section) is
+the same across the whole song"*. It was right. Creep is four chords over eight
+bars for its whole length, and the pipeline emitted **88 distinct bars in one
+unbroken section with a ten-chord vocabulary** — every wobble the recognizer made
+on every pass preserved as though it were music.
+
+Everything needed to fix it was already there. `form.py` finds the repeat groups
+and `consensus.py` votes over them; what was missing is the step between "these
+eleven blocks are the same music" and "so print them the same way". §20.6 says
+the second `form.detect` pass exists because *"after the vote they often are
+identical, and the second pass is what turns that into the compact encoding"* —
+and on a real recording they never were, so `repeats` only ever fired on
+synthetic input.
+
+`app/analysis/canon.py` is that step, and it is **not** a correction layer. §20.4
+asks whether the engine misheard a bar and gates every overwrite on three
+conditions; this asks what the group **agrees** on and writes that everywhere. The
+distinction matters because the gates are why §20.4 stays silent on the ordinary
+case: Creep's eighth bar is heard `Cm` on six passes, `Cm D#` on three and `Cm F`
+on two, nothing there is a near miss of anything, so all eleven readings ship.
+That is the right answer to "did the engine mishear bar 8 of pass 7" and the
+wrong answer to "what does this song play in bar 8".
+
+Two rules, both gated on a measurement of the song rather than on a threshold:
+
+- **`settle_to_bars`** — in a song whose harmony moves a bar at a time, a change
+  the engine put a beat early belongs on the barline. §5.4 already argues this at
+  beat resolution ("a chord change that lands 40 ms before the beat is the same
+  musical event as one that lands on it"); the argument does not stop at the
+  beat. The gate is `harmonic_unit`, the duration-weighted median chord length:
+  4 beats or more and the song settles, 2 beats and it does not. Wonderwall and
+  Smooth Criminal measure 2 and are left alone, which is correct — `| F#m7 A |`
+  is a real two-chord bar and settling it would delete half the song.
+- **`canonicalize`** — every occurrence of a repeat group plays the group's
+  progression, decided **beat by beat** across the occurrences. Beat resolution
+  rather than whole-bar, because occurrences disagree about *where in the bar* a
+  change happens at least as often as about what the chord is: eight passes of
+  `| G |` and four of `| G D |` are not two competing bars, they are twelve
+  passes agreeing on beats 1–3.
+
+What it costs, stated plainly: an occurrence that genuinely differs is flattened
+onto the others. `tests/test_alignment.py` pins both sides — a one-off Dm in bar
+12 of four passes survives with `CHORDS_THEORY_FORM=off` and is flattened with it
+on, at a cost of exactly one bar in sixteen. Three things bound it: only groups
+that already cohere (`MIN_COHESION`), only beats with a strict plurality (a tie
+holds its neighbour, or the bar is declined outright), and never a chord no
+occurrence played.
+
+### What it is worth
+
+Measured on the ten-song chart corpus (`bench/lab.py grade`), the layer is
+**accuracy-neutral and shape-transforming**, and both halves of that are the
+point:
+
+| | root | triad | vocabulary emitted |
+|---|---|---|---|
+| §21 off | 0.866 | 0.847 | Creep 10, Wonderwall 9, Smooth Criminal 15 |
+| §21 on | 0.857 | 0.850 | Creep **4**, Wonderwall 8, Smooth Criminal 13 |
+
+The chords were already close to right; what was wrong was that the chart said
+them 88 different ways. Creep now compiles as one eight-bar section with
+`repeats: 11` and a four-chord vocabulary, which is the chart, and Zombie as
+`| C | G | D | Em |` twenty times over.
+
+### Two changes that did not ship, and why
+
+Both were tried on the corpus and reverted, which is the only way to tell this
+kind of change from an improvement:
+
+- **Best-match clustering.** `form.cluster` joins a block to the *first* group it
+  matches, not the best one, which looks obviously wrong. Fixing it moves form
+  +0.012 and root −0.008 — Three Little Birds loses five points because a block
+  reassigned to a better-matching group is then made to agree with it. A change
+  that raises one number and lowers another has bought nothing.
+- **Tempo-octave correction from harmonic evidence.** Country Roads is tracked at
+  167 bpm against a true 82, and `harmonic_unit` sees it (its chords last 8 of the
+  tracker's beats). Halving the grid moves every bar line and every anchor in the
+  song, and the corpus has one track that would trigger it — so the diagnosis is
+  reported and `CHORDS_THEORY_TEMPO_OCTAVE` stays off, exactly as §20.2 already
+  argues.
+
+### The corpus this was measured on
+
+Ten popular songs with hand-written reference charts in `bench/reference/`, and
+a cached-features harness (`bench/lab.py`) that regrades all ten in about a
+second. Root scores after §21, best to worst: Creep 1.000, I'm Yours 0.985, Viva
+La Vida 0.971, Zombie 0.943, Three Little Birds 0.902, Someone Like You 0.885,
+Wonderwall 0.861, Country Roads 0.840, Don't Stop Believin' 0.838, Smooth
+Criminal 0.342. Nine of ten keys are exact.
+
+Smooth Criminal is the outlier and it is the owner's own failing case, on the
+9:26 short film: the first minute is dialogue, the beat tracker emits **no beats
+at all** across a 51-second stretch of it and reports 0.00 confidence, and the
+harmony is a bass line with no instrument sounding a third — so a recognizer
+hearing Bm and C where the bass walks through B and C is hearing the recording
+correctly and charting it wrongly. Creep's key is the other known miss: G major
+and C major score identically on every term the key finder has, because `Cm`
+shares C's root and the endpoint bonus splits one each. Both chords spell the
+same either way, so nothing the player sees changes.
+
+---
 
 Anyone extending this should assume the remaining accuracy is in the engines, and
 in §20.2's downbeat-phase check on tracks where the tracker is genuinely wrong —

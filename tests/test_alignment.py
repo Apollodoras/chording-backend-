@@ -46,9 +46,9 @@ _ENGINES = {"chords_engine": EngineInfo("exact", "1.0"),
             "beats_engine": EngineInfo("exact", "1.0")}
 
 
-def _analyze(rec, difficulty: str = HARD):
+def _analyze(rec, difficulty: str = HARD, **settings):
     outcome = assemble(meta=rec.meta, grid=rec.grid, raw=rec.chords, onsets=[],
-                       settings=Settings(), **_ENGINES)
+                       settings=Settings(**settings), **_ENGINES)
     payload = CompositionPayload.model_validate(outcome.songs[difficulty])
     return payload, outcome.sync
 
@@ -165,26 +165,67 @@ def test_an_odd_bar_does_not_derail_the_bars_after_it():
 # Structure must not invent harmony
 # ---------------------------------------------------------------------------
 
-def test_a_varied_repeat_keeps_its_own_chords():
-    """Phase held clean, so the only thing under test is the structure pass.
-
-    Bar 12 is a Dm where every other pass plays F. `_merge_similar` may still
-    merge the two blocks into one section — that is what §15 wants on the rail —
-    but it may not replay pass one's chords over pass two's bars.
-    """
-    rec = recording(
+def _varied():
+    """Four passes of C G Am F, with bar 12's F played as Dm."""
+    return recording(
         progression=["C:maj", "G:maj", "A:min", "F:maj",
                      "C:maj", "G:maj", "A:min", "F:maj",
                      "C:maj", "G:maj", "A:min", "D:min",   # <- the odd bar
                      "C:maj", "G:maj", "A:min", "F:maj"],
         bars=16, pickup_beats=0,
     )
-    payload, sync = _analyze(rec)
+
+
+def test_a_varied_repeat_keeps_its_own_chords():
+    """Phase held clean, so the only thing under test is the structure pass.
+
+    Bar 12 is a Dm where every other pass plays F. `_merge_similar` may still
+    merge the two blocks into one section — that is what §15 wants on the rail —
+    but it may not replay pass one's chords over pass two's bars.
+
+    **Run with §21 off**, because §21 is a *different* claim about this same bar
+    and the two have to be measured apart. The rule under test here is that
+    section merging is not allowed to substitute one pass's chords for another's
+    — a structural mistake, made silently, with no evidence consulted. §21 makes
+    the opposite kind of move deliberately and on evidence (see the test below),
+    and leaving it on here would mean this test passed or failed for a reason
+    that has nothing to do with the merge.
+    """
+    rec = _varied()
+    payload, sync = _analyze(rec, theory_form=False)
 
     assert sync is not None
     frame, downbeat = score(rec, payload, sync)
     assert downbeat == 1.0
     assert frame == 1.0
+
+
+def test_the_form_layer_flattens_a_one_off_variation():
+    """§21's cost, pinned — the trade it makes, stated as a number.
+
+    Same recording, §21 on. Three passes of the section play F in bar 12 and one
+    plays Dm; the form layer writes the section's own progression over all four,
+    so the chart shows F there and **one bar in sixteen is not what the recording
+    plays**. That is the whole of the price, it is paid on this exact shape of
+    input, and it is not a bug — a chart is a claim about the song, and a song
+    that plays its verse four times does not have four verses.
+
+    What buys it is in `bench/`, not here: on real recordings the same rule turns
+    Creep from eighty-eight distinct bars with a ten-chord vocabulary into
+    `| G | G | B | B | C | C | Cm | Cm |` played eleven times with four. The
+    per-pass variation that this test calls music is, on a recording, almost
+    always the recognizer.
+
+    Both directions are supported postures (`CHORDS_THEORY_FORM`), which is why
+    this test and the one above can both stand.
+    """
+    rec = _varied()
+    payload, sync = _analyze(rec)
+
+    assert sync is not None
+    frame, downbeat = score(rec, payload, sync)
+    assert downbeat == 15 / 16, "exactly the odd bar, and nothing else, is flattened"
+    assert frame >= 0.9
 
 
 def test_contrasting_sections_survive_the_structure_pass():

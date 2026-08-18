@@ -406,9 +406,15 @@ def test_every_tier_gets_the_cleanup_not_only_the_one_that_needed_it():
 def test_the_cleanup_can_be_turned_off():
     """`CHORDS_THEORY_VOCABULARY=off`, for the same reason the vote has a switch:
     this edits chords the engine reported, and a posture that can only be judged
-    by measurement has to be reversible without a deploy."""
+    by measurement has to be reversible without a deploy.
+
+    Every *other* stage that can remove this noise is off too. There are four of
+    them now and they overlap on exactly this input, so a test that left one
+    running would pass whatever `consolidate` did — which is the failure mode
+    that makes a switch look tested when it is not.
+    """
     model = song_model.build(grid=_grid(32), raw=_noisy_chords(), onsets=[],
-                             consolidate=False, vote=False)
+                             consolidate=False, vote=False, form_canonical=False)
     assert not model.vocabulary.touched
     qualities = {c.quality for s in model.sections for bar in s.bars for c in bar
                  if c.root_pc == 9}

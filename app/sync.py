@@ -145,6 +145,24 @@ class TheoryReport(BaseModel):
     # they are published rather than logged.
     snappedSpans: int = 0
     absorbedIslands: int = 0
+    # §21's two counts. ``canonicalBars`` is bars brought into line with their own
+    # section's progression, and it is emphatically *not* comparable with
+    # ``rewrittenBars`` above: that one counts places the engine is thought to
+    # have misheard, this one counts places the chart now states the song's form
+    # rather than one pass of it. The other two say where the agreement ran out:
+    # ``heldBeats`` is beats the occurrences tied on, where the bar held the chord
+    # it had already settled on, and ``splitBars`` is slots where nothing settled
+    # and every occurrence kept its own reading. A song with a high ``splitBars``
+    # is one whose sections genuinely vary, and one this layer correctly declined
+    # to speak for.
+    canonicalBars: int = 0
+    # §21b — bars given the chord that held most of them, because the song was
+    # measured to change chord a bar at a time. Zero on a song whose harmony moves
+    # faster than its bar (Wonderwall changes twice a bar and must not be touched),
+    # which is a finding about the song rather than a stage that did not run.
+    settledBars: int = 0
+    heldBeats: int = 0
+    splitBars: int = 0
     # Beats the downbeat grid was rotated by against the tracker's own answer
     # (§20.2). Non-zero means the harmony and the pulse disagreed about where
     # the bar started, and the harmony won.

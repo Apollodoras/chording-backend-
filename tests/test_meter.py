@@ -194,9 +194,43 @@ def test_an_implausible_tempo_is_reported_and_never_corrected():
                     bpm=460.0, confidence=0.9, time_signature="4/4")
     meter = reconcile(fast, [])
     assert meter.tempo_octave_suspect
-    assert meter.tempo == 460
+    # 462 and not the 460 the fixture's own header claims: the beats are 130 ms
+    # apart, which is 461.5 bpm, and the tempo is measured off them. See
+    # `test_the_tempo_is_measured_off_the_beats_not_taken_from_the_header`.
+    assert meter.tempo == 462
     assert meter.grid.beats_ms == fast.beats_ms
     assert meter.tempo_octave_shift == 0
+
+
+def test_the_tempo_is_measured_off_the_beats_not_taken_from_the_header():
+    """`BeatGrid.bpm` is the tracker's headline estimate; `beats_ms` is what it
+    emitted. They agree on every track in the bench corpus — this is not a
+    correction — and the guarantee being bought is that they cannot come apart.
+
+    The payload carries one song-level tempo and the client derives its whole bar
+    grid from it (`JamSongSheet.from`), while every internal stage is built on the
+    beats. Two numbers for one grid is a divergence waiting to happen, and
+    `_halve`/`_double` already maintain the second one by hand.
+    """
+    lying = BeatGrid(beats_ms=[i * 500 for i in range(64)],       # 120 bpm
+                     downbeats_ms=[i * 500 for i in range(0, 64, 4)],
+                     bpm=90.0, confidence=0.9, time_signature="4/4")
+    meter = reconcile(lying, [])
+    assert meter.tempo == 120
+    assert meter.grid.bpm == 120.0, "the sidecar reads this, and it must agree"
+    assert meter.grid.beats_ms == lying.beats_ms, "measuring must not move a beat"
+
+
+def test_a_dropped_beat_does_not_drag_the_measured_tempo():
+    """The median interval, not the mean. A tracker emits no beats over material
+    with no pulse, and the mean reads that silence as tempo: Smooth Criminal's
+    grid has one **51-second** gap in it (the short film's spoken opening), and
+    its mean beat rate is 91 bpm against a true 115. The median is exact."""
+    beats = [i * 500 for i in range(64)]
+    beats.remove(31 * 500)
+    holed = BeatGrid(beats_ms=beats, downbeats_ms=beats[::4],
+                     bpm=120.0, confidence=0.9, time_signature="4/4")
+    assert reconcile(holed, []).tempo == 120
 
 
 def test_a_normal_tempo_is_not_flagged():
@@ -236,7 +270,7 @@ def test_a_tempo_more_than_an_octave_out_is_left_alone_even_then():
     strength of it is exactly the confident mistake this layer avoids."""
     wild = steady(460.0)
     meter = reconcile(wild, [], correct_octave=True)
-    assert meter.tempo == 460
+    assert meter.tempo == 462     # measured; `steady` rounds 460 bpm to a 130 ms beat
     assert meter.tempo_octave_shift == 0
     assert meter.tempo_octave_suspect
     assert meter.grid.beats_ms == wild.beats_ms

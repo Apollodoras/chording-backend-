@@ -1,0 +1,56 @@
+Title: Zombie
+Artist: The Cranberries
+Key: E minor (Aeolian)
+Tempo: 83
+Time: 4/4
+
+# Em C G D, one bar each, for the entire song — intro, verse, chorus and solo
+# are the same four bars. 26 passes over the recording's 106 bars.
+#
+# The D is a whole bar and not a half: the recording changes on the downbeat of
+# bar 4 of every cycle (bench/inspect_song.py, bars 4–7 and 8–11), so a chart
+# reading `| G D |` has the change two beats early.
+#
+# Note: harmonically uniform. The section split is the arrangement, not
+# something the chords could tell you.
+
+[Intro]
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+
+[Verse 1]
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+
+[Chorus 1]
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+
+[Verse 2]
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+
+[Chorus 2]
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+
+[Solo]
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+
+[Outro]
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C | G | D |
+| Em | C |

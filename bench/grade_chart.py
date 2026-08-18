@@ -6,13 +6,23 @@ transposition sweep that needs no reference at all.
 
 The resolutions exist because "does it match" is not one question:
 
-- **root** — right root in the right bar. The number to read first: a chart with
-  every root right and some qualities wrong is a different and much smaller
-  problem than one that has drifted.
-- **triad** — root plus major/minor, over the bars that aligned. Quality beyond
-  the third is not graded, and not because it is unimportant: `§12.2` already
-  ruled that the app plays `Cmaj9` and `Cmaj7` identically, so scoring them apart
-  would measure a difference the product does not have.
+- **root** — right root, **for how much of the bar**. The number to read first: a
+  chart with every root right and some qualities wrong is a different and much
+  smaller problem than one that has drifted.
+
+  Scored over the bar's *duration*, not over its first chord, and the difference
+  is not academic. Grading `bar.head` alone means half of `| Am G |` is never
+  looked at — so a system that reads Smooth Criminal's `| Am G | F E |` a chord
+  late scores every bar wrong on a head comparison and half of every bar right in
+  fact, and neither number tells you which. Several chords in one cell divide that
+  cell evenly (`chartref`'s stated convention), so the comparison is over
+  `_SLOTS` equal slices per bar and a bar holding one chord is simply twelve
+  identical slices.
+- **triad** — root plus major/minor, over the same slices, on the bars that
+  aligned. Quality beyond the third is not graded, and not because it is
+  unimportant: `§12.2` already ruled that the app plays `Cmaj9` and `Cmaj7`
+  identically, so scoring them apart would measure a difference the product does
+  not have.
 - **bars** — did the chart put its changes where the music puts them. Reported as
   alignment coverage plus the raw bar counts, because a chart that is right about
   every chord and 30 bars too long has a real defect that the root score hides.
@@ -67,6 +77,11 @@ _MATCH = 1.0
 _MISMATCH = 0.0
 _GAP = -0.25
 
+# Slices per bar for the duration-weighted comparison. Twelve divides by 2, 3, 4
+# and 6, so every cell a reference chart can legally hold — two chords, three,
+# four, six — splits into whole slices and none of them is rounded away.
+_SLOTS = 12
+
 
 def _root_quality(name: str) -> tuple[int | None, str]:
     """(pitch class, quality) for a chart cell, power chords included."""
@@ -107,6 +122,24 @@ def _triad_agrees(reference: str, system: str) -> bool:
 
 def _pc(bar: Bar) -> int | None:
     return _root_quality(bar.head)[0]
+
+
+def _slices(bar: Bar) -> list[str]:
+    """A bar as `_SLOTS` equal slices of chord name. `| Am G |` is six of each."""
+    names = bar.chords or ("N.C.",)
+    return [names[min(len(names) - 1, index * len(names) // _SLOTS)]
+            for index in range(_SLOTS)]
+
+
+def _shared(reference: Bar, system: Bar, agrees) -> int:
+    """How many of a bar's slices the two charts agree on, under `agrees`."""
+    return sum(1 for a, b in zip(_slices(reference), _slices(system)) if agrees(a, b))
+
+
+def _same_root(reference: str, system: str) -> bool:
+    ref_pc, _ = _root_quality(reference)
+    sys_pc, _ = _root_quality(system)
+    return ref_pc is not None and ref_pc == sys_pc
 
 
 def _transpose_bar(bar: Bar, semitones: int) -> Bar:
@@ -180,12 +213,16 @@ def align(reference: list[Bar], system: list[Bar]) -> Alignment:
 
 
 def _root_score(reference: list[Bar], system: list[Bar]) -> tuple[float, Alignment]:
+    """Share of the reference's *duration* whose root the system gets right.
+
+    A reference bar the alignment could not place contributes its slices as
+    misses, so dropping a section costs exactly the bars that were dropped.
+    """
     if not reference:
         return 0.0, Alignment([])
     alignment = align(reference, system)
-    hits = sum(1 for a, b in alignment.matched
-               if _pc(reference[a]) is not None and _pc(reference[a]) == _pc(system[b]))
-    return hits / len(reference), alignment
+    hits = sum(_shared(reference[a], system[b], _same_root) for a, b in alignment.matched)
+    return hits / (len(reference) * _SLOTS), alignment
 
 
 def grade(reference: Chart, system: Chart) -> dict:
@@ -193,9 +230,8 @@ def grade(reference: Chart, system: Chart) -> dict:
     root, alignment = _root_score(ref_bars, sys_bars)
 
     aligned = alignment.matched
-    triad_hits = sum(1 for a, b in aligned
-                     if _triad_agrees(ref_bars[a].head, sys_bars[b].head))
-    triad = triad_hits / len(ref_bars) if ref_bars else 0.0
+    triad_hits = sum(_shared(ref_bars[a], sys_bars[b], _triad_agrees) for a, b in aligned)
+    triad = triad_hits / (len(ref_bars) * _SLOTS) if ref_bars else 0.0
 
     # The sweep. Rotation 0 is the plain score; the winner tells us whether the
     # chart is wrong or merely displaced.
@@ -244,7 +280,8 @@ def grade(reference: Chart, system: Chart) -> dict:
             "ratio": round(system.tempo / reference.tempo, 3)
             if reference.tempo and system.tempo else None,
         },
-        "form": {"reference": "".join(reference.form), "system": "".join(system.form),
+        "form": {"reference": "".join(_collapsed(reference.form)),
+                 "system": "".join(_collapsed(system.form)),
                  "referenceLabels": [s.label for s in reference.sections],
                  "systemLabels": [s.label for s in system.sections]},
     }
@@ -257,8 +294,24 @@ def _same_tonic(a: str, b: str) -> bool:
 
 def _form_score(reference: Chart, system: Chart) -> float:
     """How much of the reference's repetition pattern survives, as a ratio of
-    longest-common-subsequence to reference length. Labels are not consulted."""
-    a, b = reference.form, system.form
+    longest-common-subsequence to reference length. Labels are not consulted.
+
+    **Runs are collapsed first**, and that is the difference between measuring
+    form and measuring a labelling choice. Creep is one eight-bar progression
+    played eleven times; a reference that writes it out as intro / verse / chorus
+    / verse / chorus / bridge / chorus / outro has the form string `AAAAAAAA`,
+    and a system that says "one section, eleven times" has `A`. Those describe the
+    *same music*, and the raw LCS scores the agreement at 0.125 — so the metric
+    would report a total failure on a song the analysis got exactly right, purely
+    because the two disagree about where a repeat is allowed to be split.
+
+    Collapsing `AAAAAAAA` and `A` both to `A` scores that 1.0. It costs nothing
+    that matters: contrast is what form *is*, so `ABABAC` survives collapsing
+    unchanged, and a system that flattens a real ABABAC song into one section
+    still scores 1/6. What stops being penalized is only the thing that was never
+    a musical claim.
+    """
+    a, b = _collapsed(reference.form), _collapsed(system.form)
     if not a:
         return 0.0
     table = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
@@ -267,6 +320,12 @@ def _form_score(reference: Chart, system: Chart) -> float:
             table[i][j] = (table[i - 1][j - 1] + 1 if a[i - 1] == b[j - 1]
                            else max(table[i - 1][j], table[i][j - 1]))
     return round(table[len(a)][len(b)] / len(a), 4)
+
+
+def _collapsed(form: list[str]) -> list[str]:
+    """`A A B A A` → `A B A`. Consecutive repeats of one letter are one entry."""
+    return [letter for index, letter in enumerate(form)
+            if index == 0 or letter != form[index - 1]]
 
 
 def diff_bars(reference: Chart, system: Chart, limit: int = 40) -> str:
@@ -281,8 +340,11 @@ def diff_bars(reference: Chart, system: Chart, limit: int = 40) -> str:
             break
         left = " ".join(ref_bars[a].chords) if a is not None else "—"
         right = " ".join(sys_bars[b].chords) if b is not None else "—"
-        ok = "ok" if (a is not None and b is not None
-                      and _triad_agrees(ref_bars[a].head, sys_bars[b].head)) else "XX"
+        if a is None or b is None:
+            ok = "XX"
+        else:
+            share = _shared(ref_bars[a], sys_bars[b], _triad_agrees) / _SLOTS
+            ok = "ok" if share > 0.99 else (f"{share:.0%}" if share else "XX")
         index = str(a + 1) if a is not None else "-"
         lines.append(f"{index:>4}  {left:<14} {right:<14}  {ok}")
         shown += 1

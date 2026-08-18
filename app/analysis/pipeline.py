@@ -238,6 +238,7 @@ def assemble(
         weigh=getattr(settings, "theory_belief", True),
         consolidate=getattr(settings, "theory_vocabulary", True),
         correct_octave=getattr(settings, "theory_tempo_octave", False),
+        form_canonical=getattr(settings, "theory_form", True),
     )
     if model is None or not grid.is_usable:
         raise AnalysisError(
@@ -301,6 +302,10 @@ def assemble(
         weighedBars=model.consensus.weighed_bars,
         snappedSpans=model.vocabulary.snapped_spans,
         absorbedIslands=model.vocabulary.absorbed_islands,
+        canonicalBars=model.canon.canonical_bars,
+        settledBars=model.canon.settled_bars,
+        heldBeats=model.canon.held_beats,
+        splitBars=model.canon.split_bars,
         phaseShift=model.meter.phase_shift,
         meterSource=model.meter.meter_source,
         tempoOctaveSuspect=model.meter.tempo_octave_suspect,
@@ -360,7 +365,12 @@ def assemble(
             # the other would put the anchors on a different bar grid than the
             # chart. They have to be the same string.
             time_signature=time_signature,
-            bpm=grid.bpm,
+            # The **model's** tempo, not the tracker's. Same argument as the
+            # `time_signature` above it: the payload carries the reconciled
+            # number, the client derives one bar grid from it, and a sidecar
+            # quoting a different tempo would describe a different grid than the
+            # chart it is shipped beside.
+            bpm=float(tempo),
             tempo_confidence=grid.confidence,
             engine_chords=str(chords_engine),
             engine_beats=str(beats_engine),

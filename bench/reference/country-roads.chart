@@ -1,0 +1,45 @@
+Title: Take Me Home, Country Roads
+Artist: John Denver
+Key: A major
+Tempo: 82
+Time: 4/4
+
+# Four chords, one bar each, and verse and chorus are harmonically distinct —
+# which is what makes this the one song in the corpus where the form score has
+# something real to be wrong about.
+#
+# Note: the recording's beat grid is the worst in the corpus, and this chart is
+# written in the song's bars rather than the tracker's. The tracker reads it at
+# 0.53 confidence, emits 3.52 beats to the bar before the repair, and runs at
+# 167 bpm — an *octave* above the 82 this song is in — so its bars are half bars
+# and its chart comes out about twice as long as this one. The measured harmonic
+# unit says the same thing from the other direction: the chords last 8 of the
+# tracker's beats, which is two of its bars and one of the song's. A 2:1 bar
+# ratio on this song is that octave and nothing else; it belongs to
+# bench/run_bench.py's sync gate rather than to this grade.
+
+[Intro]
+| A | A | A | A |
+
+[Verse 1]
+| A | A | F#m | E | D | A | A | A |
+| A | A | F#m | E | D | A | A | A |
+
+[Chorus 1]
+| A | E | F#m | D | A | E | D | A |
+
+[Verse 2]
+| A | A | F#m | E | D | A | A | A |
+| A | A | F#m | E | D | A | A | A |
+
+[Chorus 2]
+| A | E | F#m | D | A | E | D | A |
+
+[Bridge]
+| F#m | E | A | A | D | A | E | E |
+
+[Chorus 3]
+| A | E | F#m | D | A | E | D | A |
+
+[Outro]
+| A | E | D | A |

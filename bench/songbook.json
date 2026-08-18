@@ -1,0 +1,62 @@
+{
+  "creep": {
+    "videoId": "XFkzRNyygfk",
+    "title": "Creep",
+    "artist": "Radiohead",
+    "note": "Four bars, one chord each, for the entire song. The purest test there is of whether the form layer knows a section repeats."
+  },
+  "zombie": {
+    "videoId": "6Ejga4kJUts",
+    "title": "Zombie",
+    "artist": "The Cranberries",
+    "note": "Em C G D throughout, in a minor key, with a loud/quiet dynamic that the energy probe has to survive."
+  },
+  "im-yours": {
+    "videoId": "EkHTsc9PU2A",
+    "title": "I'm Yours",
+    "artist": "Jason Mraz",
+    "note": "C G Am F throughout. Offbeat reggae strum — onsets land between beats, which the beat tracker has to not follow."
+  },
+  "three-little-birds": {
+    "videoId": "HNBCVM4KbUM",
+    "title": "Three Little Birds",
+    "artist": "Bob Marley & The Wailers",
+    "note": "A D E, with a verse and a chorus that differ. Three chords, so a vocabulary bigger than four is transcribing noise."
+  },
+  "country-roads": {
+    "videoId": "1vrEljMfXYo",
+    "title": "Take Me Home, Country Roads",
+    "artist": "John Denver",
+    "note": "A major, verse and chorus harmonically distinct — the form score has something to be wrong about."
+  },
+  "wonderwall": {
+    "videoId": "6hzrDeceEKc",
+    "title": "Wonderwall",
+    "artist": "Oasis",
+    "note": "Played in Em shapes with a capo at 2, so the recording sounds in F# minor. Every published chart is in the wrong key on purpose; this one is not."
+  },
+  "someone-like-you": {
+    "videoId": "hLQl3WQQoQ0",
+    "title": "Someone Like You",
+    "artist": "Adele",
+    "note": "Piano only, arpeggiated. No strum, no band — the chord engine has the least evidence per frame here."
+  },
+  "dont-stop-believin": {
+    "videoId": "1k8craCGpgs",
+    "title": "Don't Stop Believin'",
+    "artist": "Journey",
+    "note": "E major, four-bar loop, but the chorus arrives once at the very end — a form with a genuine hapax in it."
+  },
+  "viva-la-vida": {
+    "videoId": "dvgZkm1xWPE",
+    "title": "Viva La Vida",
+    "artist": "Coldplay",
+    "note": "Ab major: no open strings, strings and timpani rather than guitar. The key nothing in a guitar corpus would catch."
+  },
+  "smooth-criminal": {
+    "videoId": "h_D3VFfhvs4",
+    "title": "Smooth Criminal",
+    "artist": "Michael Jackson",
+    "note": "The owner's own failing case, on the exact video they ran: the 9:26 short film, whose first minute is dialogue and whose song proper is an Am vamp."
+  }
+}

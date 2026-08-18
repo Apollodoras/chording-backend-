@@ -1,0 +1,92 @@
+Title: Smooth Criminal
+Artist: Michael Jackson
+Key: A minor (Dorian)
+Tempo: 118
+Time: 4/4
+
+# **Two chords to a bar.** The measured harmonic unit on this recording is two
+# beats (bench/harmonic_rhythm.py, and `canon.harmonic_unit`), which is what every
+# published chart of this song also says: `| Am G | F G |`, not `| Am | G | F | G |`.
+# Writing it one chord a bar puts the whole chart at half the song's harmonic
+# rhythm, and the resulting bar-count mismatch reads as a system defect.
+#
+# The owner's own failing case, on the exact video they ran: the 9:26 short film.
+# Two things about that video shape the numbers.
+#
+# **The song does not start until about 1:07.** The first minute is dialogue over
+# a room-tone bed, and the beat tracker emits **no beats at all** across a
+# 51-second stretch of it — one gap in the grid, longer than most songs' intros.
+# The bars here start where the music does, and the alignment is expected to gap
+# through everything before that.
+#
+# **The harmony is a bass line, not a chord part.** There is no instrument
+# sounding a third for most of the verse — Am, G and F are what the bass walks
+# through under a single sustained A tonality — so a recognizer hearing Bm or C
+# where the bass passes through B and C is hearing the recording correctly and
+# charting it wrongly. That is the specific defect this entry exists to expose.
+
+[Intro]
+| Am Am | Am G | Am Am | Am G |
+| Am Am | Am G | Am Am | Am G |
+
+[Verse 1]
+| Am G | F G | Am G | F G |
+| Am G | F G | Am G | F G |
+| Am G | F G | Am G | F G |
+| Am G | F G | Am G | F G |
+
+[Pre-Chorus 1]
+| F G | F G | F G | F E |
+| F G | F G | F G | F E |
+
+[Chorus 1]
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+
+[Verse 2]
+| Am G | F G | Am G | F G |
+| Am G | F G | Am G | F G |
+| Am G | F G | Am G | F G |
+| Am G | F G | Am G | F G |
+
+[Pre-Chorus 2]
+| F G | F G | F G | F E |
+| F G | F G | F G | F E |
+
+[Chorus 2]
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+
+[Bridge]
+| Am Am | Am Am | Am G | F G |
+| Am Am | Am Am | Am G | F E |
+
+[Chorus 3]
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+
+[Solo]
+| Am G | F G | Am G | F G |
+| Am G | F G | Am G | F G |
+| Am G | F G | Am G | F G |
+| Am G | F G | Am G | F G |
+
+[Chorus 4]
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+
+[Outro]
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
+| Am G | F E | Am G | F E |
