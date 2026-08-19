@@ -90,12 +90,36 @@ CLUSTER_SIMILARITY = 0.75
 # this rule touches is now cut into phrase-length pieces (eight bars of a doubled
 # grid, which is its four-bar phrase) instead of six-bar ones, which is the answer
 # a musician would give and the one `repeats` can express.
-PERIOD_MARGIN = 0.05
+#
+# **The width is measured, and it was too narrow at 0.05.** Swept over the chart
+# corpus (root / form): 0.05 → 0.857 / 0.713, then a flat band from 0.08 to 0.15
+# at 0.854–0.855 / **0.747**, then 0.18 → 0.853 / 0.732. 0.12 is the middle of
+# the band rather than its edge.
+#
+# Three and a half points of form for three thousandths of root, and the trade is
+# the right way round for what this constant decides: the shorter unit is what
+# lets `_sections_from` collapse a repeat into `repeats`, so widening the margin
+# is not "accept a worse period", it is "prefer the compact statement of the same
+# period more often". The songs that move are the ones whose section is two
+# passes of a loop — which in this repertoire is most of them.
+#
+# Worth noting what the 2026-08-18 audit expected here and did not get. It read
+# the shortest-within-margin rule as the cause of fragmented sections and
+# recommended preferring the **longest**; measured, that is a no-op on all ten
+# songs (the divisibility test above already prevents the case it describes), and
+# moving the margin the *other* way is what pays. The period search is not where
+# a song's sections fragment — `folded()` and the divisibility rule got there
+# first.
+PERIOD_MARGIN = 0.12
 
 # Beats sampled per bar when comparing two bars. Comparing at a fixed grid is
 # what lets a bar holding one chord be compared with a bar holding two without
 # either representation being privileged.
 COMPARE_SUBDIVISION = 4
+
+# Whether to cut the song at novelty peaks instead of tiling it with one unit.
+# **Off**, and the measurement that settled it is on `novelty_blocks` below.
+NOVELTY = False
 
 
 @dataclass(frozen=True)
@@ -325,6 +349,128 @@ def _chunk(bars: list[list[BarChord]], unit: int, phase: int) -> list[Block]:
     return blocks
 
 
+# --- boundaries from novelty ------------------------------------------------
+#
+# §20.3b — the alternative to cutting the song into equal blocks.
+#
+# `_layout` below tiles the whole song with one unit at one phase, and that model
+# cannot express a standard song form: 4-bar intro + 8-bar verse + 16-bar chorus
+# has no valid representation in it, so boundaries land mid-section and every
+# stage after this one — clustering, the vote, the canon — reasons about slots
+# that are half of one section and half of the next.
+#
+# The standard answer is Foote novelty: build the bar-by-bar self-similarity
+# matrix, slide a checkerboard kernel down its diagonal, and read the peaks as
+# boundaries. Where the music changes, the kernel sees two blocks that are alike
+# within and unlike across, and it spikes.
+#
+# **It is implemented here, it is measured, and it loses on every axis.** Over the
+# ten-song chart corpus, against the fixed grid:
+#
+#            root    triad    form
+#   grid    0.857    0.852   0.713
+#   Foote   0.846    0.835   0.610
+#
+# and the way it loses says why. Creep goes from 1.000 root and four chords to
+# 0.949 and **nine**: the song is one eight-bar loop for its whole length, the
+# fixed grid at the measured period lands on it exactly, and the novelty curve
+# peaks on the chord changes *inside* the loop because at bar resolution that is
+# what a checkerboard kernel sees. Foote novelty is a good segmenter of audio
+# features, where timbre and density change at a section boundary and not within
+# one; run over *harmony* in a repertoire whose sections are the same four chords
+# at different volumes, the signal it needs is not there.
+#
+# So the argument in the audit is right about the fixed grid's limits — a 4-bar
+# intro, an 8-bar verse and a 16-bar chorus genuinely have no representation in
+# it — and wrong about this being the way out. What would need to change first is
+# the feature: novelty over the *energy* curve (which the structure probe already
+# produces and which nothing but the chorus label reads today) is the untried
+# version, and it is untried rather than rejected.
+#
+# Left in place, off, and covered by a test that runs it — the measurement is the
+# reason not to ship it, and a measurement nobody can re-run is a claim.
+
+# Half-width of the checkerboard kernel, in bars. Eight bars either side is a
+# section-scale question; smaller kernels find phrase boundaries, which is what
+# the fixed grid already finds.
+NOVELTY_KERNEL_BARS = 8
+
+# A peak has to stand this far above the local median novelty to be a boundary.
+NOVELTY_PROMINENCE = 0.08
+
+
+def novelty(bars: list[list[BarChord]], bar_beats: float) -> list[float]:
+    """Foote novelty over the bar-level self-similarity matrix, one value per bar.
+
+    High where the music before a bar is unlike the music after it, which is what
+    a section boundary *is* — as opposed to a chord change, which is what the
+    period search finds.
+    """
+    n = len(bars)
+    if n < 4:
+        return [0.0] * n
+    similarity = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        similarity[i][i] = 1.0
+        for j in range(i + 1, n):
+            value = bar_similarity(bars[i], bars[j], bar_beats)
+            similarity[i][j] = similarity[j][i] = value
+
+    half = min(NOVELTY_KERNEL_BARS, max(2, n // 4))
+    out = [0.0] * n
+    for centre in range(n):
+        lo, hi = centre - half, centre + half
+        if lo < 0 or hi > n:
+            continue
+        same = across = 0.0
+        pairs = 0
+        for i in range(lo, centre):
+            for j in range(lo, centre):
+                same += similarity[i][j]
+            for j in range(centre, hi):
+                across += similarity[i][j]
+            pairs += 1
+        for i in range(centre, hi):
+            for j in range(centre, hi):
+                same += similarity[i][j]
+        if pairs:
+            out[centre] = (same - 2.0 * across) / (2.0 * half * half)
+    return out
+
+
+def novelty_blocks(bars: list[list[BarChord]], bar_beats: float,
+                   *, minimum: int = 4) -> list[Block]:
+    """Variable-length blocks, cut where the novelty peaks.
+
+    Boundaries no closer together than `minimum` bars, because a section shorter
+    than that is a tag or a turnaround (§15's floor, and `_absorb_runts`' one).
+    """
+    n = len(bars)
+    if n < 2 * minimum:
+        return _chunk(bars, n, 0)
+    curve = novelty(bars, bar_beats)
+    ordered = sorted(curve)
+    median = ordered[len(ordered) // 2]
+    boundaries = [0]
+    for index in range(1, n):
+        if curve[index] < median + NOVELTY_PROMINENCE:
+            continue
+        if index - boundaries[-1] < minimum or n - index < minimum:
+            continue
+        # Local maximum only, so one broad rise produces one boundary.
+        if curve[index] < max(curve[max(0, index - 2):index + 3]):
+            continue
+        boundaries.append(index)
+    boundaries.append(n)
+
+    blocks: list[Block] = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        if end > start:
+            blocks.append(Block(start_bar=start,
+                                bars=tuple(tuple(b) for b in bars[start:end])))
+    return blocks
+
+
 def _repetition_score(blocks: list[Block], bar_beats: float) -> float:
     """How much repetition a block layout exposes.
 
@@ -457,7 +603,10 @@ def detect(bars: list[list[BarChord]], *, bar_beats: float = 4.0,
     # `folded`); everything the caller gets back is the real ones.
     structure = folded(bars)
     unit = period(structure, bar_beats)
-    blocks = _layout(structure, unit, bar_beats)
+    if NOVELTY:
+        blocks = novelty_blocks(structure, bar_beats)
+    else:
+        blocks = _layout(structure, unit, bar_beats)
     groups, assignment = cluster(blocks, bar_beats)
 
     blocks = _restored(blocks, bars)
@@ -470,7 +619,7 @@ def detect(bars: list[list[BarChord]], *, bar_beats: float = 4.0,
             group.canonical = [list(bar) for bar in bars[start:start + group.length_bars]]
 
     sections = _sections_from(blocks, assignment, groups)
-    sections = _absorb_runts(sections)
+    sections = _absorb_runts(sections, groups)
     _assign_positions(sections)
     _assign_labels(sections, groups, energy=energy, unit=unit, tonic_pc=tonic_pc)
     return sections, groups
@@ -520,7 +669,8 @@ def _expanded(section: Section) -> list[list[BarChord]]:
     return [list(bar) for bar in section.bars] * section.repeats
 
 
-def _absorb_runts(sections: list[Section]) -> list[Section]:
+def _absorb_runts(sections: list[Section],
+                  groups: list[RepeatGroup] | None = None) -> list[Section]:
     """§15's ~4-bar floor, applied only where it costs nothing.
 
     A runt's bars are expanded into a neighbour rather than dropped, so no bar of
@@ -542,19 +692,44 @@ def _absorb_runts(sections: list[Section]) -> list[Section]:
     short section of its own. The ~4-bar floor is a §15 *preference*; the
     container has no such rule, and a standalone two-bar intro is a far smaller
     lie than an eighteen-bar section that claims to be one piece of music.
+
+    **And a host that is a clean occurrence of a repeat group is not lengthened.**
+    Third rule, from the 2026-08-18 audit. A 2-bar turnaround absorbed into the
+    16-bar verse beside it makes an 18-bar section, and 18 bars is not an
+    occurrence of a 16-bar group any more: `block_similarity` scores blocks of
+    unequal length 0, so that verse stops matching the others, drops out of the
+    consensus vote and out of §21's canon, and the repetition the whole layer
+    runs on is quietly one pass short. The runt stays where it is instead —
+    which is the same trade the rule above already makes, applied to the
+    occurrence rather than to the `repeats` encoding.
+
+    **A repeat group specifically**, and that qualifier is measured rather than
+    tidy. Protecting every clean host — including the ones whose "group" has a
+    single occurrence, where there is no sibling to stop matching — costs Smooth
+    Criminal a quarter of its form score (0.750 → 0.500) and gains nothing
+    anywhere: a lone section is not made worse by two more bars, and leaving the
+    runt standing turns one section into two. With the guard restricted to groups
+    that actually repeat, the corpus is unchanged to four decimals and the
+    failure above is still closed.
     """
     if len(sections) <= 1:
         return sections
+    lengths = {group.label: group.length_bars for group in (groups or [])
+               if group.is_repeat}
     out: list[Section] = []
     for section in sections:
         if section.total_bars >= MIN_SECTION_BARS or not out or out[-1].repeats > 1:
             out.append(section)
             continue
+        if lengths.get(out[-1].group) == out[-1].total_bars:
+            out.append(section)      # the host is a clean occurrence — leave it
+            continue
         out[-1].bars = _expanded(out[-1]) + _expanded(section)
         out[-1].repeats = 1
     # The head has no previous section to join, so it merges forwards instead —
     # under the same two rules.
-    if len(out) > 1 and out[0].total_bars < MIN_SECTION_BARS and out[1].repeats == 1:
+    if (len(out) > 1 and out[0].total_bars < MIN_SECTION_BARS and out[1].repeats == 1
+            and lengths.get(out[1].group) != out[1].total_bars):
         head = out.pop(0)
         out[0].bars = _expanded(head) + _expanded(out[0])
         out[0].repeats = 1
@@ -606,6 +781,12 @@ def _assign_labels(sections: list[Section], groups: list[RepeatGroup], *,
     `solo` stays unreachable on purpose. Telling a solo from a verse is a
     question about *timbre* — who is playing the melody — and nothing that
     crosses the audio boundary here (one loudness scalar per hop) can answer it.
+    The 2026-08-18 audit noted it as dead (F23), which it is; it is dead because
+    the evidence for it does not cross §2.1's audio boundary, and the fix is a
+    second scalar out of the structure probe rather than anything in this file.
+    `preChorus` is nearly dead for a different and better reason — its guard
+    demands two repeated non-chorus groups *and* a half cadence *and* a chorus
+    after it, and songs that satisfy all three are genuinely rare.
     """
     if not sections:
         return
@@ -614,18 +795,23 @@ def _assign_labels(sections: list[Section], groups: list[RepeatGroup], *,
     for section in sections:
         order.setdefault(section.group, len(order) + 1)
 
-    if energy is None:
+    means = ({s.group: _mean_energy(energy, s) for s in sections}
+             if energy is not None else {})
+    repeated = {g.label for g in groups if g.is_repeat}
+    # A group can also be "repeated" by having been merged into one section with
+    # several passes, which is what happens when its occurrences were adjacent.
+    repeated |= {s.group for s in sections if s.repeats > 1}
+
+    if not repeated:
+        # No repetition anywhere: there is no chorus to find and no verse to name,
+        # so §15's honest fallback stands. This is now the *only* way to reach it
+        # — it used to be reached by every song analyzed without a loudness probe.
         for section in sections:
             section.kind = "custom"
             section.name = f"Part {order.get(section.group, 1)}"
         return
 
-    means = {s.group: _mean_energy(energy, s) for s in sections}
-    repeated = {g.label for g in groups if g.is_repeat}
-    # A group can also be "repeated" by having been merged into one section with
-    # several passes, which is what happens when its occurrences were adjacent.
-    repeated |= {s.group for s in sections if s.repeats > 1}
-    chorus = max(repeated, key=lambda g: (means.get(g, 0.0), g), default=None)
+    chorus = _chorus(sections, repeated, means)
     # The song's other repeated material — what a pre-chorus has to be one of.
     siblings = repeated - {chorus}
 
@@ -645,6 +831,64 @@ def _assign_labels(sections: list[Section], groups: list[RepeatGroup], *,
             section.kind = "bridge"
         else:
             section.kind = "verse"
+
+
+def _chorus(sections: list[Section], repeated: set[str],
+            means: dict[str, float]) -> str | None:
+    """Which repeated group is the chorus, from several cheap signals.
+
+    Loudness alone was the whole rule, and it is the right *first* signal —
+    a chorus is louder and denser than the verse it follows — but it fails on
+    exactly the songs where it is easiest to be confident: a quiet chorus after a
+    building verse, a final verse sung at full band, a coda louder than anything.
+    Worse, it was the only signal, so a build without a structure probe had no
+    labelling at all and every song came out `Part 1`, `Part 2`.
+
+    Three structural signals stand beside it, each cheap and each a different
+    argument for the same conclusion:
+
+    - **how often it comes round.** A chorus recurs more than any other group; a
+      verse comes back too, but a song has more verse *material* than chorus
+      material and the chorus is the part that repeats identically.
+    - **whether it is interleaved.** A chorus alternates with something else
+      (V C V C). A group whose occurrences are all consecutive is a verse played
+      twice, or a vamp.
+    - **where it first appears.** Choruses rarely open a song. A group whose first
+      occurrence is the first section is far more likely the intro or the verse,
+      and this carries the most weight of the three structural terms because it is
+      the one that decides `A B A` — where the other two both point at `A`, which
+      opens the song, recurs, and is interleaved, and is the verse.
+
+    Scored as a weighted sum rather than a cascade of tie-breaks, so a chorus that
+    is only slightly the loudest but plainly the most repeated still wins, and no
+    single signal can carry the decision on its own. The label falls back to the
+    alphabetically-first repeated group only when everything ties, which keeps the
+    output deterministic (§16.5).
+    """
+    if not repeated:
+        return None
+    positions: dict[str, list[int]] = {}
+    for index, section in enumerate(sections):
+        positions.setdefault(section.group, []).append(index)
+
+    loudest = max(means.values(), default=0.0)
+    quietest = min(means.values(), default=0.0)
+    spread = (loudest - quietest) or 1.0
+
+    def score(group: str) -> tuple[float, str]:
+        where = positions.get(group, [])
+        passes = sum(sections[i].repeats for i in where)
+        interleaved = any(b - a > 1 for a, b in zip(where, where[1:]))
+        loudness = ((means[group] - quietest) / spread) if group in means else 0.0
+        return (
+            1.0 * loudness
+            + 0.5 * min(passes, 4) / 4.0
+            + 0.3 * float(interleaved)
+            - 0.6 * float(bool(where) and where[0] == 0),
+            group,
+        )
+
+    return max(repeated, key=score)
 
 
 def _leans_on(section: Section, following: Section | None, chorus: str | None,

@@ -16,10 +16,9 @@ from app.analysis.postprocess import (
     merge,
     process,
     quantize,
-    simplify_tier,
 )
 from app.analysis.types import GridSpan, RawChordSpan
-from app.chords import EASY, HARD, MAJOR, MAJOR7, MINOR, NORMAL
+from app.chords import MAJOR, MAJOR7, MINOR
 from tests.conftest import known_axis, known_chords
 
 
@@ -137,42 +136,25 @@ def test_the_timeline_is_extended_to_a_known_total():
     assert out[-1].end_beat == 16
 
 
-# --- difficulty -------------------------------------------------------------
+# --- no simplification ------------------------------------------------------
 
-def test_simplifying_re_merges_the_duplicates_it_creates():
-    """The load-bearing detail: collapsing Cmaj7 and C onto C at `easy` puts two
-    identical chords side by side, and showing the player a chord change that
-    doesn't happen is worse than the extension they lost."""
-    spans = [span(0, 4, root=0, quality=MAJOR7), span(4, 4, root=0, quality=MAJOR)]
-    out = simplify_tier(spans, EASY)
-    assert len(out) == 1
-    assert out[0].length_beats == 8
+def test_the_chain_leaves_the_harmony_alone():
+    """The §5.5 tiers used to be step 5 of this chain, and `easy` collapsed a
+    Cmaj7 next to a C onto one held C. Both chords were played, so both are
+    charted: this chain quantizes, merges and fills, and it never renames."""
+    spans = [span(0, 4, root=0, quality=MAJOR7), span(4, 4, root=0, quality=MAJOR),
+             span(8, 4, root=9, quality=MINOR)]
+    out = merge(spans)
+    assert [(s.root_pc, s.quality) for s in out] == [
+        (0, MAJOR7), (0, MAJOR), (9, MINOR)]
 
 
-def test_easy_drops_passing_chords_shorter_than_a_bar():
-    """The other half of §5.5 — an easy chart has fewer *changes*, not just
-    simpler names."""
+def test_a_passing_chord_of_a_full_bar_is_never_dropped():
+    """`easy` dropped changes shorter than a bar, so a two-beat passing chord
+    disappeared. The floor is one *beat* again — the jitter floor — and a chord
+    the band played for half a bar is a chord the band played."""
     spans = [span(0, 8, root=0), span(8, 2, root=2, quality=MINOR), span(10, 8, root=7)]
-    out = simplify_tier(spans, EASY, bar_beats=4)
-    assert [s.root_pc for s in out] == [0, 7]
-
-
-def test_hard_leaves_the_harmony_alone():
-    spans = [span(0, 4, root=0, quality=MAJOR7), span(4, 4, root=9, quality=MINOR)]
-    out = simplify_tier(spans, HARD)
-    assert [(s.root_pc, s.quality) for s in out] == [(0, MAJOR7), (9, MINOR)]
-
-
-def test_every_tier_covers_the_same_span_of_time():
-    """A tier that quietly got shorter would put the sidecar's anchors past the
-    end of the song."""
-    axis = known_axis()
-    lengths = {
-        difficulty: sum(s.length_beats for s in process(known_chords(), axis,
-                                                        difficulty=difficulty))
-        for difficulty in (EASY, NORMAL, HARD)
-    }
-    assert len(set(lengths.values())) == 1, lengths
+    assert [s.root_pc for s in drop_short(spans)] == [0, 2, 7]
 
 
 # --- confidence -------------------------------------------------------------
@@ -194,7 +176,7 @@ def test_exact_ratio_reports_how_much_survived_normalization():
 def test_the_known_song_survives_the_chain_unchanged():
     """G–D–Em–C, four beats each, four times. Nothing in §5.4 should touch a
     chart that was already clean."""
-    out = process(known_chords(), known_axis(), difficulty=NORMAL)
+    out = process(known_chords(), known_axis())
     assert len(out) == 16
     assert [s.root_pc for s in out[:4]] == [7, 2, 4, 0]
     assert all(s.length_beats == 4 for s in out)

@@ -75,15 +75,16 @@ PATTERN_PREFIX = "yt:pat-"
 PROGRESSION_PREFIX = "yt:prog-"
 
 
-def song_id(video_id: str, difficulty: str | None = None) -> str:
+def song_id(video_id: str) -> str:
     """The idempotency key (§12.5): deterministic, so re-analyzing a video
     **replaces** its Library row rather than duplicating it.
 
-    The optional difficulty suffix is what lets one video produce several rows
-    without them colliding (``yt:<videoId>:easy``).
+    One video, one id. It used to take a difficulty suffix
+    (``yt:<videoId>:easy``) so that one recording could hold three Library rows
+    without them colliding; there is one chart per recording now, so the suffix
+    is gone and the id is the video's.
     """
-    base = f"{SONG_PREFIX}{video_id}"
-    return f"{base}:{difficulty}" if difficulty else base
+    return f"{SONG_PREFIX}{video_id}"
 
 _KIND_DISPLAY = {
     "intro": "Intro", "verse": "Verse", "preChorus": "Pre-Chorus", "chorus": "Chorus",

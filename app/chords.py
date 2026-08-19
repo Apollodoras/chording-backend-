@@ -13,10 +13,13 @@ grammar, whereas a chord recognizer hands us Harte labels, slash chords and
 extensions by the hundred (handoff §12.2 — "a chord recognizer will hand you
 these constantly ... normalize before emitting"). So:
 
-- ``normalize`` maps anything an engine emits into the app's closed grammar,
-- ``simplify`` implements the §5.5 difficulty tiers **redefined against that
-  grammar** (§12.2: `hard` cannot mean "full detected quality" — the ceiling is
-  what ``ChordSymbol(name:)`` parses).
+``normalize`` maps anything an engine emits into the app's closed grammar, and
+that grammar is the **only** reduction this file performs. There used to be a
+second one — ``simplify``, the §5.5 easy/normal/hard tiers — and it is gone: the
+chart states what was played, and nothing downstream is allowed to make the
+harmony easier than the recording. (§12.2 had already cut those tiers down to
+three shapes inside the app's grammar, which is a fair description of how little
+they were ever worth.)
 """
 
 from __future__ import annotations
@@ -145,11 +148,23 @@ def prefers_flats(tonic: str, mode: str) -> bool:
     pc = pitch_class(tonic)
     if pc is None:
         return False
+    return prefers_flats_for(pc, mode)
+
+
+# The key-signature table itself, by pitch class, so a caller holding a pitch
+# class rather than a spelled name does not have to keep a second copy of it.
+# `analysis/keyfinder.py` had that second copy — the same twelve numbers, written
+# out again — which is the shape of thing that stays right until one of them is
+# edited.
+_FLAT_MINOR_TONICS = frozenset({2, 7, 0, 5, 10, 3})   # d, g, c, f, bb, eb
+_FLAT_MAJOR_TONICS = frozenset({5, 10, 3, 8, 1})      # F, Bb, Eb, Ab, Db
+
+
+def prefers_flats_for(tonic_pc: int, mode: str) -> bool:
+    """`prefers_flats`, for a tonic that is still a pitch class."""
     if mode == "minor":
-        # d, g, c, f, bb, eb minor — everything from one flat down.
-        return pc in {2, 7, 0, 5, 10, 3}
-    # F, Bb, Eb, Ab, Db major.
-    return pc in {5, 10, 3, 8, 1}
+        return tonic_pc % 12 in _FLAT_MINOR_TONICS
+    return tonic_pc % 12 in _FLAT_MAJOR_TONICS
 
 
 # --- Normalization ----------------------------------------------------------
@@ -189,7 +204,7 @@ def normalize_quality(text: str) -> tuple[str, bool]:
     ``exact`` is False whenever information was thrown away (an extension
     flattened, an alteration dropped, a token not understood at all). The caller
     keeps the count: a track where most chords needed reducing is a track whose
-    `hard` tier is a fiction, and that is worth knowing before shipping it.
+    chart is a fiction, and that is worth knowing before shipping it.
     """
     raw = text.strip()
     if raw in _EXACT_QUALITY:
@@ -261,6 +276,15 @@ def normalize(label: str) -> tuple[int, str, bool] | None:
       discarded** (§12.2: `G/B` → `G`). This is a real loss and the right one:
       the app voices a chord from its root, so a bass it cannot play is better
       dropped than misread.
+
+    The 2026-08-18 audit suggested keeping inversions (F34), on the grounds
+    that BTC's large vocabulary emits them and the bass note is part of what was
+    played. The obstacle is not this function: the container has no
+    field for a bass note, and the app builds its voicing from the root, so a
+    payload saying `C/E` would either fail to parse or sound a plain C under a
+    label promising otherwise. Adding it is a container change first (§12.2) and
+    a parser change second, which is why the loss is recorded here — in
+    ``exactRatio``, which counts every discarded bass — rather than papered over.
     """
     text = label.strip()
     if text.lower() in NO_CHORD_LABELS:
@@ -294,45 +318,3 @@ def normalize_name(label: str, *, flats: bool = False) -> str | None:
         return None
     root, quality, _ = parsed
     return render(root, quality, flats=flats)
-
-
-# --- Difficulty (handoff §5.5, re-scoped by §12.2) ---------------------------
-
-EASY, NORMAL, HARD = "easy", "normal", "hard"
-DIFFICULTIES = (EASY, NORMAL, HARD)
-
-# §5.5 said `hard` = "full detected quality, including extensions and slash
-# chords". §12.2 makes that impossible — the ceiling is the app's grammar — so
-# the tiers are redefined as three shapes *inside* it:
-#
-#   easy   major/minor only. Every quality collapses onto its own triad's
-#          brightness: the beginner plays G where the record plays Gmaj7.
-#   normal triads + the three common 7ths + sus. What a chord sheet prints.
-#   hard   the whole grammar, unreduced.
-#
-# (The other half of §5.5 — "drop passing chords shorter than a bar" on easy —
-# is duration work, and lives in analysis/postprocess.py.)
-_EASY = {
-    MAJOR: MAJOR, MAJOR7: MAJOR, DOMINANT7: MAJOR, AUGMENTED: MAJOR,
-    SUS2: MAJOR, SUS4: MAJOR,
-    MINOR: MINOR, MINOR7: MINOR, DIMINISHED: MINOR, DIMINISHED7: MINOR,
-    HALF_DIM7: MINOR,
-}
-_NORMAL = {
-    MAJOR: MAJOR, MAJOR7: MAJOR7, DOMINANT7: DOMINANT7,
-    MINOR: MINOR, MINOR7: MINOR7,
-    SUS2: SUS2, SUS4: SUS4,
-    # Diminished and augmented are grammar-legal but they are not campfire
-    # chords; at `normal` they read as their nearest playable triad.
-    DIMINISHED: MINOR, DIMINISHED7: MINOR, HALF_DIM7: MINOR7, AUGMENTED: MAJOR,
-}
-
-
-def simplify(quality: str, difficulty: str) -> str:
-    """Reduce a quality to the vocabulary of a difficulty tier."""
-    if difficulty == EASY:
-        return _EASY.get(quality, MAJOR)
-    if difficulty == NORMAL:
-        return _NORMAL.get(quality, MAJOR)
-    return quality
-

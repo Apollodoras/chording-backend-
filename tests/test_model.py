@@ -1,14 +1,14 @@
-"""§20.6 — one analysis, three renders.
+"""§20.6 — one analysis, one render.
 
-The claim under test is that a song has **one** structure and the difficulty
-tier only changes which chord names are printed inside it. Before §20 the whole
-of §5.4, §15 and §14 ran once per tier, so the three songs were related only by
-having come from the same recording — and `easy`'s simplification can merge two
-bars into identical ones, which changes what the segmenter collapses. The
-pipeline had to re-check `lint_sync` against every tier to catch the fallout.
+The claim under test is that `build` decides and `render` reads those decisions
+back out. Every theory layer is *replayed* rather than retaken, so a render
+cannot quietly reach a different conclusion from the analysis it is rendering.
 
-That check is still there and still passes. These tests assert the stronger
-thing it could never establish: that the tiers agree **by construction**.
+That mattered most when there were three renders — the §5.5 difficulty tiers,
+which could disagree with each other about where the sections were, because
+`easy`'s simplification merged bars the segmenter then collapsed differently.
+The tiers are gone. The replay discipline stays, because "the render agrees with
+the model" is a property worth holding by construction rather than by luck.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import pytest
 
 from app.analysis import model as song_model
 from app.analysis.types import BeatGrid, EnergyCurve, RawChordSpan
-from app.chords import DIFFICULTIES, EASY, HARD
 from app.chords import render as render_name
 from app.errors import AnalysisError
 
@@ -69,49 +68,42 @@ def test_no_readable_chords_raises_rather_than_blaming_the_rhythm():
         song_model.build(grid=_grid(), raw=silent, onsets=[])
 
 
-# --- the tiers are renders, not analyses -------------------------------------
+# --- the render is a read, not an analysis -----------------------------------
 
-def test_every_tier_shares_the_models_section_boundaries():
+def test_the_render_shares_the_models_section_boundaries():
     model = _model()
     expected = [(s.start_bar, s.total_bars) for s in model.sections]
-    for difficulty in DIFFICULTIES:
-        rendered = song_model.render(model, _chords(), difficulty)
-        assert [(s.start_bar, s.total_bars) for s in rendered] == expected, difficulty
+    rendered = song_model.render(model, _chords())
+    assert [(s.start_bar, s.total_bars) for s in rendered] == expected
 
 
-def test_every_tier_shares_the_models_repeat_groups():
+def test_the_render_shares_the_models_repeat_groups():
     model = _model()
     expected = [s.group for s in model.sections]
-    for difficulty in DIFFICULTIES:
-        assert [s.group for s in song_model.render(model, _chords(), difficulty)] == expected
+    assert [s.group for s in song_model.render(model, _chords())] == expected
 
 
-def test_the_tiers_tile_the_song_identically():
-    """One sidecar serves whichever tier the player asked for, so a tier that
-    tiled differently would be addressed by anchors meant for another."""
+def test_the_render_tiles_the_song_without_a_hole_in_it():
+    """The sidecar's anchors address the chart's bars, so a render that tiled
+    differently from the model would be addressed by anchors meant for another
+    shape."""
     model = _model()
-    for difficulty in DIFFICULTIES:
-        cursor = 0
-        for section in song_model.render(model, _chords(), difficulty):
-            assert section.start_bar == cursor
-            cursor += section.total_bars
-        assert cursor == model.total_bars
+    cursor = 0
+    for section in song_model.render(model, _chords()):
+        assert section.start_bar == cursor
+        cursor += section.total_bars
+    assert cursor == model.total_bars
 
 
-def test_simplification_changes_the_names_not_the_shape():
-    """`easy` really does drop passing chords shorter than a bar — duration work
-    that cannot be done by renaming qualities in place — but the boundaries come
-    from the model and do not move."""
+def test_the_render_prints_the_quality_that_was_played():
+    """The §5.5 tiers flattened `Cmaj7` to `C` for a beginner. Nobody is forming
+    the shape, so the seventh is information the analysis earned and the chart
+    keeps."""
     raw = _chords(names=("Cmaj7", "G7", "Am7", "Fmaj7"))
     model = song_model.build(grid=_grid(), raw=raw, onsets=[])
-    hard = song_model.render(model, raw, HARD)
-    easy = song_model.render(model, raw, EASY)
-    assert [(s.start_bar, s.total_bars) for s in hard] == [(s.start_bar, s.total_bars) for s in easy]
-
-    hard_qualities = {c.quality for s in hard for bar in s.bars for c in bar}
-    easy_qualities = {c.quality for s in easy for bar in s.bars for c in bar}
-    assert hard_qualities != easy_qualities, "the tiers really do differ in vocabulary"
-    assert easy_qualities <= {"major", "minor"}
+    rendered = song_model.render(model, raw)
+    qualities = {c.quality for s in rendered for bar in s.bars for c in bar}
+    assert qualities == {"major7", "dominant7", "minor7"}
 
 
 # --- patterns ----------------------------------------------------------------
@@ -162,9 +154,13 @@ def test_a_loudness_curve_becomes_one_number_per_bar():
 
 
 def test_no_probe_means_no_energy_and_that_is_a_supported_configuration():
+    """And since F21 it is no longer a configuration with no labels in it: the
+    curve is absent, the structural cues are not, and the sections come back
+    named from repetition alone."""
     model = _model()
     assert song_model.per_bar_energy(None, model.axis) is None
-    assert all(s.kind == "custom" for s in model.sections), "§15's honest fallback"
+    assert {s.kind for s in model.sections} <= {"verse", "chorus", "intro", "outro",
+                                                "bridge", "preChorus"}
 
 
 def test_an_empty_curve_is_treated_as_no_curve():
@@ -203,7 +199,7 @@ def test_the_hop_is_a_real_duration_and_not_a_whole_millisecond():
 def _sevenths(last: str = "Cmaj7") -> list[RawChordSpan]:
     """Gmaj7 D7 Em7 Cmaj7 ×4, with the final bar heard as `last`.
 
-    Sevenths because that is what makes a tier render *visible* in the model: at
+    Sevenths because that is what makes a render *visible* in the model: at
     `easy` every one of them flattens to a triad, so a render that wrote back to
     the model would leave the reference structure carrying easy's chords.
     """
@@ -229,27 +225,26 @@ def _provenance(groups):
             for g in groups]
 
 
-def test_rendering_a_tier_does_not_edit_the_model_it_renders():
-    """`render` replays the vote per tier, and the vote writes its provenance
-    onto the `RepeatGroup` objects — which are the model's own. So after
-    compiling three tiers the model described whichever one compiled last: at
-    `easy`, a canonical progression of plain triads for a song whose reference
-    tier is all sevenths. The wire never saw it (the sidecar snapshots earlier),
-    the benchmark and the logs did."""
+def test_rendering_does_not_edit_the_model_it_renders():
+    """`render` replays the vote, and the vote writes its provenance onto the
+    `RepeatGroup` objects — which are the model's own. Recording on a render
+    would leave the model describing the render's conclusions instead of the
+    analysis's. The wire never saw that (the sidecar snapshots earlier), the
+    benchmark and the logs did."""
     model, raw = _voted_model()
     before = (_provenance(model.groups), _provenance(model.vote_groups))
-    for difficulty in DIFFICULTIES:
-        song_model.render(model, raw, difficulty)
+    for _ in range(3):
+        song_model.render(model, raw)
     assert (_provenance(model.groups), _provenance(model.vote_groups)) == before
 
 
-def test_the_reference_tier_is_the_model_itself():
-    """`hard` is the tier the model was built at, so its render has to come back
-    with the model's own bars. It used to hold by luck: the vote was taken over
-    the first pass's groups at build time and over the *second* pass's on every
-    render, so the reference tier was re-deciding what `build` had decided."""
+def test_the_render_is_the_model_itself():
+    """The render has to come back with the model's own bars. It used to hold by
+    luck: the vote was taken over the first pass's groups at build time and over
+    the *second* pass's on every render, so the render was re-deciding what
+    `build` had decided."""
     model, raw = _voted_model()
-    rendered = song_model.render(model, raw, HARD)
+    rendered = song_model.render(model, raw)
     assert _shape(rendered) == _shape(model.sections)
 
 
@@ -330,7 +325,7 @@ def test_a_render_replays_the_vote_with_the_key_the_vote_used(monkeypatch):
     assert len(readings) == 2, "the fixture has to reach the re-read"
     assert model.key.tonic_pc != readings[0], "and the re-read has to differ"
 
-    song_model.render(model, raw, HARD)
+    song_model.render(model, raw)
 
     assert len(votes) == 2, "one vote in build, one in the render"
     assert votes[0] == votes[1], \
@@ -380,27 +375,27 @@ def test_the_cleanup_runs_before_the_bars_are_cut():
     assert qualities == {"minor"}, "the song plays Am, and now so does the chart"
 
 
-def test_a_tier_render_replays_the_cleanup():
-    """`hard` is the tier the model was built at, so its render has to come back
+def test_the_render_replays_the_cleanup():
+    """The render has to come back
     with the model's own bars — the same discipline as the vote replay, and it
     needs the same stored key (`seed_key`) to be a replay rather than a new
     decision."""
     raw = _noisy_chords()
     model = song_model.build(grid=_grid(32), raw=raw, onsets=[])
-    assert _shape(song_model.render(model, raw, HARD)) == _shape(model.sections)
+    assert _shape(song_model.render(model, raw)) == _shape(model.sections)
 
 
-def test_every_tier_gets_the_cleanup_not_only_the_one_that_needed_it():
-    """A tier's spans are not the reference tier's, so "did it change anything at
-    `hard`" is the wrong question to gate the replay on. `easy` has to be cleaned
-    too, or one tier ships noise the others do not."""
+def test_the_render_gets_the_cleanup_even_when_build_found_nothing_to_do():
+    """The replay is gated on whether the stage *ran*, not on whether it changed
+    anything — `consolidated` and `audited` are booleans about the run. Gating on
+    "did it change anything" would let a render skip a stage `build` performed
+    and ship the noise `build` removed."""
     raw = _noisy_chords()
     model = song_model.build(grid=_grid(32), raw=raw, onsets=[])
-    for difficulty in DIFFICULTIES:
-        rendered = song_model.render(model, raw, difficulty)
-        tonic = {c.quality for s in rendered for bar in s.bars for c in bar
-                 if c.root_pc == 9}
-        assert tonic == {"minor"}, difficulty
+    rendered = song_model.render(model, raw)
+    tonic = {c.quality for s in rendered for bar in s.bars for c in bar
+             if c.root_pc == 9}
+    assert tonic == {"minor"}
 
 
 def test_the_cleanup_can_be_turned_off():
@@ -423,7 +418,7 @@ def test_the_cleanup_can_be_turned_off():
 
 # --- how much of `hard` is real ----------------------------------------------
 
-def test_the_model_measures_how_much_of_the_reference_tier_survived_intact():
+def test_the_model_measures_how_much_of_the_chart_survived_intact():
     """`Cmaj9` is not a chord the container can carry, so it ships as `Cmaj7` —
     playable, and not what was heard. One bar in four here, and the number is the
     only thing in the analysis that can say the `hard` tier is a fiction."""
@@ -451,7 +446,7 @@ def test_a_groove_two_groups_share_is_named_for_both():
     assert len({g.label for g in model.groups}) == 2, "two groups"
     ids = {p.pattern.id for p in model.patterns.values()}
     assert len(ids) == 1, "and with no onsets, one shared quarter-note groove"
-    assert {p.pattern.name for p in model.patterns.values()} == {"Part 1 & Part 2 strum"}
+    assert {p.pattern.name for p in model.patterns.values()} == {"Verse & Chorus strum"}
 
 
 def test_a_groove_the_whole_song_plays_is_named_for_no_section():
@@ -607,11 +602,10 @@ def test_a_four_chord_song_heard_with_variants_charts_as_four_chords():
     model = song_model.build(grid=_grid(bars=32), raw=raw, onsets=[])
     assert model is not None
 
-    for difficulty in DIFFICULTIES:
-        sections = song_model.render(model, raw, difficulty)
-        names = {render_name(c.root_pc, c.quality)
-                 for s in sections for b in s.bars for c in b}
-        assert names == {"Em", "G", "D", "C"}, f"{difficulty} tier carried {sorted(names)}"
+    sections = song_model.render(model, raw)
+    names = {render_name(c.root_pc, c.quality)
+             for s in sections for b in s.bars for c in b}
+    assert names == {"Em", "G", "D", "C"}, f"the chart carried {sorted(names)}"
 
     assert [s.repeats for s in model.sections] == [8], "the eight passes collapsed"
     assert model.total_bars == 32

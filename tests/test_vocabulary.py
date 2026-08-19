@@ -333,3 +333,65 @@ def test_the_profile_counts_occasions_as_well_as_beats():
 def test_an_empty_track_profiles_to_nothing():
     assert vocabulary.profile([]) == {}
     assert vocabulary.consolidate([])[0] == []
+
+
+# --- §20.8b, the semitone slip ------------------------------------------------
+#
+# The failure every near-miss gate in the codebase is closed to by construction:
+# `harmony.similarity(A, A#)` is 0, because the two triads share no pitch class,
+# so a semitone slip is "as far apart as two chords can be" to every rule that
+# reasons about harmonic distance. `absorb_islands` cannot see it either — that
+# one requires the island to be on the flanks' own root. See
+# `vocabulary.absorb_semitone_islands`.
+
+def test_a_brief_semitone_slip_between_two_passes_of_one_chord_is_absorbed():
+    """`A | A# | A` is not a progression anyone plays. It is one chord with the
+    recognizer a bin out in the middle of it — the owner's "A and A# in the same
+    chart", and the one shape this rule exists for."""
+    spans = [span(0, 8, A, MAJOR, confidence=0.9),
+             span(8, 2, Bb, MAJOR, confidence=0.4),
+             span(10, 8, A, MAJOR, confidence=0.9)]
+    out, absorbed = vocabulary.absorb_semitone_islands(spans, bar_beats=4)
+    assert absorbed == 1
+    assert names(out) == [(A, MAJOR)], "one chord, and merged back into one span"
+
+
+def test_a_passing_chord_a_fifth_away_survives():
+    """C | G | C is a passing dominant, which is music. Only the semitone is
+    treated as a slip, and that is the whole content of the rule."""
+    spans = [span(0, 8, C, MAJOR, confidence=0.9),
+             span(8, 2, G, MAJOR, confidence=0.4),
+             span(10, 8, C, MAJOR, confidence=0.9)]
+    out, absorbed = vocabulary.absorb_semitone_islands(spans, bar_beats=4)
+    assert absorbed == 0
+    assert names(out) == [(C, MAJOR), (G, MAJOR), (C, MAJOR)]
+
+
+def test_an_augmented_flank_is_left_alone():
+    """"Michelle" again, arriving by the other road. An augmented triad is one
+    set of notes under three names, so "a semitone away from it" is not a
+    well-formed statement and the rule must not act on one."""
+    spans = [span(0, 8, C, AUGMENTED, confidence=0.9),
+             span(8, 2, 1, MAJOR, confidence=0.3),
+             span(10, 8, C, AUGMENTED, confidence=0.9)]
+    _, absorbed = vocabulary.absorb_semitone_islands(spans, bar_beats=4)
+    assert absorbed == 0
+
+
+def test_a_believed_semitone_span_survives():
+    """The gate that makes this a no-op on perfect input: ground truth arrives at
+    a flat confidence and no island is ever believed less than its flanks."""
+    spans = [span(0, 8, A, MAJOR, confidence=1.0),
+             span(8, 2, Bb, MAJOR, confidence=1.0),
+             span(10, 8, A, MAJOR, confidence=1.0)]
+    _, absorbed = vocabulary.absorb_semitone_islands(spans, bar_beats=4)
+    assert absorbed == 0
+
+
+def test_a_semitone_span_long_enough_to_be_a_chord_survives():
+    """A bar of it is a chromatic chord, however doubtfully it was heard."""
+    spans = [span(0, 8, A, MAJOR, confidence=0.9),
+             span(8, 8, Bb, MAJOR, confidence=0.3),
+             span(16, 8, A, MAJOR, confidence=0.9)]
+    _, absorbed = vocabulary.absorb_semitone_islands(spans, bar_beats=4)
+    assert absorbed == 0

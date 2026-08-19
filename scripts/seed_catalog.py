@@ -295,14 +295,17 @@ def _root(name: str) -> str:
 
 
 def _triad(name: str) -> str:
-    """Root plus major/minor only — the grading resolution.
+    """Root plus major/minor only — the grading resolution **of this report**.
 
-    Quality beyond the third is thrown away on purpose. §12.2 already decided
-    that `Cmaj9` and `Cmaj7` are the same chord to this app because the player
-    voices them identically, so grading them apart would score a difference the
-    product does not have. Major/minor is kept because that difference is
-    audible in every arrangement, and confusing a chord with its relative minor
-    is the specific mistake worth catching.
+    Not a claim about what the chart should emit: the chart states the quality it
+    heard, extensions included, and `exactRatio` is what says when the grammar
+    could not. This is a *comparison* resolution, and it is deliberately coarse
+    because the reference vocabularies these seeds are graded against are written
+    by hand from published chord sheets, which disagree with each other about
+    whether a bar is `C` or `Cmaj7` far more often than they disagree about the
+    root. Major/minor is kept because that difference is audible in every
+    arrangement, and confusing a chord with its relative minor is the specific
+    mistake worth catching.
     """
     head = name.split("/")[0]
     match = re.match(r"^([A-G][#b]?)(.*)$", head)
@@ -417,8 +420,8 @@ def _chart(song: dict) -> dict:
     }
 
 
-# The same two numbers `app.lint` withholds a sidecar on, restated here rather
-# than imported: everything in this half of the script runs on the laptop, where
+# The same two numbers `app.lint` measures a song's own bar against, restated here
+# rather than imported: everything in this half runs on the laptop, where
 # `app` and its dependencies are deliberately not imported (see the note above
 # `seed_one`, whose imports are all function-local for that reason).
 ANCHOR_GAP_TOLERANCE = 0.25
@@ -503,7 +506,6 @@ def seed_one(name: str) -> dict:
     import traceback
     import uuid
 
-    from app.chords import DIFFICULTIES, NORMAL
     from app.config import load_settings
     from app.analysis import engines
     from app.analysis.fetch import build_source
@@ -523,14 +525,8 @@ def seed_one(name: str) -> dict:
         report["ERROR"] = "no fetch source in this image (yt-dlp or ffmpeg missing)"
         return report
 
-    # `normal`, not "intermediate" — the tiers are `easy`/`normal`/`hard`
-    # (`app.chords.DIFFICULTIES`). Naming a tier that does not exist stores the
-    # analysis fine and then reads back nothing, which is how this script first
-    # reported "job reported ready but no row landed in chord_maps" against a
-    # run that had in fact filed all three rows.
     job_id = f"seed-{uuid.uuid4().hex[:12]}"
-    store.create_job(job_id=job_id, uid=SEED_UID, video_id=video_id,
-                     difficulty=NORMAL)
+    store.create_job(job_id=job_id, uid=SEED_UID, video_id=video_id)
 
     started = time.monotonic()
     try:
@@ -538,7 +534,7 @@ def seed_one(name: str) -> dict:
         # container will make, and the fan-out in `main` is what places the next
         # one on a fresh IP. Passing True here would leave the job row alive and
         # hand the retry to a worker spawn we are not waiting on.
-        outcome = run_job(job_id=job_id, video_id=video_id, difficulty=NORMAL,
+        outcome = run_job(job_id=job_id, video_id=video_id,
                           uid=SEED_UID, settings=settings, store=store, source=source,
                           may_retry_elsewhere=False)
     except Exception as exc:  # noqa: BLE001 — reporting, not handling
@@ -557,7 +553,7 @@ def seed_one(name: str) -> dict:
     # Read the graded chart back out of `chord_maps` rather than off `outcome`.
     # The point of the exercise is that the catalog now holds something correct,
     # and the only way to claim that is to look at what the catalog holds.
-    stored = store.get_map(video_id, NORMAL)
+    stored = store.get_map(video_id)
     if stored is None:
         report["ERROR"] = "job reported ready but no row landed in chord_maps"
         return report
@@ -569,8 +565,6 @@ def seed_one(name: str) -> dict:
     report["engines"] = {"chords": stored.engine_chords, "beats": stored.engine_beats}
     report["lowConfidence"] = stored.low_confidence
     report["hasSync"] = stored.sync is not None
-    report["difficultiesStored"] = [d for d in DIFFICULTIES
-                                    if store.get_map(video_id, d) is not None]
 
     song = stored.song
     report["chart"] = _chart(song)
@@ -690,8 +684,7 @@ def _report(reports: list[dict]) -> int:
     for report in seeded:
         grade, chart = report["grade"], report["chart"]
         print(f"\n{report['song']}  ({report['videoId']})  — {grade['verdict']}")
-        print(f"  stored     : {', '.join(report['difficultiesStored'])} "
-              f"| sync {'yes' if report['hasSync'] else 'NO'}"
+        print(f"  stored     : sync {'yes' if report['hasSync'] else 'NO'}"
               f"{' | lowConfidence' if report['lowConfidence'] else ''}")
         print(f"  key        : {grade['key']['got']} (want {grade['key']['want']}) "
               f"{'ok' if grade['key']['match'] else 'MISMATCH'}")

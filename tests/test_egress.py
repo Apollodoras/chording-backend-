@@ -78,11 +78,11 @@ def test_a_retryable_egress_block_leaves_the_job_alive(settings, store):
     """No terminal status, no error, no refund — the next container inherits the
     row. A client polling through the retry must never see the job fail and then
     un-fail."""
-    store.create_job(job_id="j1", uid="u1", video_id=VIDEO, difficulty="normal")
+    store.create_job(job_id="j1", uid="u1", video_id=VIDEO)
     store.try_record_use("u1", 5)
     used_before = store.usage_today("u1")
 
-    outcome = run_job(job_id="j1", video_id=VIDEO, difficulty="normal", uid="u1",
+    outcome = run_job(job_id="j1", video_id=VIDEO, uid="u1",
                       settings=settings, store=store,
                       source=FakeSource(error=EgressBlocked()),
                       may_retry_elsewhere=True)
@@ -98,10 +98,10 @@ def test_the_last_attempt_still_reports_the_failure(settings, store):
     """The half that makes the retry safe: whoever runs the final attempt passes
     `may_retry_elsewhere=False`, and the job lands somewhere terminal instead of
     sitting in `queued` forever."""
-    store.create_job(job_id="j2", uid="u1", video_id=VIDEO, difficulty="normal")
+    store.create_job(job_id="j2", uid="u1", video_id=VIDEO)
     store.try_record_use("u1", 5)
 
-    outcome = run_job(job_id="j2", video_id=VIDEO, difficulty="normal", uid="u1",
+    outcome = run_job(job_id="j2", video_id=VIDEO, uid="u1",
                       settings=settings, store=store,
                       source=FakeSource(error=EgressBlocked()),
                       may_retry_elsewhere=False)
@@ -114,9 +114,9 @@ def test_the_last_attempt_still_reports_the_failure(settings, store):
 
 
 def test_a_plain_unavailable_video_is_terminal_even_when_retries_are_allowed(settings, store):
-    store.create_job(job_id="j3", uid="u1", video_id=VIDEO, difficulty="normal")
+    store.create_job(job_id="j3", uid="u1", video_id=VIDEO)
 
-    outcome = run_job(job_id="j3", video_id=VIDEO, difficulty="normal", uid="u1",
+    outcome = run_job(job_id="j3", video_id=VIDEO, uid="u1",
                       settings=settings, store=store,
                       source=FakeSource(error=VideoUnavailable()),
                       may_retry_elsewhere=True)
@@ -232,11 +232,11 @@ def test_a_refused_media_url_is_retryable_rather_than_terminal():
 
 
 def test_a_retryable_media_refusal_leaves_the_job_alive(settings, store):
-    store.create_job(job_id="j4", uid="u1", video_id=VIDEO, difficulty="normal")
+    store.create_job(job_id="j4", uid="u1", video_id=VIDEO)
     store.try_record_use("u1", 5)
     used_before = store.usage_today("u1")
 
-    outcome = run_job(job_id="j4", video_id=VIDEO, difficulty="normal", uid="u1",
+    outcome = run_job(job_id="j4", video_id=VIDEO, uid="u1",
                       settings=settings, store=store,
                       source=FakeSource(error=MediaUrlRefused()),
                       may_retry_elsewhere=True)

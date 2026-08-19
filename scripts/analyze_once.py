@@ -31,7 +31,6 @@ def run(video_id: str) -> str:
     from app.analysis import engines
     from app.analysis.fetch import build_source
     from app.analysis.pipeline import analyze
-    from app.chords import NORMAL
     from app.config import load_settings
     from app.store import build_store
 
@@ -55,7 +54,7 @@ def run(video_id: str) -> str:
         structure_probe=engines.build_structure_probe(settings),
     )
 
-    song = outcome.songs.get(NORMAL) if isinstance(outcome.songs, dict) else None
+    song = outcome.song
     sync = outcome.sync
     return json.dumps({
         "videoId": video_id,

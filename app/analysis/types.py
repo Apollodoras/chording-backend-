@@ -141,7 +141,7 @@ class GridSpan:
     confidence: float = 1.0
     # False when normalization threw information away (an extension flattened, a
     # slash bass dropped). Counted, not acted on: a track where most chords
-    # needed reducing is a track whose `hard` tier is a fiction. Counted by
+    # needed reducing is a track whose chart is a fiction. Counted by
     # `postprocess.exact_ratio` and reported as the sidecar's `exactRatio` —
     # which is the whole of "acted on", and deliberately so: the reduction is
     # what makes the song playable on the app's grammar, so the answer to a low

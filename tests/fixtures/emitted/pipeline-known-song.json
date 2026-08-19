@@ -9,9 +9,9 @@
           "Em",
           "C"
         ],
-        "id": "1A219520-7115-591B-91F9-17135F5C3A7C",
-        "kindRaw": "custom",
-        "name": "Part 1",
+        "id": "654FA93A-A5F5-5481-B68B-91DE38AFD54A",
+        "kindRaw": "chorus",
+        "name": "",
         "patternID": "yt:pat-a6a9045bab07",
         "repeats": 4
       }
@@ -24,13 +24,13 @@
     "Em",
     "C"
   ],
-  "id": "yt:dQw4w9WgXcQ:easy",
+  "id": "yt:dQw4w9WgXcQ",
   "mode": "major",
   "patternID": "yt:pat-a6a9045bab07",
   "patterns": [
     {
       "id": "yt:pat-a6a9045bab07",
-      "name": "Part 1 strum",
+      "name": "Chorus strum",
       "strokes": [
         {
           "accent": true,

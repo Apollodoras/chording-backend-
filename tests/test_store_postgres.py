@@ -105,12 +105,12 @@ def test_a_map_round_trips_including_the_low_confidence_flag(clean):
     """The flag is an INTEGER column written as 1/0 and read back through
     `bool()` — the kind of thing that works in SQLite and surprises you in
     Postgres if the column type ever drifts."""
-    clean.put_map(video_id="v1", difficulty="normal", song=SONG, sync=None,
+    clean.put_map(video_id="v1", song=SONG, sync=None,
                   engine_chords="btc@1", engine_beats="beat_this@1",
                   analyzed_at="2026-08-03T00:00:00Z", channel_id="c1",
                   title="Test", duration_ms=1000, low_confidence=True)
 
-    cached = clean.get_map("v1", "normal")
+    cached = clean.get_map("v1")
     assert cached.song == SONG
     assert cached.low_confidence is True
     assert cached.channel_id == "c1"
@@ -119,7 +119,7 @@ def test_a_map_round_trips_including_the_low_confidence_flag(clean):
 
 def test_re_analysis_upserts_rather_than_duplicating(clean):
     for engine in ("btc@1", "btc@2"):
-        clean.put_map(video_id="v1", difficulty="normal", song=SONG, sync=None,
+        clean.put_map(video_id="v1", song=SONG, sync=None,
                       engine_chords=engine, engine_beats="beat_this@1",
                       analyzed_at="2026-08-03T00:00:00Z", channel_id="c1",
                       title="Test", duration_ms=1000, low_confidence=False)
@@ -132,17 +132,17 @@ def test_re_analysis_upserts_rather_than_duplicating(clean):
 def test_an_admin_offset_survives_re_analysis(clean):
     """`put_map`'s ON CONFLICT deliberately preserves `offset_ms` — a hand
     correction (§6) must not be silently undone by a re-run."""
-    clean.put_map(video_id="v1", difficulty="normal", song=SONG, sync=None,
+    clean.put_map(video_id="v1", song=SONG, sync=None,
                   engine_chords="btc@1", engine_beats="b@1",
                   analyzed_at="2026-08-03T00:00:00Z", channel_id="c1",
                   title="T", duration_ms=1000, low_confidence=False)
     clean.set_offset("v1", 250)
-    clean.put_map(video_id="v1", difficulty="normal", song=SONG, sync=None,
+    clean.put_map(video_id="v1", song=SONG, sync=None,
                   engine_chords="btc@2", engine_beats="b@1",
                   analyzed_at="2026-08-04T00:00:00Z", channel_id="c1",
                   title="T", duration_ms=1000, low_confidence=False)
 
-    assert clean.get_map("v1", "normal").offset_ms == 250
+    assert clean.get_map("v1").offset_ms == 250
 
 
 def test_the_blocklist_covers_video_and_channel(clean):
@@ -160,22 +160,22 @@ def test_the_blocklist_covers_video_and_channel(clean):
 def test_purge_reports_what_it_actually_removed(clean):
     """§3 asks the operator to verify the cascade cascaded, which is only
     possible if the counts are real — `rowcount` after DELETE, per backend."""
-    clean.put_map(video_id="v1", difficulty="normal", song=SONG, sync=None,
+    clean.put_map(video_id="v1", song=SONG, sync=None,
                   engine_chords="e", engine_beats="b",
                   analyzed_at="2026-08-03T00:00:00Z", channel_id="c1",
                   title="T", duration_ms=1000, low_confidence=False)
-    clean.create_job(job_id="j1", uid="u1", video_id="v1", difficulty="normal")
+    clean.create_job(job_id="j1", uid="u1", video_id="v1")
 
     counts = clean.purge("v1", actor="ops", reason="dmca")
 
     assert counts["maps"] == 1
     assert counts["jobs"] == 1
-    assert clean.get_map("v1", "normal") is None
+    assert clean.get_map("v1") is None
 
 
 def test_a_channel_purge_reaches_every_video(clean):
     for video in ("v1", "v2"):
-        clean.put_map(video_id=video, difficulty="normal", song=SONG, sync=None,
+        clean.put_map(video_id=video, song=SONG, sync=None,
                       engine_chords="e", engine_beats="b",
                       analyzed_at="2026-08-03T00:00:00Z", channel_id="c1",
                       title="T", duration_ms=1000, low_confidence=False)
@@ -188,7 +188,7 @@ def test_a_channel_purge_reaches_every_video(clean):
 
 def test_the_audit_log_outlives_what_it_records(clean):
     """§3: `purge` deliberately does not touch the audit log."""
-    clean.put_map(video_id="v1", difficulty="normal", song=SONG, sync=None,
+    clean.put_map(video_id="v1", song=SONG, sync=None,
                   engine_chords="e", engine_beats="b",
                   analyzed_at="2026-08-03T00:00:00Z", channel_id="c1",
                   title="T", duration_ms=1000, low_confidence=False)
@@ -212,7 +212,7 @@ def test_the_rate_limiter_admits_then_refuses(clean):
 
 
 def test_jobs_move_through_their_lifecycle_and_expire(clean):
-    clean.create_job(job_id="j1", uid="u1", video_id="v1", difficulty="normal")
+    clean.create_job(job_id="j1", uid="u1", video_id="v1")
     clean.update_job("j1", status=STATUS_READY, progress=1.0)
 
     job = clean.get_job("j1")
@@ -227,12 +227,12 @@ def test_jobs_move_through_their_lifecycle_and_expire(clean):
 
 
 def test_two_callers_asking_for_one_video_share_a_job(clean):
-    clean.create_job(job_id="j1", uid="u1", video_id="v1", difficulty="normal")
-    existing = clean.active_job_for("v1", "normal")
+    clean.create_job(job_id="j1", uid="u1", video_id="v1")
+    existing = clean.active_job_for("v1")
     assert existing is not None and existing.job_id == "j1"
 
     clean.update_job("j1", status=STATUS_READY)
-    assert clean.active_job_for("v1", "normal") is None
+    assert clean.active_job_for("v1") is None
 
 
 def test_the_limiter_serializes_concurrent_checks_of_one_key(store):
@@ -285,13 +285,14 @@ def test_the_postgres_store_gets_the_added_columns(store):
             "chord_names", "denormalized"} <= present
 
 
-def test_the_catalog_window_function_works_in_postgres(store):
-    """`ROW_NUMBER() OVER (PARTITION BY …)` collapses a video's difficulties to one
-    row, and `LIMIT`/`OFFSET` page it. Both are the rewrite that moved this off a
-    full-table scan, and neither had ever run in this dialect."""
+def test_the_catalog_paging_works_in_postgres(store):
+    """`LIMIT`/`OFFSET` paging is the rewrite that moved this off a full-table
+    scan, and it had never run in this dialect. Re-analysis upserts rather than
+    adding a row — which used to take a `ROW_NUMBER() OVER (PARTITION BY …)`
+    collapse, because a video held one row per difficulty."""
     video = f"vid{uuid.uuid4().hex[:8]}"
-    for tier in ("easy", "normal", "hard"):
-        store.put_map(video_id=video, difficulty=tier,
+    for _ in range(3):
+        store.put_map(video_id=video,
                       song={"version": 2, "id": f"yt:{video}", "tempo": 120,
                             "tonic": "G", "mode": "major", "chordNames": ["G", "D"]},
                       sync=None, engine_chords="f@1", engine_beats="f@1",
@@ -307,19 +308,18 @@ def test_an_upload_is_private_in_postgres_too(store):
     """The privacy filter is `owner_uid IS NULL` in SQL, so it is the one thing that
     absolutely must behave identically in both backends."""
     private = f"up_{uuid.uuid4().hex[:16]}"
-    store.put_map(video_id=private, difficulty="normal",
+    store.put_map(video_id=private,
                   song={"version": 2, "id": f"yt:{private}"}, sync=None,
                   engine_chords="f@1", engine_beats="f@1",
                   analyzed_at="2027-01-01T00:00:00Z", owner_uid="alice")
 
     assert all(row.video_id != private for row in store.list_catalog(limit=200))
-    assert store.get_map(private, "normal").owner_uid == "alice"
+    assert store.get_map(private).owner_uid == "alice"
 
 
 def test_a_follower_round_trips_in_postgres(store):
     job_id = uuid.uuid4().hex
-    job = store.create_job(job_id=job_id, uid="alice", video_id="dQw4w9WgXcQ",
-                           difficulty="normal")
+    job = store.create_job(job_id=job_id, uid="alice", video_id="dQw4w9WgXcQ")
 
     assert not store.may_read_job(job, "bob")
     store.follow_job(job_id, "bob")

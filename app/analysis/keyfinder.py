@@ -33,10 +33,19 @@ pitch-class set, so `harmony.diatonic_fit` returns the same number whichever of
 them is chosen. The tie-break reads the collection; only the spelling reads the
 tonic.
 
-Modulation is deliberately not modelled. The container carries one key for the
-whole song, so a detected key change could be neither expressed nor acted on —
-it would be surface with no effect. The duration-weighted global answer is the
-honest one for a single-key container.
+Modulation is deliberately not **acted on**. The container carries one key for
+the whole song, so a detected key change could not be expressed on the wire; the
+duration-weighted global answer is the honest one for a single-key container.
+
+What changed in the 2026-08-18 audit is that it is now *detected and reported*
+(`track`). A truck-driver modulation — the last chorus up a semitone or a tone —
+is one of the commonest structures in this repertoire, and when it happens the
+global key is wrong for the end of the song: the chart mixes two transpositions,
+which the player sees as impossible alterations, and every diatonic tie-break in
+`consensus`, `canon`, `vocabulary` and `keyaudit` is being taken against the
+wrong key for that stretch. None of that is visible in a single `tonic`/`mode`
+pair. `TheoryReport.modulations` is where it becomes visible, and it costs one
+extra pass over the spans.
 """
 
 from __future__ import annotations
@@ -57,6 +66,7 @@ from ..chords import (
     MINOR7,
     SUS2,
     SUS4,
+    prefers_flats_for,
     spell,
 )
 from . import harmony
@@ -66,6 +76,18 @@ from .types import GridSpan
 # evidence for the key — borrowed chords are normal, wrong roots are not.
 _QUALITY_MATCH = 1.0
 _ROOT_ONLY = 0.45
+# ...but "unexpected" covers two very different disagreements, and scoring them
+# alike is what lets a key survive being contradicted about its own thirds. A
+# `G7` where the mode wants `G` is a seventh the recognizer heard, and the triad
+# under it still says the key is right; a `Gm` where the mode wants `G` says the
+# opposite, and a song full of those is not in this key at all. The first keeps
+# `_ROOT_ONLY`; the second gets this, which is the term the 2026-08-18 audit
+# (F10) asked for.
+#
+# Swept over the eleven-song chart corpus at 0.45 (the old flat value) / 0.30 /
+# 0.20 / 0.10 / 0.00, counting correct tonics: see `ANALYSIS-AUDIT.md`. The value
+# below is the middle of the band that scores highest.
+_WRONG_THIRD = 0.20
 # The tonic chord opening or closing a song is the single most reliable cue there
 # is, and it is what separates a key from its relative major/minor — those two
 # share every diatonic chord, so without this they score identically.
@@ -167,6 +189,16 @@ class DetectedKey:
         reporting, because "G major" is what the player will be told about a
         song that is really G mixolydian."""
         return self.scale not in ("ionian", "aeolian")
+
+
+def degrees(mode: str) -> dict[int, frozenset[str]]:
+    """The mode's degree → qualities table, for callers outside this module.
+
+    Public because `keyaudit.py` has to ask the same question this module asks —
+    "does this chord belong to the key" — and building a second table to answer
+    it is how two tables drift apart (F13's lesson, one module over). One rule,
+    one table, both readers."""
+    return _degrees(mode)
 
 
 @lru_cache(maxsize=None)
@@ -289,7 +321,9 @@ def _score(spans: list[GridSpan], tonic_pc: int, degrees: dict[int, frozenset[st
         if span.quality in qualities:
             total += span.length_beats * _QUALITY_MATCH
         elif span.quality not in _UNRESOLVED:
-            total += span.length_beats * _ROOT_ONLY
+            mine = harmony.triad(span.quality)
+            agrees = any(harmony.triad(quality) == mine for quality in qualities)
+            total += span.length_beats * (_ROOT_ONLY if agrees else _WRONG_THIRD)
 
     # The endpoint bonus is a claim about *position* — the song comes to rest on
     # its tonic — so it is weighted like one typical chord rather than by however
@@ -307,10 +341,109 @@ def _score(spans: list[GridSpan], tonic_pc: int, degrees: dict[int, frozenset[st
 def _prefers_flat_spelling(tonic_pc: int, mode: str) -> bool:
     """Which spelling of the *tonic itself* to emit.
 
-    ``chords.prefers_flats`` answers the same question for a tonic already
-    spelled; this one has only a pitch class, so it names the five flat keys (and
-    the six flat minors) by number. F/Bb/Eb/Ab/Db major and d/g/c/f/bb/eb minor.
+    Delegated to `chords.prefers_flats_for`, which is the same key-signature
+    table `chords.prefers_flats` reads for a tonic that is already spelled. It
+    used to be a second copy of the twelve numbers here, and two tables that have
+    to agree and are not the same table only ever agree until one of them is
+    edited.
     """
-    if mode == "minor":
-        return tonic_pc in {2, 7, 0, 5, 10, 3}
-    return tonic_pc in {5, 10, 3, 8, 1}
+    return prefers_flats_for(tonic_pc, mode)
+
+
+# --- modulation -------------------------------------------------------------
+
+# How much song each windowed reading is taken over. Thirty-two bars at four
+# beats: long enough that a window contains a section rather than a phrase (a
+# key detected over eight bars is a statement about one progression), short
+# enough that a final-chorus modulation occupies more than one of them.
+WINDOW_BEATS = 128.0
+
+# How many consecutive windows must agree on the new key before a change is
+# reported. Two, which is the smallest number that is evidence: one window
+# disagreeing with its neighbours is a bridge that tonicizes something, or a
+# window that happened to land across a section boundary, and neither is a
+# modulation.
+MODULATION_WINDOWS = 2
+
+
+def collection(key: DetectedKey) -> frozenset[int]:
+    """The key's seven notes. What a modulation actually moves.
+
+    The plain scale, without aeolian's borrowed leading tone — that note is a
+    fact about how minor keys are harmonized, not about which collection the
+    music is in, and including it would make a minor key differ from its relative
+    major by one pitch class and read as a modulation.
+    """
+    degrees = harmony.SCALES.get(key.scale, harmony.IONIAN)
+    return frozenset((key.tonic_pc + degree) % 12 for degree in degrees)
+
+
+def track(spans: list[GridSpan], *, window_beats: float = WINDOW_BEATS
+          ) -> tuple[tuple[float, DetectedKey], ...]:
+    """Where the song changes key, as (beat, key) — the first entry is where it
+    starts.
+
+    Detection only: nothing downstream acts on this, by design (see the module
+    docstring). A single entry means one key for the whole song, which is the
+    ordinary case and the one the container is built for.
+
+    The window reading is the same `detect_key` the song gets, over the spans
+    that start inside the window — so a change is reported only when a stretch of
+    the song, read on its own terms, comes out somewhere else. Runs shorter than
+    `MODULATION_WINDOWS` are folded back into their neighbour rather than
+    reported, because a bridge that tonicizes the relative minor for eight bars is
+    not a modulation and a chart that said so would be crying wolf on half the
+    repertoire.
+    """
+    if not spans:
+        return ()
+    end = max(span.end_beat for span in spans)
+    if end <= window_beats:
+        return ((0.0, detect_key(spans)),)
+
+    readings: list[tuple[float, DetectedKey]] = []
+    start = 0.0
+    while start < end:
+        window = [s for s in spans if start <= s.start_beat < start + window_beats]
+        if window:
+            readings.append((start, detect_key(window)))
+        start += window_beats
+    if not readings:
+        return ((0.0, detect_key(spans)),)
+
+    # Runs of windows that agree on the **collection**, not on the tonic. A
+    # modulation moves the notes; B major and G# minor are the same seven notes
+    # and disagreeing about which is home is what this module's whole first half
+    # is about, not a key change. Reading it any other way makes I'm Yours report
+    # "bar 64: B major -> G# minor", which is the relative-key wobble the tonic
+    # terms already fight over and nothing a listener would call a modulation.
+    runs: list[list[tuple[float, DetectedKey]]] = [[readings[0]]]
+    for at, key in readings[1:]:
+        if collection(key) == collection(runs[-1][-1][1]):
+            runs[-1].append((at, key))
+        else:
+            runs.append([(at, key)])
+
+    out: list[tuple[float, DetectedKey]] = []
+    for run in runs:
+        if out and len(run) < MODULATION_WINDOWS:
+            continue                      # too short to be a key change
+        if out and collection(run[0][1]) == collection(out[-1][1]):
+            continue                      # back where it was — one run, interrupted
+        out.append(run[0])
+    if not out:
+        out.append(readings[0])
+    out[0] = (0.0, out[0][1])
+    return tuple(out)
+
+
+def describe_modulations(changes: tuple[tuple[float, DetectedKey], ...],
+                         bar_beats: float = 4.0) -> tuple[str, ...]:
+    """The changes as lines a person can read: `"bar 96: E major -> F major"`."""
+    if len(changes) < 2:
+        return ()
+    out = []
+    for (_, previous), (at, key) in zip(changes, changes[1:]):
+        bar = int(at // bar_beats) if bar_beats else 0
+        out.append(f"bar {bar}: {previous.tonic} {previous.mode} -> {key.tonic} {key.mode}")
+    return tuple(out)

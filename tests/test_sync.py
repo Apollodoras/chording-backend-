@@ -15,14 +15,14 @@ from __future__ import annotations
 
 import pytest
 
-from app.analysis.compile import compile_song
+from app.analysis.compile import compile_song, fit_sync
 from app.analysis.keyfinder import DetectedKey
 from app.analysis.postprocess import process
 from app.analysis.strumming import fallback
 from app.analysis.form import segment
 from app.analysis.structure import bars_from_spans
-from app.chords import NORMAL
-from app.lint import lint, lint_sync, repair, section_beats, total_beats
+from app.lint import (lint, lint_sync, lint_sync_problems, repair, section_beats,
+                      total_beats)
 from app.payload import CompositionPayload, bar_beats
 from app.sync import BeatAnchor, Confidence, EngineVersions, VideoSync, anchors_for, song_beat_at
 from tests.conftest import (
@@ -51,14 +51,14 @@ def make_sync(**overrides) -> VideoSync:
 
 
 def known_song() -> CompositionPayload:
-    spans = process(known_chords(), known_axis(), difficulty=NORMAL)
+    spans = process(known_chords(), known_axis())
     sections = segment(bars_from_spans(spans, BAR_BEATS))
     patterns = {s.group: fallback(bar_beats=4, tempo=120, name="Verse strum")
                 for s in sections}
     payload = compile_song(
         video_id="dQw4w9WgXcQ", title="Known Song", sections=sections,
         patterns=patterns, key=DetectedKey("G", "major", 0.9),
-        tempo=120, time_signature="4/4", difficulty=NORMAL,
+        tempo=120, time_signature="4/4",
     )
     repair(payload)
     assert lint(payload) == []
@@ -141,25 +141,42 @@ def test_section_lengths_are_whole_bars():
         assert section_beats(section, beats) % beats == 0
 
 
-# --- lint_sync refuses the things that would drift --------------------------
+# --- lint_sync reports the things that would drift, and grades them ---------
+#
+# Every check below still *reports*. What changed with the §13.3 amendment is
+# what a report costs: `fatal` means these anchors are not a map at all and the
+# a song ships without video sync; `advisory` means the map works and is imperfect,
+# so it ships carrying `lowConfidence: true`.
+#
+# The grading is the whole point of the split, so each test pins its own — those
+# are the assertions that decide whether a real song keeps its "play with the
+# video" button.
 
-def test_a_tempo_override_is_refused_on_a_synced_song():
+
+def fatal(payload, sync) -> tuple[str, ...]:
+    return lint_sync_problems(payload, sync).fatal
+
+
+def advisory(payload, sync) -> tuple[str, ...]:
+    return lint_sync_problems(payload, sync).advisory
+
+def test_a_tempo_override_is_fatal_on_a_synced_song():
     """The client derives its bar grid from a SINGLE song-level tempo
     (`JamSongSheet.from`), so an override detaches the axis the anchors address.
     Tempo drift belongs in the anchors, which is what they are for."""
     payload = known_song()
     payload.arrangement.sections[0].tempoOverride = 90
-    problems = lint_sync(payload, make_sync())
-    assert any("tempoOverride" in p for p in problems)
+    sync = make_sync()
+    assert any("tempoOverride" in p for p in fatal(payload, sync))
 
 
-def test_a_time_signature_override_is_refused_for_the_same_reason():
+def test_a_time_signature_override_is_fatal_for_the_same_reason():
     payload = known_song()
     payload.arrangement.sections[0].timeSignatureOverride = "3/4"
-    assert any("timeSignatureOverride" in p for p in lint_sync(payload, make_sync()))
+    assert any("timeSignatureOverride" in p for p in fatal(payload, make_sync()))
 
 
-def test_a_section_that_is_not_whole_bars_is_refused():
+def test_a_section_that_is_not_whole_bars_is_advisory():
     """Sections concatenate, so a section that isn't a whole number of bars
     slides every later bar off the recording's downbeats — silently, and further
     with each section."""
@@ -168,7 +185,10 @@ def test_a_section_that_is_not_whole_bars_is_refused():
     section.chordNames = ["G", "D", "Em"]
     section.beatsPerChord = 3
     section.repeats = 1                      # 3 × 3 × 1 = 9 beats, not a whole 4/4 bar
-    assert any("whole number" in p for p in lint_sync(payload, make_sync()))
+    # Advisory: a chart whose sections are not whole bars is exactly as wrong
+    # played to a metronome, so withholding the recording buys the player
+    # nothing and costs them the song they came for.
+    assert any("whole number" in p for p in advisory(payload, make_sync()))
 
 
 def test_anchors_must_increase():
@@ -178,34 +198,37 @@ def test_anchors_must_increase():
         BeatAnchor(songBeat=4, tMs=2000),
         BeatAnchor(songBeat=8, tMs=1500),
     ])
-    assert any("strictly increase in tMs" in p for p in lint_sync(payload, sync))
+    # Fatal: `song_beat_at` interpolates across the span between two anchors,
+    # and a non-positive span is not something to be imprecise about.
+    assert any("strictly increase in tMs" in p for p in fatal(payload, sync))
 
 
-def test_an_anchor_off_a_bar_boundary_is_refused():
+def test_an_anchor_off_a_bar_boundary_is_advisory():
     payload = known_song()
     sync = make_sync(beatAnchors=[
         BeatAnchor(songBeat=0, tMs=0),
         BeatAnchor(songBeat=3, tMs=2000),
     ])
-    assert any("bar boundary" in p for p in lint_sync(payload, sync))
+    assert any("bar boundary" in p for p in advisory(payload, sync))
 
 
-def test_a_meter_disagreement_between_song_and_sidecar_is_refused():
+def test_a_meter_disagreement_between_song_and_sidecar_is_fatal():
     payload = known_song()
-    assert any("timeSignature" in p for p in lint_sync(payload, make_sync(timeSignature="3/4")))
+    assert any("timeSignature" in p for p in fatal(payload, make_sync(timeSignature="3/4")))
 
 
-def test_anchors_past_the_end_of_the_video_are_refused():
+def test_anchors_past_the_end_of_the_video_are_advisory():
     payload = known_song()
-    assert any("past the end" in p for p in lint_sync(payload, make_sync(durationMs=1000)))
+    assert any("past the end" in p for p in advisory(payload, make_sync(durationMs=1000)))
 
 
-def test_empty_anchors_are_refused():
+def test_empty_anchors_are_fatal():
     payload = known_song()
-    assert any("beatAnchors is empty" in p for p in lint_sync(payload, make_sync(beatAnchors=[])))
+    # Fatal, and the clearest case of it: there is no map to hand over.
+    assert any("beatAnchors is empty" in p for p in fatal(payload, make_sync(beatAnchors=[])))
 
 
-def test_anchors_that_run_past_the_end_of_the_song_are_refused():
+def test_anchors_that_run_past_the_end_of_the_song_are_advisory():
     """The other half of the coverage rule, and the one that was missing.
 
     Short coverage means the tail runs on an assumed tempo; *long* coverage means
@@ -217,8 +240,10 @@ def test_anchors_that_run_past_the_end_of_the_song_are_refused():
     """
     payload = known_song()
     payload.arrangement.sections[0].repeats = 3      # 48 beats of song, 64 of anchors
-    problems = lint_sync(payload, make_sync())
-    assert any("do not exist" in p for p in problems)
+    # Advisory *and repaired*: `fit_sync` trims the overrun before the
+    # sidecar is linted, so the pipeline never reaches this. It stays reportable
+    # because a sidecar built anywhere else can still carry it.
+    assert any("do not exist" in p for p in advisory(payload, make_sync()))
 
 
 def test_an_anchor_on_the_songs_final_barline_is_not_past_the_end():
@@ -238,18 +263,18 @@ def test_an_anchor_on_the_songs_final_barline_is_not_past_the_end():
 # increase, they sit on bar boundaries, they cover the song — and bar 9 is half
 # the length of bar 8, which the client reads as the song doubling in tempo.
 
-def test_a_half_length_bar_in_the_middle_of_the_song_is_refused():
+def test_a_half_length_bar_in_the_middle_of_the_song_is_advisory():
     payload = known_song()
     times = known_downbeats()
     times[9] -= 1000                          # bar 8 half as long, bar 9 half again
     sync = make_sync(beatAnchors=anchors_for(times, bar_beats=4))
-    assert any("bars the recording does not" in p for p in lint_sync(payload, sync))
+    assert any("bars the recording does not" in p for p in advisory(payload, sync))
 
 
-def test_one_odd_bar_in_a_long_song_is_not_enough_to_withhold_the_sidecar():
+def test_one_odd_bar_in_a_long_song_is_not_even_worth_a_note():
     """Real songs have the occasional inserted bar and real recordings have
-    rubato. Withholding on a single bar would take video sync away from songs
-    that are fine, which trades a wrong sync for no sync."""
+    rubato. Flagging on a single bar would call almost every real recording
+    imperfect, which makes the flag mean nothing."""
     payload = known_song()
     times = known_downbeats()
     times[9] -= 200                           # one bar 10% short, one 10% long
@@ -270,10 +295,49 @@ def test_the_check_is_against_the_songs_own_bar_and_not_the_payload_tempo():
     assert lint_sync(payload, sync) == []
 
 
-def test_anchors_that_stop_short_of_the_song_are_refused():
+def test_anchors_that_stop_short_of_the_song_are_advisory():
     """Short coverage isn't fatal — the client extrapolates — but it means the
     tail runs on an assumed tempo, which is exactly what anchors exist to
     avoid."""
     payload = known_song()
     sync = make_sync(beatAnchors=anchors_for(known_downbeats()[:3], bar_beats=4))
-    assert any("tail would run on extrapolated tempo" in p for p in lint_sync(payload, sync))
+    assert any("tail would run on extrapolated tempo" in p for p in advisory(payload, sync))
+
+
+# --- fit_sync: the trim that replaced a withholding --------------------------
+#
+# The anchors are measured on the recording and the chart is measured in bars, so
+# `model.impose` merging across a barline leaves the chart shorter than the grid
+# the anchors were built from. The overrun used to be reported as a disagreement
+# and cost the song its sidecar. It is a trim, so it is trimmed.
+
+def test_a_shorter_chart_keeps_video_sync_by_losing_the_anchors_it_outran():
+    payload = known_song()
+    full = make_sync()
+    assert full.beatAnchors[-1].songBeat == total_beats(payload)
+
+    # The shape `impose` produces: the same chart, a section shorter.
+    short = known_song()
+    short.arrangement.sections[0].repeats = 2      # 32 beats of song, 64 of anchors
+    fitted = fit_sync(full, short)
+
+    assert len(fitted.beatAnchors) < len(full.beatAnchors)
+    assert fitted.beatAnchors[-1].songBeat <= total_beats(short)
+    assert not any("do not exist" in p for p in lint_sync(short, fitted))
+    assert fitted.beatAnchors == full.beatAnchors[:len(fitted.beatAnchors)], \
+        "a trim, not a rebuild — the surviving anchors are the same timestamps"
+
+
+def test_a_sidecar_that_already_fits_is_handed_back_untouched():
+    payload = known_song()
+    sync = make_sync()
+    assert fit_sync(sync, payload) is sync
+
+
+def test_the_anchor_on_the_final_barline_survives_the_trim():
+    """A song of N bars ships N+1 anchors — the last marks where bar N-1 ends —
+    so the bound is inclusive. Trimming it off would leave every song's last bar
+    running on extrapolation."""
+    payload = known_song()
+    fitted = fit_sync(make_sync(), payload)
+    assert fitted.beatAnchors[-1].songBeat == total_beats(payload)

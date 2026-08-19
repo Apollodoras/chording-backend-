@@ -19,7 +19,7 @@ mirrors deliberately — §16).
 
 **Working end to end, in the deployed shape, and now measured on the thing that
 actually matters.** A YouTube id (or an uploaded file) goes in; a linted
-`CompositionPayload` v2 and a `videoSync` sidecar come out. 656 tests, green, no
+`CompositionPayload` v2 and a `videoSync` sidecar come out. 745 tests, green, no
 audio and no network required to run them.
 
 That last clause is new and it was the important one. Every number this repo
@@ -41,17 +41,17 @@ App Review 5.2.3 stays a non-event — is [`RIGHTS.md`](RIGHTS.md).
 | §3 operational surface | ✅ kill switch, per-video + per-channel blocklist, admin block/purge/offset, append-only audit log, verified purge cascade |
 | §12 `CompositionPayload` v2 | ✅ emitter + the app's importer lint, ported from Mo |
 | §12.2 chord normalization | ✅ Harte + symbolic → the app's closed grammar |
-| §5.4 post-processing | ✅ quantize → merge → drop → hold N/C → simplify → confidence gate |
-| §5.5 difficulty tiers | ✅ re-scoped against the grammar ceiling (§12.2) |
+| §5.4 post-processing | ✅ quantize → merge → drop → hold N/C → confidence gate |
+| §5.5 difficulty tiers | ⛔ **removed** — the chart states what was played ([below](#the-chart-states-what-was-played-55-withdrawn)) |
 | §15 sections | ✅ superseded by §20.3 — fuzzy, global, phase-aligned repeat groups |
 | §14 strumming patterns | ✅ fold/histogram/convention + quarter-note fallback, pooled per repeat group (§20.4) |
-| §13 `videoSync` sidecar | ✅ beat anchors + the §13.2 invariant, enforced by lint |
+| §13 `videoSync` sidecar | ✅ beat anchors + the §13.2 invariant, enforced by lint — **shipped on every song from a recording** ([§13.3 amended](#every-song-plays-with-its-recording-133-amended)) |
 | §16 API | ✅ Mo-shaped: Firebase bearer, `{message, code}` errors, job-id + poll |
 | §16.5 contract fixtures | ✅ emitted and byte-stable; the app-side test is a small follow-up (below) |
 | §5.1 fetch + decode | ✅ yt-dlp + ffmpeg, bounded, behind the §4 seam — **plus an upload path** with no YouTube-terms exposure ([`RIGHTS.md`](RIGHTS.md)) |
 | egress | ✅ **`CHORDS_YTDLP_PROXY` is live** (IPRoyal residential, rotating) — verified clearing the bot check on the first attempt, twice, on real audio ([below](#the-bot-check-is-per-ip-and-cookies-do-not-fix-it)) |
 | the beat axis | ✅ one origin for chart, bars and anchors (`axis.py`) — the defect that cost 23 points |
-| §20 theory layer | ✅ meter reconciled against the harmony, repeat groups, gated consensus, the song's own vocabulary (§20.8), modal key, one model rendered per tier |
+| §20 theory layer | ✅ meter reconciled against the harmony, repeat groups, gated consensus, the song's own vocabulary (§20.8), modal key, one model rendered once |
 | §21 two-sided benchmark | ✅ both correcting layers are **provable no-ops** on perfect input, measured separately on real engines, and on injected noise where the population can resolve |
 | §5.2/§5.3 engines | ✅ **BTC + Beat This!**, benchmarked against real recordings (below) |
 | §4 two-container shape | ✅ the API delegates to the worker; `tests/test_deployment.py` covers what `modal_app.py` relies on |
@@ -174,10 +174,139 @@ downbeat accuracy across it.
 
 The residual ~0.06 is quantization to the beat grid: a chord that changes off the
 beat cannot be said in a container whose unit is a stroke. Chordify quantizes to
-beats too. Note that `delivered` is scored on the **`hard`** tier — `normal`
-deliberately folds diminished and augmented onto their nearest playable triad
-(§5.5), and charging the pipeline for a reduction it was asked to make reads
-Michelle as 0.812 instead of 0.952.
+beats too. `delivered` is scored on the one chart the analysis produces. It used
+to have to name a tier here: `normal` folded diminished and augmented onto their
+nearest playable triad (§5.5), so scoring it charged the pipeline for a reduction
+it had been asked to make and read Michelle as 0.812 instead of 0.952.
+
+---
+
+## Every song plays with its recording (§13.3, amended)
+
+**The report.** Some songs arrived in the app with no "play with the video"
+option at all. That is the product; a chart with no recording behind it is a
+songbook page.
+
+**The cause was ours and it was deliberate.** §13.3 said "degrade honestly": when
+the analysis was not confident, the service withheld the `videoSync` sidecar and
+returned the song alone, to play self-paced. Four things triggered it — chord
+confidence under the floor, beat-grid confidence under the floor, a tempo that
+might be an octave out, bars that disagreed with their own meter — and any one
+`lint_sync` complaint, of any severity, did it too.
+
+The reasoning was that a wrong sync is worse than no sync. It does not survive
+contact with what withholding actually does:
+
+- **It repairs nothing.** The chart handed back is the same chart. If the
+  analysis misheard the harmony, it misheard it self-paced as well.
+- **The anchors were measured on that recording.** They are absolute timestamps
+  taken off the audio the player is about to press play on. A low chord
+  confidence is a statement about the *harmony*; the beat grid is tracked
+  separately, and one has never been evidence against the other.
+- **It is permanent.** The sidecar-less row is a cache hit, so every later
+  request for that song serves the same missing feature, forever.
+- **The client was already told.** `lowConfidence` exists precisely so the app
+  can caveat a doubtful reading. Withholding says less, not more.
+
+**The rule now.** A song that came from a recording ships a sidecar. The only
+thing that can still take it away is a `lint_sync` **fatal** — anchors that are
+not a map at all: none of them, fewer than two, an order that runs backwards, or
+a chart whose per-section tempo overrides mean the client cannot derive a bar
+grid to address. Everything else is **advisory**: the map works and is imperfect,
+so it ships carrying `lowConfidence: true` and the client says so.
+
+Three pieces of machinery, in `app/lint.py`, `app/analysis/compile.py` and
+`app/analysis/pipeline.py`:
+
+| | |
+|---|---|
+| `SyncProblems` | `lint_sync`'s findings split into `fatal` and `advisory`. Only `fatal` withholds. |
+| `fit_sync` | trims the anchors to the chart's own last barline. `impose` merging across a barline leaves anchors for bars the chart no longer has; that is a **trim**, so it is trimmed rather than reported and punished. |
+
+The confidence floor still exists and still means what it meant. It sets
+`lowConfidence`; it no longer decides whether the feature exists.
+
+**Stored rows do not fix themselves.** A map filed before this change has
+`sync_json IS NULL` and will keep serving no video option until it is
+re-analyzed. That is a one-command sweep, narrow by design — it purges only the
+affected rows, and each comes back the first time anyone opens the song:
+
+```bash
+modal run scripts/sweep_catalog.py --missing-sync            # list them
+modal run scripts/sweep_catalog.py --missing-sync --confirm  # purge; they re-analyze on demand
+```
+
+**No video is treated differently from any other video.** Worth stating because
+it was the first suspicion: nothing in the fetch, the gate, the pipeline or the
+store reads a video's channel, its uploader, or whether it is an official label
+upload. `probe` records `channel_id` for exactly one purpose — §3's blocklist is
+per-channel — and the only other per-video branch in the service is the length
+cap. Whatever made the missing feature *look* like it followed a category of
+video ran through the confidence floor, which is the only thing in the system
+that could have varied by recording — and it is the thing this change removed
+from that decision. If a pattern survives the fix, it is a beat-tracking
+question, and it will be visible in `lowConfidence` rather than in a feature
+that is not there.
+
+---
+
+## The chart states what was played (§5.5, withdrawn)
+
+**The ruling.** Asked whether a reference corpus should be stratified by harmonic
+difficulty, the owner answered that it should not: *"The harmonic difficulty
+isn't for us! It's for 'real guitar' softwares where people execute the chords.
+For us the chord is just a band to swipe on."* So the easy/normal/hard tiers are
+gone — not deferred to a later simplification layer, removed.
+
+**Why the argument for them never applied here.** §5.5 defined `easy` as "collapse
+to triads, major/minor only; drop passing chords shorter than a bar". Every word
+of that is about what a beginner's hands can do. The Rosetta client never renders
+a fingering: a chord is a band the player swipes, and `Gmaj7` costs exactly what
+`G` costs to play. Collapsing the one onto the other bought a beginner nothing
+and destroyed information the analysis had just worked to earn — the whole of
+§20's theory layer exists to get that seventh right.
+
+It had already half-collapsed under its own weight. §12.2 established that `hard`
+could not mean "full detected quality" — the ceiling is what the app's
+`ChordSymbol(name:)` parses — so the tiers were re-scoped to three shapes inside
+that grammar, and `_NORMAL` then mapped `DOMINANT7 → DOMINANT7`, `MINOR7 →
+MINOR7`, `SUS4 → SUS4`. The default tier reduced nothing and rendered identically
+to `hard`. That read like a bug and was in fact the design telling the truth.
+
+**What came out.**
+
+| | |
+|---|---|
+| `chords.simplify`, `_EASY`, `_NORMAL`, `DIFFICULTIES` | the whole tier vocabulary. `normalize` stays, and is now the only reduction in the codebase — a ceiling rather than a choice, and one that *counts itself* in `exactRatio`. |
+| `postprocess.simplify_tier` | step 5 of the §5.4 chain. The chain is quantize → merge → drop → hold N/C → confidence gate, and it never renames a chord. |
+| `drop_short(to_longer=…)` | existed only for `easy`'s one-*bar* floor, where the rule was choosing between two real chords rather than cleaning jitter. At the one-beat floor there is no second chord to choose. |
+| `model.render(…, difficulty)` | one render. The replay discipline it was built for — `vote_groups`, `vote_key`, `seed_key`, `canon_rounds`, every `record=False` — **stays**, because "a render reads the model's decisions rather than retaking them" is still worth holding by construction. |
+| `AnalysisOutcome.songs` / `.syncs` | two dicts keyed by difficulty become `song` and `sync`. `sync_for` and `sync_tiers` are gone; `sync` is a plain field. |
+| `chord_maps (video_id, difficulty)` | the primary key is `video_id`. One recording, one row. |
+| `jobs.difficulty`, the `difficulty` request field, the catalog card's `difficulty` | gone from the wire and from the job. |
+| `song_id(video_id, difficulty)` | `yt:<videoId>`, with no suffix. The suffix existed so three tiers could hold three Library rows without `import` upserting one over another. |
+
+**The store migration is hand-written and lossy on purpose.** `difficulty` was
+half of `chord_maps`' primary key, so the table is rebuilt rather than altered —
+and rebuilding forces the question of which of a video's three rows survives. It
+keeps **`hard`**: that was the reference render, built at the full grammar, and
+the only one of the three that ever claimed to state what was played. `easy` and
+`normal` were reductions, and a reduction is what this change exists to stop
+shipping. See `Store._drop_difficulty`.
+
+**One thing got simpler as a side effect.** `list_catalog` collapsed rows with a
+`ROW_NUMBER() OVER (PARTITION BY video_id …)` subquery because a video analyzed
+at two difficulties had two rows. One row per video is the primary key now, so
+the listing is a plain indexed walk of `chord_maps_catalog` with `LIMIT`/`OFFSET`.
+
+**What this does not change.** Nothing about accuracy: the reference tier was
+already what every number in this README was measured on, so the benchmark reads
+the same chart it always read. What it removes is two thirds of the compile work
+per job, a schema that could file three answers to one question, and a standing
+invitation to fix engine noise by hiding it behind a tier — which the owner had
+already ruled out once, on different grounds, when a per-tier chord budget was
+proposed for "the song has more chords than it should". The noise got fixed at
+the source instead (§20.8, §20.10).
 
 ---
 
@@ -286,8 +415,8 @@ Read honestly, because the temptation is to read it the other way:
 - **The architecture is delivered-neutral.** Meter reconciliation, the new form
   detection, the model/render split and the modal keyfinder together move the
   number by nothing. What they bought is coherence and provenance — repeats
-  collapse, the three tiers agree by construction, sections carry group
-  identity, and the sidecar reports what was changed — not accuracy.
+  collapse, the render agrees with the model by construction, sections carry
+  group identity, and the sidecar reports what was changed — not accuracy.
 - **Consensus is a marginal win**: +0.003, with Michelle up 0.028 and Let It Be
   *down* 0.014. Real, but within noise on nine tracks. That is why
   `CHORDS_THEORY_CONSENSUS` exists, and why the harness prints MARGINAL rather
@@ -613,7 +742,7 @@ POST /v1/analyze/upload   {file}     ──┘        (free — §16.4, id is a 
                                        │
                        §5.4 post-process ──► §20.3 form ──► §20.4 consensus
                                        │        (repeat groups)   (gated vote)
-                       §20.6 ONE model ──► rendered once per difficulty
+                       §20.6 ONE model ──► ONE render: what was played
                                        │
                        §12 compile ──► lint ──► Postgres: chord_maps
 GET /v1/analyze/{jobId} ──► status / {song, videoSync}
@@ -689,7 +818,7 @@ See [`RIGHTS.md`](RIGHTS.md).
 | Module | What it owns |
 |---|---|
 | `app/payload.py` | `CompositionPayload` v2 — a near-copy of Mo's, `yt:` ids |
-| `app/chords.py` | the app's grammar (ported) + §12.2 normalization + §5.5 tiers |
+| `app/chords.py` | the app's grammar (ported) + §12.2 normalization — the only reduction there is |
 | `app/lint.py` | the importer's checks (ported) + `lint_sync`, the §13.2 invariant |
 | `app/sync.py` | the sidecar, anchors, and the client's interpolation in Python |
 | `app/store.py` | maps, jobs, blocklist, audit log, quota, limiter — two backends |
@@ -700,7 +829,7 @@ See [`RIGHTS.md`](RIGHTS.md).
 | `app/analysis/form.py` | §20.3 — repeat groups, found fuzzily and globally (supersedes §15's segmentation) |
 | `app/analysis/consensus.py` | §20.4 — the three-gate vote: the same bar in another pass |
 | `app/analysis/vocabulary.py` | §20.8 — the song's own chord vocabulary, for the bars the vote cannot reach |
-| `app/analysis/model.py` | §20.6 — the song model; the tiers are renders of it, not separate analyses |
+| `app/analysis/model.py` | §20.6 — the song model; `build` decides and `render` reads those decisions back |
 | `app/analysis/ytdlp_source.py` | the only code that ever holds audio — worker image only |
 | `app/analysis/file_source.py` | the upload path: player-supplied audio, no YouTube-terms exposure |
 | `app/analysis/adapters/` | one file per engine; nothing else imports a model |
@@ -1201,9 +1330,10 @@ pitch that separates E from Em really is in the audio, which is why the margins
 are thin), not a licence for them. See [below](#what-the-seeded-catalog-says).
 
 Note also that until this was written the gate had been reading the **easy**
-tier while its code said `intermediate` — a tier that does not exist, whose
-`or` fallback silently resolved to `sorted(...)[0]`. Every root histogram this
-gate printed before then described the simplified chart.
+tier while its code said `intermediate` — a tier that did not exist, whose `or`
+fallback silently resolved to `sorted(...)[0]`. Every root histogram this gate
+printed before then described the simplified chart. (The tiers have since been
+removed outright, so there is no longer a wrong one to read.)
 
 The gate also surfaced a real limit. **Solo fingerstyle guitar degrades**: no
 percussion, so the beat grid is too weak to align, and the result comes back
@@ -1285,6 +1415,54 @@ every entry in it carries its reasoning: a cover is under no obligation to be in
 the original's key, so a "wrong" chart is always two hypotheses, not one.
 
 ---
+
+## The analysis audit (2026-08-18)
+
+An external review of the chord-analysis half — engines, theory layer, structure
+— traced back from four symptoms the owner reported: sevenths in almost every
+song, major and minor sharing a key, `A` and `A#` in one chart, and several
+distinct "verses" where the song has one. Thirty-four findings, written up with a
+verdict against each in [`ANALYSIS-AUDIT.md`](ANALYSIS-AUDIT.md).
+
+What it moved, on the ten-song chart corpus (`python bench/lab.py grade`):
+
+| | root | triad | form | distinct chords |
+|---|---|---|---|---|
+| before | 0.853 | 0.846 | 0.688 | 71 |
+| after | 0.854 | 0.849 | **0.755** | **61** |
+
+and on `easy` — then the tier a beginner was shown, since removed — root
+0.761 → **0.791**.
+
+**Read the chord count next to the chord score.** The roots were mostly right
+already; what the owner was seeing is ten spurious chords across ten songs —
+Someone Like You reported eleven distinct chords against a reference of five, and
+now reports six. The three changes that did it are a **Viterbi decoder on BTC's
+posteriors** (which were being arg-maxed away frame by frame), a **key-consistency
+audit** (§20.10, `keyaudit.py` — the only layer whose evidence did not come from
+counting engine output, and so the only one that can settle a *systematic*
+mishearing), and **per-occurrence gates in the consensus vote**, which used to
+abandon a whole slot the moment one occurrence was too wrong to fix.
+
+Six of the review's recommendations were implemented and then **reverted on
+measurement**, and that is the part worth keeping: beat-synchronous decoding costs
+five points of root, novelty-based segmentation costs eleven, and a
+confidence-based tuning-sign check takes one song from 0.335 to 0.012. Which is
+why the first thing built was the ruler — `python bench/lab.py layers` now scores
+every song once per posture, engine-only through each theory layer, so "is this
+the engine or the theory layer?" is a question with an answer per song:
+
+```
+posture                  root  triad   form
+engine only             0.809  0.789  0.702
++ vocabulary  §20.8     0.809  0.789  0.702
++ key audit   §20.10    0.809  0.793  0.713
++ consensus   §20.4     0.821  0.812  0.713
++ belief      §20.9     0.821  0.812  0.713
++ form        §21       0.854  0.849  0.755
+```
+
+Most of the remaining error is the engine's.
 
 ## The service audit (2026-08-17)
 
@@ -1383,14 +1561,15 @@ about **+0.003** raw chord accuracy and **nothing** delivered — see
 [the feature extractor](#the-feature-extractors-block-edges-fixed-2026-08-17) for
 the numbers and why a transformer over 108 frames absorbs it.
 
-Per-difficulty video sync is a **latent** fix rather than a measured one. The
-sidecar was withheld from every tier on the first tier that disagreed with it, so
-one `easy` render coming out a section short cost `hard` and `normal` their video
-sync too — and the log named only the failing tier, so the two that were fine
-looked untouched. On the benchmark corpus the disagreement is always a property of
-the *recording* (all three tiers fail together, and now say so individually), so
-the sidecar count is 13/15 before and after. The fix removes a failure mode the
-corpus does not contain; that is a reason to keep it, not evidence that it helped.
+Per-difficulty video sync was a **latent** fix rather than a measured one, and
+the tiers it applied to have since been removed. The sidecar used to be withheld
+from every tier on the first tier that disagreed with it, so one `easy` render
+coming out a section short cost `hard` and `normal` their video sync too — and
+the log named only the failing tier, so the two that were fine looked untouched.
+On the benchmark corpus the disagreement was always a property of the *recording*
+(all three tiers failed together), so the sidecar count was 13/15 before and
+after. What survives of it is `fit_sync`, which trims the anchors to the chart
+rather than reporting the overrun as a disagreement.
 
 ### Still open
 

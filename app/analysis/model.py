@@ -1,31 +1,25 @@
-"""§20.6 — the song model, and why the difficulty tiers are renders of it.
-
-Before §20 the pipeline ran the whole of §5.4, §15 and §14 **once per
-difficulty**: three passes of quantize → bars → segment → patterns, from the
-same raw spans, producing three songs that were only *related* by having come
-from the same recording. That is one analysis too few and two structures too
-many, and it had a consequence the pipeline already had to defend against —
-`easy`'s simplification can merge two bars into identical ones, which changes
-what the segmenter collapses, so the three tiers could legitimately disagree
-about where the sections are. One sidecar serves whichever tier the player asked
-for, so `assemble` re-checked `lint_sync` against every tier to catch it.
+"""§20.6 — the song model: one recording, one analysis, one chart.
 
 A song has one structure. It is in one key, at one tempo, in one meter, with one
-form; the difficulty tier changes which chord names are printed inside that
-structure and nothing else. So the structure is built **once**, from the richest
-tier, and each difficulty is a *render* of it:
+form — and it has one set of chords, the ones that were played:
 
-    build()   raw spans ─► meter ─► axis ─► chords@hard ─► form ─► consensus
-                                                       └─► key, patterns
-                                                              │
-    render()  ───────────────────────────────────────────────┴─► one tier's
-                                                                 sections
+    build()   raw spans ─► meter ─► axis ─► chords ─► form ─► consensus
+                                                   └─► key, patterns
+                                                          │
+    render()  ───────────────────────────────────────────┴─► the song's sections
 
-Boundaries, repeat groups and patterns are now identical across tiers by
-construction rather than by inspection, which is a stronger statement than the
-cross-tier `lint_sync` check could ever make — and that check stays anyway,
-because it costs nothing and it is the kind of thing that should not be removed
-on the strength of an argument.
+This module carries the scar of a design that is gone. §5.5's easy/normal/hard
+tiers used to make three songs out of one recording — three passes of quantize →
+bars → segment → patterns from the same raw spans — and they could legitimately
+disagree about where the sections were, because `easy`'s simplification merged
+bars the segmenter then collapsed differently. §20.6's answer was to build the
+structure **once**, at the richest tier, and make each difficulty a *render* of
+it. The tiers are now gone outright (the chart states what was played), so the
+split survives for a smaller and still-good reason: `build`
+decides, `render` reads those decisions back out onto a bar list. The replay
+machinery below — `vote_groups`, `vote_key`, `seed_key`, `canon_rounds`, and
+every `record=False` — is what keeps a render a *read* of the analysis rather
+than a second, quieter analysis with its own opinions.
 
 **Why the form is discovered twice.** `form.detect` runs, `consensus.apply`
 votes, and then `form.detect` runs again on the corrected bars. That is not
@@ -42,17 +36,17 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field, replace
 
-from ..chords import HARD
 from ..errors import AnalysisError
-from . import canon, consensus, form, postprocess, vocabulary
+from . import canon, consensus, form, keyaudit, postprocess, vocabulary
 from .axis import BeatAxis, build_axis
 from .canon import CanonReport
 from .consensus import ConsensusReport
-from .keyfinder import DetectedKey, detect_key
+from .keyfinder import DetectedKey, describe_modulations, detect_key, track
 from .meter import Meter, reconcile
 from .strumming import ExtractedPattern, fallback, stroke_similarity
 from .structure import BarChord, Section, bars_from_spans, spans_from_bars
 from .types import BeatGrid, EnergyCurve, Onset, RawChordSpan
+from .keyaudit import KeyAuditReport
 from .vocabulary import VocabularyReport
 
 log = logging.getLogger("chords.model")
@@ -64,12 +58,6 @@ log = logging.getLogger("chords.model")
 # Tighter and the merge stops happening; looser and grooves that differ by a beat
 # start collapsing together.
 GROOVE_SIMILARITY = 0.5
-
-# The tier the model is built at. The richest one, because everything structural
-# is easier to see before simplification has flattened distinctions — two
-# sections that differ only in a 7th are two sections at `hard` and one at
-# `easy`, and the structure should be the one the recording has.
-REFERENCE = HARD
 
 # The **bound** on §21's fixed-point loop, not the number of rounds it takes. Each
 # round canonicalizes the current groups and then re-finds them, and `form.detect`
@@ -84,6 +72,18 @@ REFERENCE = HARD
 # throughout and the reason it is judged on section counts rather than on root.
 # The bound exists so a pathological song cannot make termination an open
 # question, not because any real one approaches it.
+#
+# **This loop is also where near-identical groups get merged**, which the
+# 2026-08-18 audit (F20) recorded as missing. Each round re-runs `form.detect`,
+# which re-clusters from scratch over the bars the previous round just made
+# agree — so two groups whose canonical progressions have become the same *do*
+# collapse into one. Traced over the chart corpus: Wonderwall 9 → 8 groups,
+# Someone Like You 11 → 10, Mary Jane 8 → 7 → 6, Smooth Criminal 26 → 22. The
+# audit's other recommendation for this loop (F17: collapse it to a single
+# convergent pass with explicit invariants) is declined on the measurement §21
+# already carries — against a single round, running to a fixed point is form
+# +0.014 and root −0.004, and the reason is in `canon.py`: one round leaves a
+# song whose occurrences were identical a moment ago holding two readings again.
 CANON_ROUNDS = 4
 
 
@@ -115,62 +115,74 @@ class SongModel:
     # answer different questions with different evidence, and a song can be
     # transformed by one and untouched by the other.
     canon: CanonReport = field(default_factory=CanonReport)
+    # §20.10's findings — every root the chart reads two incompatible ways, and
+    # the spans moved onto the key's own answer. Separate from `vocabulary` for
+    # the reason all of these are separate: the evidence differs (the key, rather
+    # than the song's mass or another pass of the section), so a song can be
+    # helped by one and untouched by the others.
+    key_audit: KeyAuditReport = field(default_factory=KeyAuditReport)
+    # §20.5b — where the song changed key, read a window at a time. Detection
+    # only: the container carries one key, so nothing acts on this. It is here so
+    # that "the chart mixes two transpositions" stops being invisible, which is
+    # the state a truck-driver modulation leaves the analysis in.
+    modulations: tuple[str, ...] = ()
     # §20.8's edits — what the song's own vocabulary corrected before the vote
     # ever ran. Separate from `consensus` because the two answer with different
     # evidence (the rest of the song, versus the same bar in another pass) and a
     # song can be helped a lot by one and not at all by the other.
     vocabulary: VocabularyReport = field(default_factory=VocabularyReport)
     # Whether the cleanup **ran**, which is not the same as whether it changed
-    # anything. `render` needs the first: a tier's spans are not the reference
-    # tier's, so a stage that found nothing to do at `hard` can still have work at
-    # `easy`, and skipping it there would leave one tier holding noise the others
-    # do not. Default False so a hand-assembled model renders exactly as it did
-    # before this stage existed.
+    # anything — `render` needs the first, so that a stage which found nothing to
+    # do still gets replayed in the same order and with the same inputs. Default
+    # False so a hand-assembled model renders exactly as it did before this stage
+    # existed.
     consolidated: bool = False
+    # Whether §20.10 **ran**, on the same argument as `consolidated` immediately
+    # above.
+    audited: bool = True
     # Whether §20.9's belief reduction was part of the vote, carried for the same
     # reason as `vote_groups` and `vote_key`: `render` replays the vote, and a
-    # replay that took a *different* reduction from the reference one would put
-    # the tiers back on separate structures — the exact fiction §20.6 exists to
-    # end. Default True because that is the deployed posture and because a model
-    # assembled by hand takes the same vote `build` would have taken.
+    # replay that took a *different* reduction would be a second analysis rather
+    # than a read of the first. Default True because that is the deployed posture
+    # and because a model assembled by hand takes the same vote `build` would.
     weighed: bool = True
     confidence: float = 0.0
     total_bars: int = 0
-    # How much of the reference tier survived normalization exactly (§5.4) —
-    # `postprocess.exact_ratio`. Low means `hard` is not really "the full
-    # detected quality" on this recording, and the sidecar reports it.
+    # How much of the chart survived normalization exactly (§5.4) —
+    # `postprocess.exact_ratio`. Low means the app's grammar could not spell what
+    # was played on this recording, and the sidecar reports it.
     exact_ratio: float = 1.0
     # The groups the vote was taken over: the **first** pass's, whose block
     # boundaries are the ones `consensus.apply` scored, and which therefore
     # carry what it did. Voting over `groups` instead would be a different vote,
-    # and a tier render has to reproduce the reference one rather than take its
-    # own — so `render` uses these.
+    # and a render has to reproduce the one `build` took rather than take its own
+    # — so `render` uses these.
     vote_groups: list[form.RepeatGroup] = field(default_factory=list)
     # And the key it was taken with, for exactly the same reason. The vote's
     # diatonic tie-break consumes a key, and it consumed the **pre-vote**
     # reading — `key` above is the post-vote one, re-read off the corrected bars
     # so the song reports the key its chart actually settled on. Replaying the
-    # vote with that one would be taking a different vote, not reproducing the
-    # reference: the tie-break would break the other way on any bar the two keys
+    # vote with that one would be taking a different vote, not reproducing
+    # `build`'s: the tie-break would break the other way on any bar the two keys
     # disagree about. Stored rather than recomputed because the reading that
     # matters here is a historical fact about a decision already made.
     vote_key: DetectedKey | None = None
     # And the key §20.8's consolidation ran with, which is one reading earlier
     # still: taken off the engine's own spans, before either the cleanup or the
     # vote had touched them. `render` replays the cleanup with it for exactly the
-    # reason it replays the vote with `vote_key` — a tier is a render of the
-    # reference decisions, not a fresh chance to decide differently.
+    # reason it replays the vote with `vote_key` — a render reads decisions
+    # already taken, it is not a fresh chance to decide differently.
     seed_key: DetectedKey | None = None
     # The groups §21 made canonical, and the key it used — carried for exactly
     # the reason `vote_groups`/`vote_key` are. These are the *encoding* pass's
     # groups (found on the voted bars), which is a different set from the vote's,
-    # and a render has to reproduce the reference decision rather than take its
-    # own over whatever boundaries its own tier happens to produce.
+    # and a render has to reproduce the decision `build` made rather than take
+    # its own over whatever boundaries it happens to arrive at.
     # A **list per round**, because §21 runs to a fixed point and each round
     # votes over the groups the previous round's `form.detect` came back with.
     # A render replays the rounds in order; replaying only the last would
-    # canonicalize a tier against boundaries the reference analysis reached by a
-    # path the tier never took.
+    # canonicalize against boundaries the analysis reached by a path it never
+    # took.
     canon_rounds: list[list[form.RepeatGroup]] = field(default_factory=list)
     canon_key: DetectedKey | None = None
 
@@ -205,7 +217,8 @@ def per_bar_energy(curve: EnergyCurve | None, axis: BeatAxis) -> list[float] | N
 def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
           energy: EnergyCurve | None = None, vote: bool = True,
           weigh: bool = True, consolidate: bool = True,
-          correct_octave: bool = False, form_canonical: bool = True) -> SongModel | None:
+          correct_octave: bool = False, form_canonical: bool = True,
+          key_audit: bool = True) -> SongModel | None:
     """Features → the song model. **Pure**, and the half worth testing directly.
 
     Returns None when there is not enough *rhythm* to lay bars over, and raises
@@ -219,7 +232,7 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
     if axis is None or not axis.is_usable:
         return None
 
-    spans = postprocess.process(raw, axis, difficulty=REFERENCE)
+    spans = postprocess.process(raw, axis)
 
     # §20.8, before anything is cut into bars and before the vote. The order is
     # not incidental: the vote reasons about a bar as a *unit* — one disagreement
@@ -228,13 +241,37 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
     # Cleaning first also means the form detection that follows is looking at the
     # song rather than at the engine's stutter, and it is `form` that decides
     # which bars the vote gets to compare at all.
-    seed_key = detect_key(spans)
+    # **On the chords the engine reported, not on the filled timeline.**
+    # `postprocess.process` holds a chord across every silence and N.C. region so
+    # the chart covers the whole recording (§18), which is right for a chart and
+    # wrong for a bag of chords: a song whose intro is forty seconds of drums over
+    # a held E gives E three times the weight the band ever played it, and the
+    # key comes out partly a fact about the gaps. Same spans otherwise — same
+    # quantization, same merging, same floor — so this is the reading the engine
+    # supports and nothing more (F12).
+    seed_key = detect_key(postprocess.process(raw, axis, fill=False) or spans)
     vocab = VocabularyReport()
     if consolidate and spans:
         spans, vocab = vocabulary.consolidate(
             spans, tonic_pc=seed_key.tonic_pc, mode=seed_key.scale,
             bar_beats=axis.bar_beats,
         )
+
+    # §20.10, immediately after §20.8 and on the same timeline. It runs *after*
+    # the vocabulary rather than before it because the two are ordered by how much
+    # they claim: §20.8 only ever moves a reading the song itself contradicts by a
+    # landslide, and what is left over is the systematic mishearing the key is the
+    # only remaining witness against. Running it first would let the weaker
+    # evidence answer a question the stronger one had not been asked yet.
+    #
+    # With `seed_key`, which is the reading taken off the engine's own spans. Not
+    # a re-read after the vocabulary moved things: this layer is about to *use*
+    # the key to overrule chords, so taking the key from chords it has already
+    # corrected would be the small circle `model.build` breaks everywhere else.
+    audit = KeyAuditReport()
+    if key_audit and spans:
+        spans, audit = keyaudit.resolve(spans, tonic_pc=seed_key.tonic_pc,
+                                        mode=seed_key.scale)
 
     bars = bars_from_spans(spans, axis.bar_beats) if spans else []
     if not bars:
@@ -244,7 +281,7 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
     # follows below: with nothing changed, this is the reading `seed_key` already
     # is, and re-running it could differ only for reasons that are not about the
     # song.
-    key = detect_key(spans) if vocab.touched else seed_key
+    key = detect_key(spans) if (vocab.touched or audit.touched) else seed_key
     bar_beats = float(axis.bar_beats)
     bar_energy = per_bar_energy(energy, axis)
 
@@ -301,7 +338,11 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
         bar_rhythm = canon.settles_on_barlines(spans, axis.bar_beats)
         settled = 0
         if bar_rhythm:
-            bars, settled = canon.settle_to_bars(bars, axis.bar_beats)
+            # With the groups in hand, so a split the song plays every time round
+            # survives — see `settle_to_bars`. These are the groups found on the
+            # voted bars, which is the closest thing to "the song's own sections"
+            # available at this point in the build.
+            bars, settled = canon.settle_to_bars(bars, axis.bar_beats, groups)
             if settled:
                 # The groups were found over the unsettled bars, and settling can
                 # change which blocks resemble which. Re-found before the vote so
@@ -354,6 +395,14 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
         # its key, calling an F# minor song A major off a chorus group that occurs
         # twenty-one times. 9/10 correct tonics against 8/10.
 
+    # §20.5b — the windowed reading, taken on the same spans the key was. After
+    # the theory layer rather than before it, because what this is reporting is a
+    # property of the chart being shipped, and cheap enough (one `detect_key` per
+    # thirty-two bars) not to need a flag.
+    modulations = describe_modulations(track(spans), float(axis.bar_beats))
+    if modulations:
+        log.info("key changes detected: %s", "; ".join(modulations))
+
     # The song's own meter, not `f"{bar_beats}/4"`: `bar_beats` is quarter-note
     # beats, so synthesising a signature from it labelled every 6/8 song's
     # patterns "3/4" — the same bar length, and a meter the song is not in.
@@ -364,7 +413,8 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
     return SongModel(
         meter=meter, axis=axis, key=key, sections=sections, groups=groups,
         patterns=patterns, consensus=report, vocabulary=vocab, canon=canon_report,
-        consolidated=consolidate, weighed=weigh,
+        key_audit=audit, modulations=modulations, consolidated=consolidate, weighed=weigh,
+        audited=key_audit,
         confidence=postprocess.mean_confidence(spans),
         total_bars=sum(s.total_bars for s in sections),
         exact_ratio=postprocess.exact_ratio(spans),
@@ -373,29 +423,25 @@ def build(*, grid: BeatGrid, raw: list[RawChordSpan], onsets: list[Onset],
     )
 
 
-def render(model: SongModel, raw: list[RawChordSpan], difficulty: str) -> list[Section]:
-    """One difficulty tier's sections, on the model's structure.
+def render(model: SongModel, raw: list[RawChordSpan]) -> list[Section]:
+    """The song's sections — the chords that were played, on the model's structure.
 
-    The chords are re-derived for the tier — `easy` really does drop passing
-    chords shorter than a bar, and that is duration work that cannot be done by
-    renaming qualities in place — but the *boundaries* come from the model, so
-    every tier tiles the song the same way and the one sidecar addresses all of
-    them.
+    The chords are re-derived from the raw spans; the *boundaries* come from the
+    model. So this is a **read** of the analysis, not a second one, and every
+    theory decision `build` took is replayed here rather than retaken.
 
     The vote is replayed over the model's **`vote_groups`**, with the model's
     **`vote_key`**, and told not to record what it did. All three matter and none
-    is cosmetic. Voting over `model.groups` (the encoding pass) meant the
-    reference tier's render took a subtly different vote from the one `build`
-    took, so "hard is the model" held by luck. Voting with `model.key` was the
-    same mistake wearing the other hat: that is the key re-read *after* the vote,
-    so on any song where the correction moved the reading, the replay's diatonic
-    tie-break broke differently from the original's — and the guard on both is
-    the same `consensus.touched`, so the two conditions never came apart.
-    Recording, finally, would leave the model's groups carrying whichever tier
-    compiled last instead of the reference vote, which is what the benchmark and
-    the logs read.
+    is cosmetic. Voting over `model.groups` (the encoding pass) is a different
+    vote from the one `build` took. Voting with `model.key` is the same mistake
+    wearing the other hat: that is the key re-read *after* the vote, so on any
+    song where the correction moved the reading, the replay's diatonic tie-break
+    breaks differently from the original's — and the guard on both is the same
+    `consensus.touched`, so the two conditions never come apart. Recording,
+    finally, would have the render write its own conclusions back over the
+    model's, which is what the benchmark and the logs read.
     """
-    spans = postprocess.process(raw, model.axis, difficulty=difficulty)
+    spans = postprocess.process(raw, model.axis)
     if not spans:
         return []
     if model.consolidated:
@@ -407,6 +453,13 @@ def render(model: SongModel, raw: list[RawChordSpan], difficulty: str) -> list[S
             spans, tonic_pc=seed_key.tonic_pc, mode=seed_key.scale,
             bar_beats=model.axis.bar_beats,
         )
+    if model.audited:
+        # §20.10, replayed with the model's `seed_key` for exactly the reason the
+        # consolidation above it is: this is a read of decisions already taken,
+        # not a fresh chance to decide differently.
+        seed_key = model.seed_key or model.key
+        spans, _ = keyaudit.resolve(spans, tonic_pc=seed_key.tonic_pc,
+                                    mode=seed_key.scale)
     bars = bars_from_spans(spans, model.axis.bar_beats)
     if not bars:
         return []
@@ -421,19 +474,19 @@ def render(model: SongModel, raw: list[RawChordSpan], difficulty: str) -> list[S
             record=False, weigh=model.weighed,
         )
     if model.canon.bar_rhythm:
-        # §21b, replayed. Measured on the reference tier and *applied* here
-        # without re-measuring, for the reason every replay in this function has:
-        # a tier is a render of decisions already taken, and `easy` dropping a
-        # passing chord could flip the measurement on its own.
-        bars, _ = canon.settle_to_bars(bars, model.axis.bar_beats)
+        # §21b, replayed. Measured in `build` and *applied* here without
+        # re-measuring, for the reason every replay in this function has: the
+        # measurement is a decision, and a render reads decisions.
+        bars, _ = canon.settle_to_bars(bars, model.axis.bar_beats,
+                                       model.canon_rounds[0] if model.canon_rounds
+                                       else model.vote_groups)
     if model.canon_rounds:
-        # Replayed over the reference groups, in the reference order, with the
-        # reference key, and told not to record — the conditions the vote replay
-        # above is under, and every one of them for the same reason.
-        # `canon_rounds` in particular is *not* `model.groups`: those were
-        # re-found after the last round ran, so voting over them would
-        # canonicalize a tier against boundaries the reference analysis never
-        # used.
+        # Replayed over `build`'s groups, in `build`'s order, with `build`'s key,
+        # and told not to record — the conditions the vote replay above is under,
+        # and every one of them for the same reason. `canon_rounds` in particular
+        # is *not* `model.groups`: those were re-found after the last round ran,
+        # so voting over them would canonicalize against boundaries the analysis
+        # never used.
         canon_key = model.canon_key or model.key
         for round_groups in model.canon_rounds:
             bars, _ = canon.canonicalize(
@@ -447,12 +500,11 @@ def impose(sections: list[Section], bars: list[list[BarChord]]) -> list[Section]
     """Re-read the model's sections out of a differently-rendered bar list.
 
     The boundaries are the model's and do not move. What can change is whether a
-    section's passes are still identical: simplification is applied to the whole
-    timeline, and `easy`'s drop-passing-chords rule can merge across a barline,
-    so two passes that agreed at `hard` may not at `easy`. When that happens the
-    section is expanded to explicit bars rather than keeping a `repeats` that
-    would replay the wrong pass — the same rule, and the same reason, as
-    `form._sections_from`.
+    section's passes are still identical — the replayed theory layers act on the
+    whole timeline, and one of them settling a bar can leave two passes of a
+    section no longer agreeing. When that happens the section is expanded to
+    explicit bars rather than keeping a `repeats` that would replay the wrong
+    pass — the same rule, and the same reason, as `form._sections_from`.
     """
     out: list[Section] = []
     for section in sections:
@@ -630,6 +682,13 @@ def _rename_shared_grooves(patterns: dict[str, ExtractedPattern],
     so the wire, is unchanged. Two sharers are named for both; beyond two the
     groove is the song's rather than any section's, and a list of names has
     stopped being a name.
+
+    **Counted in groups, not in names.** Since §20.3's labelling learned to work
+    without a loudness probe (F21), three groups can carry two *display* names —
+    verse, chorus, verse is the commonest form there is — and deduplicating first
+    made a groove the whole song plays come out as "Verse & Chorus strum". The
+    question this is answering is whether the groove belongs to a section or to
+    the song, and that is a fact about how many groups share it.
     """
     sharers: dict[str, list[str]] = {}
     for label, extracted in patterns.items():
@@ -642,7 +701,8 @@ def _rename_shared_grooves(patterns: dict[str, ExtractedPattern],
             out[label] = extracted
             continue
         distinct = list(dict.fromkeys(names.get(g, g) for g in group_labels))
-        shared = f"{' & '.join(distinct)} strum" if len(distinct) <= 2 else "Strum"
+        shared = (f"{' & '.join(distinct)} strum"
+                  if len(group_labels) <= 2 and len(distinct) <= 2 else "Strum")
         out[label] = replace(extracted,
                              pattern=extracted.pattern.model_copy(update={"name": shared}))
     return out

@@ -70,13 +70,13 @@ class UploadCapableRunner(JobRunner):
     def can_accept_uploads(self) -> bool:
         return True
 
-    def submit(self, *, job_id, video_id, difficulty, uid, audio=None, filename=None):
+    def submit(self, *, job_id, video_id, uid, audio=None, filename=None):
         self.submitted.append({"video_id": video_id, "audio": audio, "filename": filename})
         # Deliberately runs against the fake source rather than building a real
         # `FileSource`: this covers the route, the gate and the job bookkeeping.
         # `FileSource` itself is covered below, against real ffmpeg.
         from app.jobs import run_job
-        run_job(job_id=job_id, video_id=video_id, difficulty=difficulty, uid=uid,
+        run_job(job_id=job_id, video_id=video_id, uid=uid,
                 settings=self.settings, store=self.store, source=self.source)
 
 
@@ -439,12 +439,12 @@ def test_a_re_analysis_cannot_quietly_publish_an_upload(two_player_client):
     store = two_player_client.app.state.store
     video_id = upload_id(AUDIO)
 
-    cached = store.get_map(video_id, "normal")
-    store.put_map(video_id=video_id, difficulty="normal", song=cached.song, sync=None,
+    cached = store.get_map(video_id)
+    store.put_map(video_id=video_id, song=cached.song, sync=None,
                   engine_chords="x", engine_beats="y", analyzed_at="2026-09-01T00:00:00Z",
                   owner_uid=None)
 
-    assert store.get_map(video_id, "normal").owner_uid == "alice"
+    assert store.get_map(video_id).owner_uid == "alice"
     assert store.list_catalog() == []
 
 

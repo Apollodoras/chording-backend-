@@ -83,16 +83,24 @@ def register_structure_probe(name: str, factory: StructureProbeFactory) -> None:
 # itself imports its dependency inside `analyze`/`track`, so even a registered
 # engine costs nothing until it is built.
 
+# `chordino` and `madmom` are **planned, not written** — there is no
+# `adapters/chordino.py` or `adapters/madmom_beats.py` in the tree. They are
+# listed because the §8 engine comparison names them as the candidates worth
+# adding next, and `register_builtins` checks that the module exists before it
+# registers anything, so neither can reach `available()` or `/healthz` by
+# accident. Kept rather than deleted so the shortlist survives in the one place
+# a reader looks for it; marked, so a reader does not take the entry for a
+# working adapter.
 _BUILTIN_CHORD_ENGINES = {
     "chroma": (".adapters.chroma", "ChromaTemplateEngine", ("librosa", "numpy")),
-    "chordino": (".adapters.chordino", "ChordinoEngine", ("vamp", "numpy")),
+    "chordino": (".adapters.chordino", "ChordinoEngine", ("vamp", "numpy")),   # planned
     "btc": (".adapters.btc", "BtcEngine", ("torch", "librosa")),
 }
 
 _BUILTIN_BEAT_TRACKERS = {
     "librosa": (".adapters.librosa_beats", "LibrosaBeatTracker", ("librosa", "numpy")),
     "beat_this": (".adapters.beat_this_tracker", "BeatThisTracker", ("beat_this", "torch")),
-    "madmom": (".adapters.madmom_beats", "MadmomBeatTracker", ("madmom", "numpy")),
+    "madmom": (".adapters.madmom_beats", "MadmomBeatTracker", ("madmom", "numpy")),  # planned
 }
 
 _BUILTIN_ONSET_DETECTORS = {

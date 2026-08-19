@@ -1,17 +1,32 @@
 {
   "analysis": {
     "absorbedIslands": 0,
+    "canonicalBars": 0,
     "contestedBars": 0,
+    "downbeatsRepaired": {
+      "dropped": 0,
+      "inserted": 0
+    },
     "exactRatio": 1.0,
     "groups": 1,
+    "heldBeats": 0,
+    "irregularBars": 0,
+    "keyConflicts": [],
     "meterSource": "tracker",
+    "modulations": [],
     "phaseShift": 0,
+    "resolvedSpans": 0,
     "rewrittenBars": 0,
     "scale": "ionian",
     "sections": 1,
+    "settledBars": 0,
     "snappedSpans": 0,
+    "splitBars": 0,
     "tempoOctaveShift": 0,
-    "tempoOctaveSuspect": false
+    "tempoOctaveSuspect": false,
+    "tuningAmbiguous": false,
+    "tuningCents": 0.0,
+    "weighedBars": 0
   },
   "analyzedAt": "2026-01-01T00:00:00Z",
   "beatAnchors": [

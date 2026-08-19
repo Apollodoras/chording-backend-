@@ -38,7 +38,7 @@ VIDEO = "dQw4w9WgXcQ"
 # --- expiry ------------------------------------------------------------------
 
 def make_job(store: SQLiteStore, job_id: str, status: str, *, age_s: float) -> None:
-    store.create_job(job_id=job_id, uid="u1", video_id=VIDEO, difficulty="normal")
+    store.create_job(job_id=job_id, uid="u1", video_id=VIDEO)
     store.update_job(job_id, status=status)
     # Backdate `updated_at` directly: the prune is a time-based sweep and the
     # alternative is a test that sleeps for a day.
@@ -96,7 +96,7 @@ def test_a_failing_sweep_never_fails_the_request(store, monkeypatch):
 
     store._maybe_prune_jobs()   # must not raise
 
-    job = store.create_job(job_id="fresh", uid="u1", video_id=VIDEO, difficulty="normal")
+    job = store.create_job(job_id="fresh", uid="u1", video_id=VIDEO)
     assert job.job_id == "fresh"
 
 
@@ -157,18 +157,15 @@ class _Meta:
 class _Outcome:
     """A successful analysis, as `run_pipeline` would return it."""
 
-    sync = None
-    songs = {"normal": {"id": "yt:x", "title": "A Song"}}
+    song = {"id": "yt:x", "title": "A Song"}
     engine_chords = "btc"
     engine_beats = "beat_this"
     analyzed_at = "2026-08-05T00:00:00Z"
     meta = _Meta()
     duration_ms = 180_000
     low_confidence = False
-    # Which tiers the sidecar is true of — empty here because `sync` is None.
-    # `run_job` stores the sidecar per difficulty rather than once for all of
-    # them, so this is part of the shape a pipeline outcome has to have.
-    sync_tiers = frozenset()
+    # None here: this stub is about the job's bookkeeping, not about §13.
+    sync = None
 
 
 def _analyzed_job(store, settings, monkeypatch, *, put_map):
@@ -185,9 +182,9 @@ def _analyzed_job(store, settings, monkeypatch, *, put_map):
                     "build_onset_detector", "build_structure_probe"):
         monkeypatch.setattr(jobs.engines, builder, lambda _s: None)
     monkeypatch.setattr(store, "put_map", put_map)
-    store.create_job(job_id="j1", uid="u1", video_id=VIDEO, difficulty="normal")
+    store.create_job(job_id="j1", uid="u1", video_id=VIDEO)
     store.try_record_use("u1", 10)
-    return jobs.run_job(job_id="j1", video_id=VIDEO, difficulty="normal", uid="u1",
+    return jobs.run_job(job_id="j1", video_id=VIDEO, uid="u1",
                         settings=settings, store=store, source=FakeSource())
 
 
@@ -236,13 +233,13 @@ def test_a_store_too_broken_to_record_the_failure_still_does_not_raise(store, se
     assert outcome == jobs.OUTCOME_FAILED
 
 
-def test_the_happy_path_still_files_every_tier_and_reports_ready(store, settings, monkeypatch):
+def test_the_happy_path_files_the_chart_and_reports_ready(store, settings, monkeypatch):
     """The guard must not have changed what success does."""
     filed = []
     outcome = _analyzed_job(store, settings, monkeypatch,
-                            put_map=lambda **kw: filed.append(kw["difficulty"]))
+                            put_map=lambda **kw: filed.append(kw["video_id"]))
 
     assert outcome == jobs.OUTCOME_READY
-    assert filed == ["normal"]
+    assert filed == [VIDEO]
     assert store.get_job("j1").status == STATUS_READY
     assert store.usage_today("u1") == 1

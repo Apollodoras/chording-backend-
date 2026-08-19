@@ -61,10 +61,6 @@ def test_similarity_is_symmetric_and_bounded():
     assert harmony.similarity((C, MAJOR), (C, MAJOR)) == 1.0
 
 
-def test_distance_is_the_complement_of_similarity():
-    assert harmony.distance((C, MAJOR), (A, MINOR)) == 1.0 - harmony.similarity((C, MAJOR), (A, MINOR))
-
-
 # --- scales and keys ---------------------------------------------------------
 
 def test_a_modes_scale_is_rooted_at_its_own_tonic():

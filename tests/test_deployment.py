@@ -47,12 +47,12 @@ class SpawningRunner(RemoteJobRunner):
         super().__init__(settings, store, source)
         self.spawned: list[str] = []
 
-    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str) -> None:
+    def submit(self, *, job_id: str, video_id: str, uid: str) -> None:
         self.spawned.append(job_id)
 
 
 class FailingRunner(RemoteJobRunner):
-    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str) -> None:
+    def submit(self, *, job_id: str, video_id: str, uid: str) -> None:
         raise RuntimeError("modal refused the spawn")
 
 
@@ -155,7 +155,7 @@ def test_failed_dispatch_refunds_and_terminates_the_job(settings, store, no_engi
     assert response.status_code == 503
     assert store.usage_today("local-dev") == 0, "charged for a job that never ran"
 
-    job = store.active_job_for(VIDEO, "normal")
+    job = store.active_job_for(VIDEO)
     assert job is None, "a dead job is still blocking its video"
 
 
@@ -164,7 +164,7 @@ def test_failed_dispatch_refunds_and_terminates_the_job(settings, store, no_engi
 def _abandon(store: SQLiteStore, *, job_id: str, uid: str, age_s: float) -> None:
     """A job row left mid-flight `age_s` ago — a SIGKILLed worker, in the only
     state one leaves behind."""
-    store.create_job(job_id=job_id, uid=uid, video_id=VIDEO, difficulty="normal")
+    store.create_job(job_id=job_id, uid=uid, video_id=VIDEO)
     store.update_job(job_id, status=STATUS_ANALYZING, progress=0.35)
     stale = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                           time.gmtime(time.time() - age_s))
@@ -178,7 +178,7 @@ def test_abandoned_job_stops_blocking_its_video(store):
     container made one video permanently un-analyzable."""
     _abandon(store, job_id="dead", uid="u1", age_s=store._JOB_LEASE_S + 60)
 
-    assert store.active_job_for(VIDEO, "normal") is None
+    assert store.active_job_for(VIDEO) is None
 
 
 def test_job_within_its_lease_is_still_joined(store):
@@ -186,7 +186,7 @@ def test_job_within_its_lease_is_still_joined(store):
     what `active_job_for` exists to share."""
     _abandon(store, job_id="alive", uid="u1", age_s=30)
 
-    active = store.active_job_for(VIDEO, "normal")
+    active = store.active_job_for(VIDEO)
     assert active is not None and active.job_id == "alive"
 
 

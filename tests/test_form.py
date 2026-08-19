@@ -214,13 +214,18 @@ def test_cohesion_reports_how_much_of_a_repeat_a_group_really_is():
 
 # --- naming ------------------------------------------------------------------
 
-def test_without_energy_the_name_follows_the_group_not_the_position():
-    """§20's one improvement to the honest fallback: the same music carries the
-    same name wherever it returns, so a player reading the rail can see that
-    part 1 has come back."""
+def test_without_energy_the_structure_still_names_the_sections():
+    """The loudness probe is no longer a single point of failure for labelling.
+
+    A build with no structure probe used to name every section `Part N` — §15's
+    honest fallback, and honest is right, but "which repeated group is the
+    chorus" is not *only* a question about loudness. `A B A` answers it on
+    position alone: the group that opens the song is the verse, and this reads the
+    same as the energy-fed answer in the test below it (F21).
+    """
     sections = segment(SONG)
-    assert [s.kind for s in sections] == ["custom"] * 3
-    assert [s.name for s in sections] == ["Part 1", "Part 2", "Part 1"]
+    assert [s.kind for s in sections] == ["verse", "chorus", "verse"]
+    assert all(s.name == "" for s in sections), "empty name = use the kind's own label"
 
 
 def test_with_energy_the_loudest_repeated_group_is_the_chorus():
@@ -324,16 +329,21 @@ def test_a_list_and_a_tuple_of_the_same_bar_agree():
 def test_a_seventh_on_alternate_passes_does_not_double_the_period():
     """The measurement behind `form.folded`.
 
-    A four-bar loop played eight times, with the Em heard as Em7 on every other
-    pass — which is what BTC does with a doubled guitar part. Scored on the real
-    chords the loop reaches 0.9375 at lag 4 and a perfect 1.0 at lag 8, and
-    `PERIOD_MARGIN` is 0.05, so the song loses its own period by 0.0125 and comes
-    out as an eight-bar section played four times.
+    A four-bar loop played eight times, with the engine hearing a seventh on every
+    other pass — which is what BTC does with a doubled guitar part. Scored on the
+    real chords the loop loses to its own double, because `bar_similarity` rates
+    `Em` against `Em7` at 0.75 and a lag of eight compares each pass with the
+    pass that wobbled the same way. That is the "chart is twice as long as the
+    song" half of the engine wobble whose other half is "more chords than the song
+    has", and it has to be fixed *first*: §20.9's evidence is what the other
+    passes of a slot say, so it cannot speak until the passes line up.
 
-    That is the "chart is twice as long as the song" half of the same engine
-    wobble that shows up as "more chords than the song has", and it has to be
-    fixed *first*: §20.9's evidence is what the other passes of a slot say, so it
-    cannot speak at all until the passes are lined up correctly.
+    **Two fixtures, because two different things guard this.** One wobbling bar
+    per pass costs 0.0625 at lag 4, which `PERIOD_MARGIN` now covers on its own
+    (it was 0.05 and is 0.12 — see the constant). A pass that wobbles in every bar
+    costs 0.25, which no plausible margin covers and only the fold can answer. The
+    first case says the margin is wide enough for the ordinary wobble; the second
+    says the margin is not what makes this safe.
     """
     from app.chords import MINOR7
 
@@ -341,11 +351,23 @@ def test_a_seventh_on_alternate_passes_does_not_double_the_period():
     coloured = [_bar(E, MINOR7), _bar(G), _bar(D), _bar(C)]
     bars = (loop + coloured) * 4
 
-    assert period(bars, 4.0) == 8, "on the real chords the wobble wins"
+    assert period(bars, 4.0) == 4, "one wobbling bar is inside the margin"
     assert period(folded(bars), 4.0) == 4, "on the triads the song wins"
 
     _, groups = detect(bars, bar_beats=4.0)
     assert [(g.length_bars, len(g.occurrences)) for g in groups] == [(4, 8)]
+
+
+def test_a_pass_that_wobbles_throughout_still_needs_the_fold():
+    """The half `PERIOD_MARGIN` cannot reach — see the test above."""
+    from app.chords import DOMINANT7, MAJOR7, MINOR7
+
+    loop = [_bar(E, MINOR), _bar(G), _bar(D), _bar(C)]
+    coloured = [_bar(E, MINOR7), _bar(G, MAJOR7), _bar(D, DOMINANT7), _bar(C, MAJOR7)]
+    bars = (loop + coloured) * 4
+
+    assert period(bars, 4.0) == 8, "on the real chords the wobble wins"
+    assert period(folded(bars), 4.0) == 4, "on the triads the song wins"
 
 
 def test_the_fold_keeps_a_real_chord_change_apart():
@@ -369,3 +391,32 @@ def test_the_sections_are_built_from_the_real_chords_not_the_folded_ones():
     printed = {c.quality for s in sections for b in s.bars for c in b}
     assert printed == {DOMINANT7, MAJOR}, "the colour survives into the chart"
     assert {c.quality for g in groups for b in g.canonical for c in b} == {DOMINANT7, MAJOR}
+
+
+def test_novelty_segmentation_runs_and_is_not_what_ships():
+    """§20.3b, kept switchable and kept off.
+
+    The 2026-08-18 audit recommended replacing the fixed-unit grid with
+    boundaries read off a bar-level self-similarity matrix. It is implemented
+    (`novelty_blocks`) and it loses on every axis over the chart corpus — root
+    0.846 against 0.857, form 0.610 against 0.713 — because in a repertoire whose
+    sections are the same four chords at different volumes, a checkerboard kernel
+    over *harmony* peaks on the chord changes inside the loop rather than on the
+    section boundaries.
+
+    This test runs it, so the measurement stays re-runnable and the code stays
+    honest. What it asserts is only that it produces a legal segmentation: the
+    verdict on whether it is a good one lives in the bench, not here.
+    """
+    from app.analysis.form import NOVELTY, novelty, novelty_blocks
+
+    assert NOVELTY is False, "the fixed grid is what ships"
+    bars = SONG * 3
+    curve = novelty(folded(bars), 4.0)
+    assert len(curve) == len(bars)
+
+    blocks = novelty_blocks(folded(bars), 4.0)
+    assert blocks, "it segments"
+    assert blocks[0].start_bar == 0
+    assert sum(b.length for b in blocks) == len(bars), "and covers every bar exactly once"
+    assert all(b.length >= 4 for b in blocks), "with nothing below the section floor"

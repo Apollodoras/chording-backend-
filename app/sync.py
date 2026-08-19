@@ -118,7 +118,7 @@ class TheoryReport(BaseModel):
 
     ``exactRatio`` is the other one worth watching, and it says something no
     other number here does: how much of the track survived §5.4's normalization
-    without losing information. A low value means the ``hard`` tier is a
+    without losing information. A low value means the chart is a
     *fiction* on this recording — a jazz standard reduced to triads and dominant
     sevenths is a different song, and it is a different song that lints clean,
     plays fine and reports high confidence. This is the only field that can say
@@ -145,6 +145,23 @@ class TheoryReport(BaseModel):
     # they are published rather than logged.
     snappedSpans: int = 0
     absorbedIslands: int = 0
+    # §20.10's two, and they answer a question nothing here could ask before:
+    # does the finished chart sit in the key the payload names? ``keyConflicts``
+    # lists every root the song reads two incompatible ways ("C# vs C#m") whether
+    # or not anything was done about it, and ``resolvedSpans`` counts the spans
+    # moved onto the key's own reading. A song with conflicts and no resolutions
+    # is one the audit found something in and declined to touch — the state an
+    # operator most needs to be able to see, and the one that used to be
+    # invisible (`keyaudit.py`).
+    resolvedSpans: int = 0
+    keyConflicts: tuple[str, ...] = ()
+    # §20.5b — where the windowed key reading changed, as lines a person can read
+    # ("bar 96: E major -> F major"). Detection only; the container carries one
+    # key and nothing acts on this. Empty on a single-key song, which is nearly
+    # all of them — and non-empty is the one signal that distinguishes "the engine
+    # misheard the last chorus" from "the last chorus is a tone up", which are
+    # indistinguishable in every other field here.
+    modulations: tuple[str, ...] = ()
     # §21's two counts. ``canonicalBars`` is bars brought into line with their own
     # section's progression, and it is emphatically *not* comparable with
     # ``rewrittenBars`` above: that one counts places the engine is thought to
@@ -183,7 +200,7 @@ class TheoryReport(BaseModel):
     # Octaves the beat grid was moved by to get there: -1 halved, +1 doubled.
     # Always 0 unless `CHORDS_THEORY_TEMPO_OCTAVE` is on.
     tempoOctaveShift: int = 0
-    # Share of the reference tier, by duration, whose chord quality reached the
+    # Share of the chart, by duration, whose chord quality reached the
     # container intact. **Optional and defaulting to None**, which reads as "not
     # measured" — the honest answer for every sidecar written before this field
     # existed, and one that neither 1.0 ("all exact") nor 0.0 ("none of it") can
@@ -228,10 +245,12 @@ class VideoSync(BaseModel):
 class AnalyzeResponse(BaseModel):
     """The §13.1 envelope: the song and its sidecar, side by side.
 
-    ``videoSync`` is ``None`` when beat tracking was too weak to trust (§13.3) —
-    a self-paced campfire song that's right beats a video-synced one that's
-    wrong, and the player has no score to protect, so the only cost of bad sync
-    is that the app feels broken.
+    ``videoSync`` is ``None`` only when the analysis produced no usable map from
+    video time to song beat at all — no anchors, or anchors that cannot be
+    interpolated. It is **not** withheld for a weak reading any more: a song that
+    came from a recording should play with that recording, and a doubtful one
+    says so through ``lowConfidence`` rather than by having its video taken away
+    (§13.3 as amended). See `analysis/pipeline.py`.
     """
 
     song: dict

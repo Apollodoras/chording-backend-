@@ -113,3 +113,53 @@ def test_the_tonic_bonus_is_not_swamped_by_a_long_final_chord():
     dragged = normal[:-1] + [GridSpan(start_beat=12, length_beats=400,
                                       root_pc=9, quality=MINOR)]
     assert detect_key(dragged).tonic == detect_key(normal).tonic
+
+
+# --- §20.5b, modulation -------------------------------------------------------
+
+def _bars(chords, beats=4, start=0.0):
+    from app.analysis.types import GridSpan
+    out, at = [], start
+    for root, quality in chords:
+        out.append(GridSpan(start_beat=at, length_beats=beats, root_pc=root,
+                            quality=quality, confidence=0.9, exact=True))
+        at += beats
+    return out
+
+
+def test_a_single_key_song_reports_no_modulation():
+    """The ordinary case, and the one the container is built for. Every song in
+    the eleven-song chart corpus lands here."""
+    from app.analysis.keyfinder import describe_modulations, track
+    from app.chords import MAJOR, MINOR
+
+    verse = [(7, MAJOR), (2, MAJOR), (4, MINOR), (0, MAJOR)]
+    assert describe_modulations(track(_bars(verse * 40))) == ()
+
+
+def test_a_final_chorus_a_tone_up_is_reported():
+    """The truck-driver modulation — one of the commonest structures in this
+    repertoire, and today it puts two transpositions in one chart with nothing
+    anywhere able to say so."""
+    from app.analysis.keyfinder import describe_modulations, track
+    from app.chords import MAJOR, MINOR
+
+    verse = [(7, MAJOR), (2, MAJOR), (4, MINOR), (0, MAJOR)]        # G major
+    lifted = [(9, MAJOR), (4, MAJOR), (6, MINOR), (2, MAJOR)]       # A major
+    spans = _bars(verse * 24 + lifted * 16)
+    lines = describe_modulations(track(spans))
+    assert len(lines) == 1
+    assert "-> A major" in lines[0]
+
+
+def test_a_window_that_leans_on_the_relative_is_not_a_modulation():
+    """The false positive this had on its first run: I'm Yours reported
+    "bar 64: B major -> G# minor", which is one collection read two ways and
+    exactly the argument `keyfinder`'s first half is about. A modulation moves the
+    *notes*."""
+    from app.analysis.keyfinder import describe_modulations, track
+    from app.chords import MAJOR, MINOR
+
+    verse = [(7, MAJOR), (2, MAJOR), (4, MINOR), (0, MAJOR)]        # G major
+    relative = [(4, MINOR), (0, MAJOR), (7, MAJOR), (2, MAJOR)]     # E minor, same notes
+    assert describe_modulations(track(_bars(verse * 20 + relative * 20))) == ()

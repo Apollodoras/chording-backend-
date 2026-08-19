@@ -138,8 +138,16 @@ class Settings:
     # mount in the worker (§4: `--read-only` + an explicit tmpfs for scratch).
     # app/analysis/scratch.py refuses to run if this looks durable.
     scratch_root: str = "/tmp/chords-scratch"
-    # Mean-confidence floor below which the map is flagged `lowConfidence` and
-    # videoSync is withheld entirely (§5.4.6, §13.3).
+    # Mean-confidence floor below which the map is flagged `lowConfidence`
+    # (§5.4.6, §13.3).
+    #
+    # It no longer withholds the sidecar. It used to, and what that did in
+    # practice was take "play with the video" away from songs whose beat map was
+    # measured on the very recording the player wanted to play along with —
+    # handing back the same chart with a metronome, which repairs nothing. The
+    # flag now travels *on* the sidecar, so the client can caveat a weak reading
+    # instead of the service silently deleting the feature. See
+    # `analysis/pipeline.py`.
     confidence_floor: float = 0.5
     # §20.4 — let a song's repeated sections vote their engine mistakes out.
     # A flag rather than a constant because this is the one part of the theory
@@ -166,15 +174,32 @@ class Settings:
     # engine hears the seventh in half the passes, so no majority forms, and
     # nothing in §20.4 or §20.8 has anything to count.
     theory_belief: bool = True
+    # §20.10 — audit the finished chart against its own key, and settle a root
+    # the song reads two incompatible ways. A flag for the same reason as the
+    # three above, and **on** by default because it is the only layer that can
+    # answer the owner's "major and minor chords in the same key": the vote needs
+    # two passes of a section to disagree, the vocabulary needs a landslide of
+    # mass, and a systematic mishearing offers neither. The key is the one piece
+    # of evidence in the building that did not come from counting engine output
+    # (`analysis/keyaudit.py`).
+    theory_key_audit: bool = True
     # §20.2 — let a tempo that reads an octave out be halved (or doubled) instead
-    # of only reported. **Off** by default, and for the opposite reason to
-    # `theory_consensus`: this one is unmeasured. Correcting the octave rewrites
-    # the beat grid, so every bar line and every anchor in the song moves, and
-    # the corpus has no track that triggers it — so there is no benchmark verdict
-    # to turn it on with. With it off, a suspect tempo the container can still
-    # carry ships low-confidence, and one it cannot fails with a message that
-    # names the tempo (`analysis/meter.py`, `pipeline.assemble`).
-    theory_tempo_octave: bool = False
+    # of only reported. **On**, since the 2026-08-18 audit, and the reason it was
+    # off is worth keeping: correcting the octave rewrites the beat grid, so every
+    # bar line and every anchor in the song moves, and there was no measurement
+    # to turn it on with.
+    #
+    # There is now, and it is the shape that settles this kind of question: the
+    # correction only fires on a tempo *outside* 40–220 BPM, no track in the
+    # eleven-song chart corpus is, and turning it on is a **no-op to four decimal
+    # places on all of them** (root 0.854 / triad 0.849 / form 0.747 either way).
+    # So the risk of moving every anchor is bounded to the songs that today do not
+    # ship at all: `pipeline.assemble` raises `TempoUnreadable` outside that range,
+    # and the user pays a quota charge for a failure the halve/double machinery
+    # right beside it could have repaired. Trading "certainly no song" for "a song
+    # on a grid we corrected, flagged `tempoOctaveSuspect`" is the same trade
+    # §13.3 already makes for the sidecar.
+    theory_tempo_octave: bool = True
     # §21 — let every occurrence of a repeated section play that section's own
     # progression, so the chart states the song's form instead of transcribing
     # each pass separately. A flag for the same reason as the three above, and
@@ -294,7 +319,8 @@ def load_settings() -> Settings:
         theory_consensus=_bool("CHORDS_THEORY_CONSENSUS", True),
         theory_vocabulary=_bool("CHORDS_THEORY_VOCABULARY", True),
         theory_belief=_bool("CHORDS_THEORY_BELIEF", True),
-        theory_tempo_octave=_bool("CHORDS_THEORY_TEMPO_OCTAVE", False),
+        theory_key_audit=_bool("CHORDS_THEORY_KEY_AUDIT", True),
+        theory_tempo_octave=_bool("CHORDS_THEORY_TEMPO_OCTAVE", True),
         theory_form=_bool("CHORDS_THEORY_FORM", True),
         chord_engine=os.environ.get("CHORDS_CHORD_ENGINE") or "btc",
         beat_tracker=os.environ.get("CHORDS_BEAT_TRACKER") or "beat_this",

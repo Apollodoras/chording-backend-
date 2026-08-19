@@ -312,7 +312,7 @@ SPECS = [
     # The baseline: a folk progression anybody would recognise.
     Spec(name="folk-g-d-em-c", chords=["G", "D", "Em", "C"]),
     # Sevenths — where an engine that only knows triads shows itself, and where
-    # the `normal` vs `hard` tiers actually differ.
+    # the chart has to print the seventh that was played rather than its triad.
     Spec(name="sevenths-ii-v-i", chords=["Dm7", "G7", "Cmaj7", "Cmaj7"], tempo=96),
     # A minor key with a flat spelling, to catch a key-finder that reports the
     # relative major (the classic failure) and a speller that emits "A#m".

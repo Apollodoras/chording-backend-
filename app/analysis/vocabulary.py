@@ -223,10 +223,16 @@ class VocabularyReport:
 
     snapped_spans: int = 0
     absorbed_islands: int = 0
+    # §20.8b's own count, kept apart from `absorbed_islands` because the two make
+    # different claims. That one says a chord had a hole punched in its colour;
+    # this one says the engine slipped a semitone for a moment, which is a
+    # stronger claim about a bigger mistake and the one worth watching.
+    absorbed_semitones: int = 0
 
     @property
     def touched(self) -> bool:
-        return bool(self.snapped_spans or self.absorbed_islands)
+        return bool(self.snapped_spans or self.absorbed_islands
+                    or self.absorbed_semitones)
 
 
 @dataclass(frozen=True)
@@ -251,7 +257,7 @@ class Reading:
 def profile(spans: list[GridSpan]) -> dict[int, dict[str, Reading]]:
     """root pitch class → quality → what the song plays there.
 
-    The whole track, at the reference tier. Not per section: the point of this
+    The whole track. Not per section: the point of this
     layer is to be able to speak about a bar that has no second occurrence to
     compare against, so its evidence has to come from somewhere other than the
     section.
@@ -402,6 +408,69 @@ def absorb_islands(spans: list[GridSpan], *, bar_beats: int = 4) -> tuple[list[G
     return merge(out), absorbed
 
 
+def absorb_semitone_islands(spans: list[GridSpan], *, bar_beats: int = 4
+                            ) -> tuple[list[GridSpan], int]:
+    """Absorb a brief span **a semitone away** from the identical chords around it.
+
+    The one mistake nothing else in this pipeline can touch, and the owner's third
+    symptom — `A` and `A#` in the same chart. Every near-miss gate in the building
+    is closed to it *by construction*: `harmony.similarity(A, A#)` is 0, because
+    the two triads share no pitch class at all, so `is_near_miss` says they are as
+    far apart as any two chords can be. That is the right answer to "could a
+    recognizer slide between these by hearing a third wrong" and the wrong answer
+    to "could a recognizer land a semitone out", which is a different failure with
+    a different cause: a recording between two CQT bins, or a bass note the model
+    took for a root. `absorb_islands` above cannot help either — it requires the
+    island to be on the flanks' own root, which is the whole point of it.
+
+    So the harmonic test is replaced rather than relaxed, and what replaces it is
+    **the semitone itself plus the flanks being identical**. `A | A# | A` is not a
+    progression anyone plays; it is one chord with a slip in the middle of it. A
+    fourth or a fifth away would be an ordinary passing chord and is refused here
+    exactly as it is refused there.
+
+    Three further gates, and each one is a case this rule would otherwise damage:
+
+    - **the island must be brief**, relative to what surrounds it and never longer
+      than a bar — a real chromatic chord gets a bar of its own;
+    - **it must be believed less** than either flank, which is the gate every
+      correcting layer here carries and the reason this is a no-op on perfect
+      input;
+    - **neither side may be a quality `NEVER_SNAPPED` protects.** An augmented
+      triad is one set of notes under three names, so "the chord a semitone away"
+      is not a well-formed statement about it — this is `absorb_islands`'
+      Michelle case arriving by a different road, and it is refused on the same
+      grounds.
+    """
+    if len(spans) < 3:
+        return list(spans), 0
+
+    out = list(spans)
+    absorbed = 0
+    for index in range(1, len(out) - 1):
+        before, island, after = out[index - 1], out[index], out[index + 1]
+        if (before.root_pc, before.quality) != (after.root_pc, after.quality):
+            continue
+        distance = (island.root_pc - before.root_pc) % 12
+        if distance not in (1, 11):
+            continue
+        if island.quality in NEVER_SNAPPED or before.quality in NEVER_SNAPPED:
+            continue
+        flank = min(before.length_beats, after.length_beats)
+        if island.length_beats > ISLAND_SHARE * flank or island.length_beats > bar_beats:
+            continue
+        if island.confidence >= min(before.confidence, after.confidence) - CONFIDENCE_MARGIN:
+            continue
+        out[index] = replace(island, root_pc=before.root_pc, quality=before.quality,
+                             exact=False)
+        absorbed += 1
+
+    if absorbed:
+        log.info("vocabulary: %d semitone slip(s) absorbed into the chord around them",
+                 absorbed)
+    return merge(out), absorbed
+
+
 def consolidate(spans: list[GridSpan], *, tonic_pc: int = 0, mode: str = "ionian",
                 bar_beats: int = 4) -> tuple[list[GridSpan], VocabularyReport]:
     """Both rules, in the order that makes each one see the other's work.
@@ -417,5 +486,12 @@ def consolidate(spans: list[GridSpan], *, tonic_pc: int = 0, mode: str = "ionian
     which is what lets this run as a step inside that chain.
     """
     cleaned, absorbed = absorb_islands(spans, bar_beats=bar_beats)
+    # The semitone rule after the same-root one, so a slip that is also a colour
+    # island has already been handled by the narrower rule. Both before `snap`,
+    # for the reason the docstring gives: an island is a hole rather than a
+    # reading, and removing it stops it contributing its small, doubtful mass to
+    # the profile `snap` is about to weigh.
+    cleaned, slipped = absorb_semitone_islands(cleaned, bar_beats=bar_beats)
     cleaned, snapped = snap(cleaned, tonic_pc=tonic_pc, mode=mode)
-    return cleaned, VocabularyReport(snapped_spans=snapped, absorbed_islands=absorbed)
+    return cleaned, VocabularyReport(snapped_spans=snapped, absorbed_islands=absorbed,
+                                     absorbed_semitones=slipped)

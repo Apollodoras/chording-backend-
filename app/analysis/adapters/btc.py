@@ -54,6 +54,27 @@ _HOP = 2048
 # is derived from it, and the derivation is the whole point.
 _FMIN_HZ = 32.70319566257483
 
+# How long a chord is expected to last, in frames — the decoder's stay-put prior.
+# One frame is `_HOP / _SAMPLE_RATE` ≈ 93 ms, so 21 frames is about two seconds,
+# which is a bar at most tempos in this repertoire.
+#
+# **Measured, and the shape is the reassuring one.** Swept over the ten-song
+# chart corpus from the cached posteriors (8 / 15 / 21 / 30 / 45 frames): root
+# 0.856 / 0.857 / 0.857 / 0.857 / 0.857 against the argmax's 0.853. A broad flat
+# optimum rather than a peak, so the value is not perched on the edge of the
+# measurement, and every setting beats no decoder at all.
+_DECODE_CHORD_FRAMES = 21.0
+
+# Posteriors below this are clipped before the log, so a class the model gave
+# exactly zero cannot make the whole path -inf.
+_DECODE_FLOOR = 1e-6
+
+# How much of each inference window the next one repeats. A quarter, so every
+# frame is inside at least one window that saw ~40 frames of context on each side
+# — see `BtcEngine._posteriors`. Costs a third more forward passes, which on a
+# three-minute track is a few seconds against the CQT's own cost.
+_WINDOW_OVERLAP = 0.25
+
 # sha256 of `test/btc_model_large_voca.pt` in the BTC checkout at the commit
 # `modal_app.BTC_COMMIT` pins (2682317b), measured from the vendored copy.
 #
@@ -264,7 +285,7 @@ class BtcEngine:
     The large-vocabulary head is the right one here even though the app's grammar
     is much smaller (§12.2): asking for `maj/min` only would throw away the
     sevenths and slash chords *before* normalization gets to decide what to do
-    with them, and §5.5's `hard` tier exists precisely to keep some of that.
+    with them, and the chart is supposed to state what was played.
     """
 
     name = "btc"
@@ -353,30 +374,99 @@ class BtcEngine:
             return []
         features = (features - self._mean) / self._std
 
-        pad = (-features.shape[0]) % _TIMESTEP
-        if pad:
-            features = np.pad(features, ((0, pad), (0, 0)), mode="constant")
-        windows = features.shape[0] // _TIMESTEP
+        probabilities = self._posteriors(np, torch, features)
+        if probabilities.shape[0] == 0:
+            return []
 
-        predictions: list[int] = []
-        confidences: list[float] = []
+        predictions = _viterbi(np, probabilities)
+        # On what this number is and is not (F4): it is a **probability**, not a
+        # calibrated one. Max-softmax over 170 classes is famously overconfident,
+        # and §20 applies 0.02-wide margins to it — decisions finer than the
+        # signal can carry. Two things were done about that and a third was not:
+        # the span now publishes the posterior of the label it actually claims
+        # (below), which is at least the right quantity; and the decoder means
+        # that label is chosen with the whole sequence in view rather than one
+        # frame. Temperature-scaling it against a labelled set is the real fix,
+        # it belongs in `bench/run_bench.py --calibration` where the labelled set
+        # already is, and it cannot be judged by itself — every threshold in the
+        # theory layer was tuned against *this* distribution, so recalibrating
+        # means re-sweeping them in the same change.
+        # The probability of **what the chart claims**, not of whatever the frame
+        # liked best. Where the decoder overrules a one-frame argmax the two
+        # differ, and it is the first that this span is entitled to publish: a
+        # span labelled `Bm` may not carry the confidence the model had in `Bm7`.
+        # It is also the more honest number for §5.4.6's gate and for §20's
+        # margins, which read confidence as "how much do we believe this label".
+        confidences = probabilities[np.arange(probabilities.shape[0]), predictions]
+
+        return _spans(self._labels, predictions.tolist(), confidences.tolist(), times_s)
+
+    def _posteriors(self, np, torch, features):
+        """Per-frame 170-class posteriors for the whole track.
+
+        BTC is a fixed-window transformer: `_TIMESTEP` frames go in, `_TIMESTEP`
+        frames of logits come out, and it has no state between calls. Tiling the
+        song with non-overlapping windows therefore gives every window boundary a
+        frame that saw no context on one side — a chord straddling a join is read
+        from half its evidence, and the model's own attention cannot reach across.
+
+        So the windows **overlap by a quarter** and their posteriors are combined
+        with a triangular weight, heaviest at each window's centre and tapering to
+        nothing at its edges. Every frame is then read mostly from the window that
+        saw the most context around it, and no frame is decided by a window that
+        only just contains it. The last window is padded with zeros as before,
+        because the recording has to end somewhere, but its padded frames are
+        dropped rather than blended in.
+
+        **Measured: chords flat, form +0.008, cost nil.** Over the chart corpus
+        root and triad come out identical to three decimals and the form score
+        goes 0.747 → 0.755 (Viva La Vida 0.667 → 1.000, Wonderwall +0.016 root,
+        Smooth Criminal −0.023 and it is the corpus's known outlier). The reason
+        the chord columns do not move is worth keeping: `_features` already gives
+        every block `_context_frames()` hops of its neighbours, so the *transform*
+        never saw a boundary — only the transformer's attention did, and a
+        ten-second window is long against a chord.
+
+        A third more forward passes buys that, and it is free in practice: the
+        whole eleven-song feature build went 493 s to 481 s, because the CQT
+        rather than the transformer is what the time goes on. Kept for the form,
+        and because "no frame is decided by a window that only just contains it"
+        is the property one wants when the next engine is faster.
+        """
+        n_frames = features.shape[0]
+        if n_frames == 0:
+            return np.zeros((0, 170), dtype="float32")
+        stride = max(1, int(_TIMESTEP * (1.0 - _WINDOW_OVERLAP)))
+        # Frame k's weight inside a window: 1 at the centre, tapering to ~0 at the
+        # edges. Never exactly 0, so a frame covered by exactly one window (the
+        # first and last few) still gets a usable number.
+        offsets = np.arange(_TIMESTEP, dtype="float32")
+        weight = 1.0 - np.abs(offsets - (_TIMESTEP - 1) / 2.0) / (_TIMESTEP / 2.0)
+        weight = np.maximum(weight, 1e-3)
+
+        total = np.zeros((n_frames, 170), dtype="float32")
+        mass = np.zeros((n_frames, 1), dtype="float32")
+        starts = list(range(0, max(1, n_frames - _TIMESTEP + 1), stride))
+        if starts[-1] + _TIMESTEP < n_frames:
+            starts.append(n_frames - _TIMESTEP)
+        if n_frames < _TIMESTEP:
+            starts = [0]
+
         with torch.no_grad():
-            tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
-            for index in range(windows):
-                window = tensor[:, _TIMESTEP * index: _TIMESTEP * (index + 1), :]
-                encoded, _ = self._model.self_attn_layers(window)
+            for start in starts:
+                block = features[start:start + _TIMESTEP]
+                used = block.shape[0]
+                if used < _TIMESTEP:
+                    block = np.pad(block, ((0, _TIMESTEP - used), (0, 0)),
+                                   mode="constant")
+                tensor = torch.tensor(block, dtype=torch.float32).unsqueeze(0)
+                encoded, _ = self._model.self_attn_layers(tensor)
                 logits = self._model.output_layer(encoded)
-                probabilities = torch.softmax(logits, dim=-1).squeeze(0)
-                best = torch.max(probabilities, dim=-1)
-                predictions.extend(best.indices.tolist())
-                confidences.extend(best.values.tolist())
+                window = torch.softmax(logits, dim=-1).squeeze(0).numpy()[:used]
+                total[start:start + used] += window * weight[:used, None]
+                mass[start:start + used] += weight[:used, None]
 
-        # Trim the frames that only exist because of the padding.
-        if pad:
-            predictions = predictions[:-pad]
-            confidences = confidences[:-pad]
-
-        return _spans(self._labels, predictions, confidences, times_s)
+        return total / np.maximum(mass, 1e-6)
 
 
 def _features(np, pcm, tuning: Tuning = CONCERT_PITCH):
@@ -447,6 +537,83 @@ def _features(np, pcm, tuning: Tuning = CONCERT_PITCH):
         return np.zeros((0, _N_BINS), dtype="float32"), []
     spectrum = np.concatenate(blocks, axis=1)
     return np.log(np.abs(spectrum) + 1e-6).T.astype("float32"), times
+
+
+def _viterbi(np, probabilities):
+    """The most likely label *sequence*, rather than the best label per frame.
+
+    BTC emits a full 170-class posterior for every 93 ms frame, and this adapter
+    used to keep the argmax of each one and throw the distribution away. That is
+    the whole of the "engine flicker" the theory layer downstream spends three
+    modules cleaning up: two chords sharing three notes — `Bm` and `Bm7`, `C` and
+    `Cm`, a root and its relative — trade places frame to frame whenever the
+    posterior is close, and each trade becomes a span. Nothing later can tell
+    that noise from music, because by then the distribution that would have said
+    "these were 0.31 against 0.29" is gone.
+
+    So the decision is taken while the evidence is still here, with the one
+    assumption that is true of every song in this repertoire: **a chord persists**.
+    The transition model is uniform stay-or-switch — `P(stay) = 1 - 1/L` for an
+    expected chord length of `_DECODE_CHORD_FRAMES` frames, the rest shared out
+    over the other 169 labels — which is deliberately not a model of harmony. It
+    knows nothing about which chord follows which, and it should not: a
+    transition table learned on someone else's corpus would quietly impose that
+    corpus's key habits on every recording this service sees.
+
+    Uniform switching also makes the recursion linear rather than quadratic in
+    the label count. The best predecessor of state *j* is either *j* itself or
+    the globally best state, so one `argmax` per frame serves all 170 — 170×
+    cheaper than the textbook form, and the reason this costs a few milliseconds
+    against a transformer's forty seconds.
+
+    `chroma.py` has had this since it was written, which is the awkward part of
+    the finding: the *fallback* engine was the one that decoded, and the primary
+    engine was the one that did not.
+
+    **What it is worth, measured** on the ten-song chart corpus, decoding cached
+    posteriors so the transformer ran once: root 0.853 → 0.857, triad 0.846 →
+    0.849, and the emitted vocabulary falls from 71 distinct chords to 64 across
+    the ten songs, with a quarter of the spans gone (1624 → 1235). The accuracy
+    gain is smaller than the span reduction suggests, and the reason is worth
+    recording rather than explaining away: `postprocess.quantize` snaps every
+    boundary to a beat and `drop_short` removes anything under one beat, so most
+    single-frame flicker was already being absorbed downstream. What the decoder
+    adds on top of that is the flicker *long enough to survive quantization* —
+    and the cleaner span list every later stage reasons about.
+
+    **Beat-synchronous decoding was tried here and is measurably worse.** Pooling
+    the posteriors between beat times and running this same recursion over beats
+    (the stronger form the audit recommended) scores root 0.809 at four beats per
+    chord and 0.799 at eight, against 0.857 here — a loss of five points. It buys
+    form (0.688 → 0.742) and a smaller vocabulary, because pooling plus a
+    bar-length prior drags the chart toward fewer, longer chords; but it pays for
+    that by flattening every change that lands off the beat the pooling window
+    owns, and this pipeline already has a layer whose job is to state the form
+    (§21, `canon.py`) and which does it without giving up chords. Decoding at
+    frame resolution and quantizing afterwards keeps both.
+    """
+    n_frames, n_states = probabilities.shape
+    log_emission = np.log(np.clip(probabilities, _DECODE_FLOOR, None))
+    stay = np.log(1.0 - 1.0 / _DECODE_CHORD_FRAMES)
+    switch = np.log((1.0 / _DECODE_CHORD_FRAMES) / (n_states - 1))
+
+    states = np.arange(n_states)
+    delta = log_emission[0].copy()
+    backpointers = np.zeros((n_frames, n_states), dtype="int32")
+    for t in range(1, n_frames):
+        best_other = int(np.argmax(delta))
+        via_switch = delta[best_other] + switch
+        stay_scores = delta + stay
+        take_stay = stay_scores >= via_switch
+        backpointers[t] = np.where(take_stay, states, best_other)
+        delta = np.where(take_stay, stay_scores, via_switch) + log_emission[t]
+        delta -= delta.max()        # renormalise; only differences matter
+
+    path = np.zeros(n_frames, dtype="int32")
+    path[-1] = int(np.argmax(delta))
+    for t in range(n_frames - 1, 0, -1):
+        path[t - 1] = backpointers[t, path[t]]
+    return path
 
 
 def _spans(labels, predictions, confidences, times_s) -> list[RawChordSpan]:

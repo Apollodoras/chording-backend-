@@ -14,20 +14,20 @@ The order matters and is §5.4's:
 3. **drop** spans shorter than a beat,
 4. **fill** N/C gaps — *hold the previous chord* (§18: there is no rest primitive;
    a stroke always sounds a chord),
-5. **simplify by difficulty** (§5.5 as re-scoped by §12.2),
-6. **confidence gate** (§5.4.6).
+5. **confidence gate** (§5.4.6).
 
-One thing worth stating because it is easy to get wrong: simplification can
-create *new* adjacent duplicates (a `Cmaj7` next to a `C` both become `C` at
-`easy`), so merging runs again afterwards is not belt-and-braces — without it the
-easy chart shows the player a chord change that doesn't happen.
+§5.5's difficulty simplification used to be step 5 of this chain, and it is gone.
+The only reduction left is the one `normalize` cannot avoid — the app's grammar
+is a closed vocabulary — and it is *counted* (`exact_ratio`) rather than chosen.
+A chart that prints G where the record plays Gmaj7 is not an easier chart, it is
+a wrong one.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
 
-from ..chords import DIFFICULTIES, EASY, normalize, simplify
+from ..chords import normalize
 from .axis import BeatAxis
 from .types import GridSpan, RawChordSpan
 
@@ -35,9 +35,6 @@ from .types import GridSpan, RawChordSpan
 # IS the floor, and it is the more honest of the two — at 60 bpm a 250 ms span is
 # a quarter of a beat, at 180 bpm it is most of one.
 MIN_SPAN_BEATS = 1
-
-# §5.5's other half: at `easy`, "drop passing chords shorter than a bar".
-EASY_MIN_SPAN_BARS = 1
 
 
 def quantize(spans: list[RawChordSpan], axis: BeatAxis) -> list[GridSpan]:
@@ -123,8 +120,20 @@ def merge(spans: list[GridSpan]) -> list[GridSpan]:
                 # downbeat. Dropping the second silently kept whichever the sort
                 # happened to reach first, so the chart could show the passing
                 # chord and lose the one the bar is in. Keep the one with more
-                # evidence — the longer, and on a tie the more confident.
-                if (span.length_beats, span.confidence) > (last.length_beats, last.confidence):
+                # evidence.
+                #
+                # **Evidence is duration × confidence**, not duration and then
+                # confidence. Ordering the pair lexicographically made length win
+                # outright, so a four-beat span the engine hedged at 0.3 beat a
+                # one-beat span it was sure of — and the second reading is worth
+                # more than the first by any reading of what a posterior means.
+                # This is `vocabulary.Reading.mass`, which is the same quantity
+                # under the same argument; the tie-break behind it keeps the
+                # result independent of the sort order (§16.5 wants byte-stable
+                # output).
+                mine = (span.length_beats * span.confidence, span.length_beats)
+                theirs = (last.length_beats * last.confidence, last.length_beats)
+                if mine > theirs:
                     out[-1] = span
         else:
             if span.start_beat > last.end_beat:
@@ -140,6 +149,15 @@ def drop_short(spans: list[GridSpan], min_beats: int = MIN_SPAN_BEATS) -> list[G
     Not "delete": the beats have to go *somewhere*, and handing them back to the
     neighbour is what makes a run of jitter read as one held chord. A too-short
     first span is absorbed forward instead, into whatever follows it.
+
+    At the one-beat floor this is cleaning up jitter inside a held chord, so the
+    previous chord is always the right home. There used to be a `to_longer` mode
+    that gave each short span to its *longer* neighbour instead, because at
+    `easy`'s one-*bar* floor the rule was doing something else entirely —
+    deciding which of two real chords a beginner sees, where always reaching left
+    swallowed the `| IV V |` cadence bar that resolves a phrase. That floor was
+    the difficulty tiers' and went with them; at one beat there is no second real
+    chord to choose between.
     """
     if not spans:
         return []
@@ -148,7 +166,8 @@ def drop_short(spans: list[GridSpan], min_beats: int = MIN_SPAN_BEATS) -> list[G
     for span in spans:
         if span.length_beats < min_beats:
             if kept:
-                kept[-1] = replace(kept[-1], length_beats=kept[-1].length_beats + span.length_beats)
+                kept[-1] = replace(kept[-1],
+                                   length_beats=kept[-1].length_beats + span.length_beats)
             else:
                 pending_beats += span.length_beats
             continue
@@ -172,6 +191,18 @@ def hold_through_gaps(spans: list[GridSpan], total_beats: int | None = None) -> 
     For a genuinely long instrumental gap the handoff's other option is a section
     of its own with a sparse pattern; that is a structure decision and lives in
     `structure.py`, not here.
+
+    **What the fill costs, and how much of it has been paid back** (F33). The
+    2026-08-18 audit's suggestion was to keep N.C. internally and fill only at
+    compile time, which would buy three things: a key detected on what the band
+    played, no phantom chords in a break, and sections with no harmony able to
+    say so. The first is now had for free — `keyfinder` reads `process(...,
+    fill=False)` and never sees a held chord (see `process`). The other two need
+    an N.C. that survives all the way to `compile`, and that is a change to what a
+    `GridSpan` *is* rather than to where this function is called: every consumer
+    between here and the wire assumes a contiguous timeline (`bars_from_spans`,
+    `form`, `consensus`, `canon`, `axis`), and §18 has no rest primitive to hand
+    them. Worth doing, not worth doing halfway.
     """
     if not spans:
         return []
@@ -192,27 +223,6 @@ def hold_through_gaps(spans: list[GridSpan], total_beats: int | None = None) -> 
     return out
 
 
-def simplify_tier(spans: list[GridSpan], difficulty: str, *, bar_beats: int = 4) -> list[GridSpan]:
-    """Render the same analysis at one of the three difficulties (§5.5).
-
-    Computed from one analysis, never re-analyzed per difficulty. The re-merge at
-    the end is load-bearing: collapsing `Cmaj7` and `C` onto `C` at `easy` puts
-    two identical chords next to each other, and showing the player a chord
-    change that doesn't happen is worse than the extension they lost.
-    """
-    if difficulty not in DIFFICULTIES:
-        raise ValueError(f"unknown difficulty {difficulty!r}")
-
-    simplified = [replace(s, quality=simplify(s.quality, difficulty)) for s in spans]
-    merged = merge(simplified)
-    if difficulty == EASY:
-        # "Drop passing chords shorter than a bar" — the harmonic-rhythm half of
-        # `easy`, and the reason an easy chart has fewer changes rather than just
-        # simpler names.
-        merged = merge(drop_short(merged, min_beats=EASY_MIN_SPAN_BARS * bar_beats))
-    return merged
-
-
 def mean_confidence(spans: list[GridSpan]) -> float:
     """Track-level confidence, weighted by how long each chord is heard.
 
@@ -231,14 +241,14 @@ def mean_confidence(spans: list[GridSpan]) -> float:
 def exact_ratio(spans: list[GridSpan]) -> float:
     """How much of the track survived normalization without losing information.
 
-    A low ratio is the honest signal that `hard` is not really "the full detected
-    quality" on this recording — a jazz track reduced to triads and dominant 7ths
+    A low ratio is the honest signal that the chart is not really "what was
+    played" on this recording — a jazz track reduced to triads and dominant 7ths
     is a different song, and this is the number that says so.
 
-    Computed on the **reference tier's** spans, in `model.build`, and carried out
-    on the sidecar as `analysis.exactRatio`. It has to be the reference tier: at
-    `easy` every extension is flattened by design, so an exact ratio measured
-    there would describe the tier rather than the recording.
+    Computed in `model.build` and carried out on the sidecar as
+    `analysis.exactRatio`. Now that the chart is the only render, this measures
+    the grammar's ceiling and nothing else — which is the only thing it was ever
+    supposed to mean.
     """
     if not spans:
         return 0.0
@@ -249,19 +259,29 @@ def exact_ratio(spans: list[GridSpan]) -> float:
 
 
 def process(spans: list[RawChordSpan], axis: BeatAxis, *,
-            difficulty: str, total_beats: int | None = None) -> list[GridSpan]:
-    """The whole §5.4 chain, in order. The pipeline calls this once per tier.
+            total_beats: int | None = None,
+            fill: bool = True) -> list[GridSpan]:
+    """The whole §5.4 chain, in order. One analysis, one chart.
 
     `total_beats` defaults to the axis's own length, which is what makes the
     chart cover the **whole recording**: without it the harmony stopped at the
     last chord the engine was confident about, and the bars after that were
     simply dropped (§5.4's hold rule applied to the end of the song, not just to
     the gaps inside it).
+
+    `fill=False` stops before step 4 — the chords the engine actually reported,
+    with the silences still silent. Nothing playable comes out of it (§18 has no
+    rest, and a section of empty bars is dropped by the importer), and it has
+    exactly one caller: `keyfinder.detect_key`, which is measuring *what the song
+    plays* rather than *what the chart shows*. Holding a chord across a
+    forty-second instrumental break triples its weight in a duration-weighted bag
+    of chords, and the key then partly describes the arrangement's gaps.
     """
     quantized = quantize(spans, axis)
     merged = merge(quantized)
     trimmed = drop_short(merged)
-    filled = hold_through_gaps(
+    if not fill:
+        return trimmed
+    return hold_through_gaps(
         trimmed, total_beats=axis.total_beats if total_beats is None else total_beats
     )
-    return simplify_tier(filled, difficulty, bar_beats=axis.bar_beats)

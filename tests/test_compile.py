@@ -16,7 +16,7 @@ from app.analysis.compile import compile_song
 from app.analysis.keyfinder import DetectedKey
 from app.analysis.strumming import fallback
 from app.analysis.structure import BarChord, Section
-from app.chords import EASY, MAJOR, MINOR, NORMAL
+from app.chords import MAJOR, MINOR
 from app.lint import lint, repair
 from app.payload import CompositionPayload
 
@@ -200,13 +200,13 @@ def test_the_song_id_is_deterministic_so_re_analysis_replaces_the_library_row():
     assert first.id == second.id == "yt:dQw4w9WgXcQ"
 
 
-def test_each_difficulty_gets_its_own_row():
-    """So all three tiers can coexist without `import` upserting one over
-    another."""
+def test_a_video_has_exactly_one_song_id():
+    """The id used to carry a difficulty suffix so one video could hold three
+    Library rows. One recording, one chart, one row — and re-analyzing it upserts
+    that row rather than adding another."""
     section = Section(kind="verse", bars=[bar(whole(7)), bar(whole(2)),
                                           bar(whole(4, MINOR)), bar(whole(0))])
-    assert build([section], difficulty=EASY).id == "yt:dQw4w9WgXcQ:easy"
-    assert build([section], difficulty=NORMAL).id == "yt:dQw4w9WgXcQ:normal"
+    assert build([section]).id == "yt:dQw4w9WgXcQ"
 
 
 def test_song_ids_are_namespaced_away_from_mo():

@@ -19,9 +19,12 @@ way three private copies of "which beat is this?" once did (see `axis.py`).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field, replace
 
 from .types import GridSpan
+
+log = logging.getLogger("chords.structure")
 
 # §15's practical floor: "one section per structural segment, minimum ~4 bars".
 MIN_SECTION_BARS = 4
@@ -92,6 +95,16 @@ def bars_from_spans(spans: list[GridSpan], bar_beats: int) -> list[list[BarChord
 
     Trailing beats that don't complete a bar are dropped: a partial bar has no
     downbeat to anchor and would put every later bar off the grid.
+
+    **A bar no chord covers is filled, never dropped.** It cannot happen today —
+    `postprocess.hold_through_gaps` makes the timeline contiguous from beat 0
+    before this is ever called — but "cannot happen" was an invariant enforced in
+    a different module, and the failure if it ever stopped holding is silent and
+    total: dropping bar *k* shifts every bar after it by one, so the sections, the
+    `start_bar` each one publishes, and the sidecar's anchors all move relative to
+    the chart while every self-consistency check still passes. Holding the
+    previous chord across the hole is §18's own rule (a stroke always sounds
+    something) and it keeps bar *k* at index *k* whatever happens upstream.
     """
     if not spans or bar_beats <= 0:
         return []
@@ -114,7 +127,30 @@ def bars_from_spans(spans: list[GridSpan], bar_beats: int) -> list[list[BarChord
                 start_beat=float(lo - bar_start), length_beats=float(hi - lo),
                 confidence=span.confidence,
             ))
-    return [bar for bar in bars if bar]
+    return _without_holes(bars)
+
+
+def _without_holes(bars: list[list[BarChord]]) -> list[list[BarChord]]:
+    """Fill any bar no chord reached, so indices cannot shift. See above."""
+    if all(bars):
+        return bars
+    lead = next((bar for bar in bars if bar), None)
+    if lead is None:
+        return []
+    log.warning("%d bar(s) had no chord covering them — held rather than dropped, "
+                "so bar indices stay put", sum(1 for bar in bars if not bar))
+    filled: list[list[BarChord]] = []
+    carried = lead[-1]
+    for bar in bars:
+        if bar:
+            carried = bar[-1]
+            filled.append(bar)
+            continue
+        beats = sum(c.length_beats for c in filled[-1]) if filled else carried.length_beats
+        filled.append([BarChord(root_pc=carried.root_pc, quality=carried.quality,
+                                start_beat=0.0, length_beats=float(beats),
+                                confidence=carried.confidence)])
+    return filled
 
 
 def spans_from_bars(bars: list[list[BarChord]], bar_beats: int) -> list[GridSpan]:

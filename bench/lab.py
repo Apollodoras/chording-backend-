@@ -199,8 +199,14 @@ def load_features(slug: str) -> dict:
 # assembling
 # --------------------------------------------------------------------------
 
-def assemble(slug: str, entry: dict, cached: dict | None = None):
-    """Cached features → an `AnalysisOutcome`, through the real `assemble`."""
+def assemble(slug: str, entry: dict, cached: dict | None = None, **overrides):
+    """Cached features → an `AnalysisOutcome`, through the real `assemble`.
+
+    `overrides` replace fields on the loaded `Settings` — which is what makes the
+    per-layer attribution below possible without a subprocess per posture.
+    """
+    from dataclasses import replace as _replace
+
     from app.analysis.pipeline import assemble as real_assemble
     from app.analysis.tuning import Tuning
     from app.config import load_settings
@@ -215,21 +221,22 @@ def assemble(slug: str, entry: dict, cached: dict | None = None):
                      duration_s=duration_s, channel_id="")
     chords_name, chords_version = cached["engines"]["chords"].split("@", 1)
     beats_name, beats_version = cached["engines"]["beats"].split("@", 1)
+    settings = load_settings()
+    if overrides:
+        settings = _replace(settings, **overrides)
     return real_assemble(
         meta=meta, grid=grid, raw=raw, onsets=onsets, energy=energy,
-        settings=load_settings(), tuning=Tuning(cached["tuning"]["semitones"]),
+        settings=settings, tuning=Tuning(cached["tuning"]["semitones"]),
         chords_engine=EngineInfo(chords_name, chords_version),
         beats_engine=EngineInfo(beats_name, beats_version),
     )
 
 
-def system_chart(slug: str, entry: dict, cached: dict | None = None):
-    from app.chords import NORMAL
+def system_chart(slug: str, entry: dict, cached: dict | None = None, **overrides):
     from bench.chartref import chart_from_payload
 
-    outcome = assemble(slug, entry, cached)
-    song = outcome.songs.get(NORMAL) or next(iter(outcome.songs.values()))
-    chart = chart_from_payload(song, title=entry.get("title", slug),
+    outcome = assemble(slug, entry, cached, **overrides)
+    chart = chart_from_payload(outcome.song, title=entry.get("title", slug),
                                artist=entry.get("artist", ""))
     return chart, outcome
 
@@ -327,12 +334,88 @@ def cmd_grade(args) -> int:
     return 0
 
 
+# Which theory layers each posture has on. Cumulative and in pipeline order, so
+# every row is the row above it plus one layer, and the column deltas read as
+# "what that layer is worth on this corpus".
+#
+# The first row is the **engine's own chart** — `postprocess` and nothing else —
+# which is the row the audit's F32 was asking for and the one nothing here used
+# to be able to print. Without it "sometimes it's the engines, sometimes the
+# theory layer" is not a question the repo can answer for any given song, and
+# every threshold below it is set by feel.
+LAYERS: tuple[tuple[str, dict], ...] = (
+    ("engine only", dict(theory_vocabulary=False, theory_key_audit=False,
+                         theory_consensus=False, theory_belief=False,
+                         theory_form=False)),
+    ("+ vocabulary  §20.8", dict(theory_key_audit=False, theory_consensus=False,
+                                 theory_belief=False, theory_form=False)),
+    ("+ key audit   §20.10", dict(theory_consensus=False, theory_belief=False,
+                                  theory_form=False)),
+    ("+ consensus   §20.4", dict(theory_belief=False, theory_form=False)),
+    ("+ belief      §20.9", dict(theory_form=False)),
+    ("+ form        §21", dict()),
+)
+
+
+def cmd_layers(args) -> int:
+    """Score every song once per posture — the per-layer attribution.
+
+    One `assemble` per (song × posture) out of the cached features, so the whole
+    table costs about five grades and answers the question the audit opened with:
+    for this song, is the error the engine's or the theory layer's?
+    """
+    from bench.grade_chart import grade
+    from bench.chartref import load_chart
+
+    selected = _selected(args)
+    postures = [row for row in LAYERS
+                if not args.layer or row[0].split()[0].lstrip("+") in args.layer]
+    table: dict[str, dict[str, dict]] = {}
+    for slug, entry in selected.items():
+        path = REFERENCE / f"{slug}.chart"
+        if not path.exists():
+            continue
+        reference = load_chart(path)
+        for name, overrides in postures:
+            try:
+                chart, _ = system_chart(slug, entry, **overrides)
+                table.setdefault(name, {})[slug] = grade(reference, chart)
+            except Exception as error:                      # noqa: BLE001
+                print(f"{slug} @ {name}: FAILED {type(error).__name__}: {error}")
+
+    if args.verbose:
+        songs = sorted({slug for row in table.values() for slug in row})
+        print(f"\n{'song':<24}" + "".join(f"{n.split()[0][:9]:>10}" for n, _ in postures))
+        for slug in songs:
+            cells = "".join(
+                f"{table.get(name, {}).get(slug, {}).get('scores', {}).get('root', float('nan')):>10.3f}"
+                for name, _ in postures)
+            print(f"{slug:<24}{cells}")
+
+    print(f"\n{'posture':<22}{'root':>7}{'triad':>7}{'form':>7}{'tonics':>8}{'Δroot':>8}")
+    previous = None
+    for name, _ in postures:
+        rows = list(table.get(name, {}).values())
+        if not rows:
+            continue
+        root = sum(r["scores"]["root"] for r in rows) / len(rows)
+        triad = sum(r["scores"]["triad"] for r in rows) / len(rows)
+        shape = sum(r["scores"]["form"] for r in rows) / len(rows)
+        tonics = sum(1 for r in rows if r["key"]["tonicMatch"])
+        delta = "" if previous is None else f"{root - previous:+8.3f}"
+        print(f"{name:<22}{root:>7.3f}{triad:>7.3f}{shape:>7.3f}"
+              f"{tonics:>5}/{len(rows):<2}{delta:>8}")
+        previous = root
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     for name, handler in (("fetch", cmd_fetch), ("features", cmd_features),
-                          ("chart", cmd_chart), ("grade", cmd_grade)):
+                          ("chart", cmd_chart), ("grade", cmd_grade),
+                          ("layers", cmd_layers)):
         child = sub.add_parser(name)
         child.add_argument("--slug", action="append")
         child.add_argument("--force", action="store_true")
@@ -340,6 +423,8 @@ def main() -> int:
         child.add_argument("--render", action="store_true")
         child.add_argument("--verbose", "-v", action="store_true")
         child.add_argument("--limit", type=int, default=64)
+        child.add_argument("--layer", action="append",
+                           help="layers only: restrict to these postures")
         child.add_argument("--width", type=int, default=4,
                            help="bars per printed line (display only; see render_chart)")
         child.set_defaults(handler=handler)

@@ -178,10 +178,10 @@ def apply(bars: list[list[BarChord]], groups: list[RepeatGroup], *,
     `record` is the exception to "not mutated": what the vote did is written back
     onto each `RepeatGroup` (`rewritten_bars`, `contested_bars`, `canonical`) so
     the provenance travels with the group it describes. Those objects are
-    **shared** — `model.render` votes over the same groups once per difficulty
-    tier — and a tier's vote is a render of the reference one, not a new finding
-    about the song. So renders pass `record=False` and the numbers on the groups
-    keep describing the reference vote rather than whichever tier compiled last.
+    **shared** — `model.render` replays the vote over the same groups `build`
+    voted over — and a replay is a read of that finding, not a new one. So
+    renders pass `record=False` and the numbers on the groups keep describing
+    the vote `build` took.
 
     `weigh` turns §20.9 off, the same posture `theory_consensus` and
     `theory_vocabulary` already support. With it off the count is the only
@@ -210,13 +210,21 @@ def apply(bars: list[list[BarChord]], groups: list[RepeatGroup], *,
             if outcome is None and weigh:
                 # §20.9. Only ever reached where the count already gave up, so
                 # this can add corrections and can never overturn one.
-                outcome = _weigh(candidates, tonic_pc=tonic_pc, mode=mode)
-                by_belief = outcome is not None
+                weighed_outcome = _weigh(candidates, tonic_pc=tonic_pc, mode=mode)
+                if weighed_outcome is not None:
+                    outcome = (*weighed_outcome, False)
+                    by_belief = True
             if outcome is None:
                 group_contested.append(slot)
                 contested += 1
                 continue
-            winner, losers = outcome
+            winner, losers, refused = outcome
+            if refused:
+                # Partly settled: some occurrences took the group's reading and
+                # at least one kept its own. Both facts are true of this slot and
+                # both are reported.
+                group_contested.append(slot)
+                contested += 1
             for index in losers:
                 out[positions[index]] = _adopt(winner, out[positions[index]])
                 group_rewritten += 1
@@ -241,12 +249,16 @@ def apply(bars: list[list[BarChord]], groups: list[RepeatGroup], *,
 
 
 def _vote(candidates: list[list[BarChord]], *, bar_beats: float,
-          tonic_pc: int, mode: str) -> tuple[list[BarChord], list[int]] | None:
-    """One bar slot across a group's occurrences → (winner, indices to rewrite).
+          tonic_pc: int, mode: str) -> tuple[list[BarChord], list[int], bool] | None:
+    """One bar slot across a group's occurrences → (winner, indices to rewrite,
+    whether any occurrence refused).
 
-    None means **contested**: the gates did not all hold, so this slot is left
-    exactly as every occurrence played it. An empty loser list means there was
-    nothing to decide — every occurrence already agreed.
+    None means **contested with nothing settled**: no occurrence could be
+    rewritten, so this slot is left exactly as every one of them played it. An
+    empty loser list means there was nothing to decide — every occurrence already
+    agreed. The third element is true when at least one occurrence held its own
+    reading against the winner, which makes the slot contested *as well as*
+    partly rewritten — a state this function could not previously express.
 
     Those two are emphatically not the same thing, and conflating them makes the
     reported numbers lie: a song whose verses match perfectly would report every
@@ -258,7 +270,7 @@ def _vote(candidates: list[list[BarChord]], *, bar_beats: float,
         tally.setdefault(_signature(bar), []).append(index)
 
     if len(tally) == 1:
-        return candidates[0], []   # unanimous — nothing to do, nothing contested
+        return candidates[0], [], False   # unanimous — nothing to do, nothing contested
 
     ranked = sorted(
         tally.items(),
@@ -278,16 +290,40 @@ def _vote(candidates: list[list[BarChord]], *, bar_beats: float,
     winner = candidates[winning_indices[0]]
     winner_confidence = _mean_confidence([candidates[i] for i in winning_indices])
 
+    # **Gates 2 and 3 are asked of each loser, not of the slot.** They used to
+    # abandon the whole slot on the first occurrence that failed either — and
+    # that is inverted for the case the layer exists for. A bar read `A#` while
+    # three passes of the verse read `A` scores similarity 0 against the winner
+    # (the two triads share no pitch class), so it fails gate 2 outright; the
+    # slot is abandoned; and the three passes that *were* near-misses of the
+    # winner, and believed less, keep their own readings too. The more wrong one
+    # occurrence is, the more protection it bought for every other.
+    #
+    # Deciding per loser removes that and adds no licence whatsoever: every
+    # occurrence that is rewritten still clears both gates **individually**,
+    # exactly as it had to before. What changes is only that failing them no
+    # longer speaks for anybody else. The slot is still reported contested
+    # whenever any occurrence refused, because that is what the number means —
+    # there is a real difference in this bar — and a caller reading
+    # `contested_bars` alongside `rewritten_bars` now learns something it could
+    # not: that the two can be true of the same slot.
     losers: list[int] = []
+    refused = False
     for signature, indices in ranked[1:]:
         for index in indices:
             other = candidates[index]
             if bar_similarity(winner, other, bar_beats) < harmony.NEAR_MISS:
-                return None                                  # gate 2
+                refused = True                               # gate 2
+                continue
             if _mean_confidence([other]) >= winner_confidence - CONFIDENCE_MARGIN:
-                return None                                  # gate 3
+                refused = True                               # gate 3
+                continue
             losers.append(index)
-    return winner, losers
+    if refused and not losers:
+        # Nothing survived either gate — the old answer, and still the right one:
+        # a slot where every dissenter is entitled to its reading is contested.
+        return None
+    return winner, losers, refused
 
 
 def _weigh(candidates: list[list[BarChord]], *, tonic_pc: int, mode: str

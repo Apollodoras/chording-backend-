@@ -105,6 +105,40 @@ def test_a_genuinely_different_chord_is_never_flattened():
     assert out[15][0].root_pc == F, "the real chord change survived the vote"
 
 
+def test_a_gross_outlier_no_longer_protects_the_near_miss_beside_it():
+    """The inversion the 2026-08-18 audit found (F14), and the case it costs.
+
+    Five passes of a verse: three end on C, one on a doubtful Am (a near-miss the
+    vote is *for*), and one on F (a real chord change the vote must not touch).
+    Both gates used to be asked of the **slot**, so the F — the reading furthest
+    from the winner — aborted the whole vote and the Am shipped as well. The more
+    wrong one occurrence was, the more protection it bought for every other.
+
+    Asked per occurrence instead, the Am is corrected and the F stands. Nothing
+    is rewritten that could not be rewritten before: the Am still had to clear
+    both gates on its own. And the slot is reported **contested as well as
+    rewritten**, because both are now true of it.
+    """
+    bars = (verse() + verse() + verse()
+            + verse(NEAR, confidence=0.2) + verse(DISTANT, confidence=0.05))
+    out, report = consensus.apply(bars, [group(0, 4, 8, 12, 16)], bar_beats=4.0)
+    assert report.rewritten_bars == 1
+    assert out[15][0].root_pc == C, "the mishearing was corrected"
+    assert out[19][0].root_pc == F, "the chord change survived"
+    assert report.contested_bars == 1, "and the slot still says it has a real difference"
+
+
+def test_a_slot_where_every_dissenter_is_entitled_to_its_reading_is_contested():
+    """Per-occurrence gates do not mean per-occurrence licence. With nothing that
+    clears them, the answer is the old one: the slot is contested and every
+    occurrence keeps what it played."""
+    bars = verse() + verse() + verse() + verse(DISTANT, confidence=0.05)
+    out, report = consensus.apply(bars, [group(0, 4, 8, 12)], bar_beats=4.0)
+    assert report.rewritten_bars == 0
+    assert report.contested_bars == 1
+    assert out[15][0].root_pc == F
+
+
 # --- gate 3: a confident dissenter is evidence -------------------------------
 
 def test_a_confident_dissenter_outranks_the_majority():

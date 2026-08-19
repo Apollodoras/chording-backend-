@@ -15,8 +15,8 @@ at all:
 **Everything after `decode` is pure.** The DSP stages hand back plain data
 (`BeatGrid`, `RawChordSpan`, `Onset`) and the rest of the function is arithmetic
 over it. So `analyze` can be driven end to end with fake engines — which is how
-the test suite exercises quantization, structure, difficulty tiers and the §13.2
-anchor invariant without any audio, any model weights, or any network.
+the test suite exercises quantization, structure and the §13.2 anchor invariant
+without any audio, any model weights, or any network.
 
 **The gate runs before the fetch, always.** A blocked video, a too-long video and
 a disabled feature are all decided from `probe` metadata. §2's blast-radius
@@ -31,7 +31,6 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from ..chords import DIFFICULTIES
 from ..errors import (
     AnalysisError,
     FeatureDisabled,
@@ -39,11 +38,10 @@ from ..errors import (
     VideoBlocked,
     VideoTooLong,
 )
-from ..lint import TEMPO_MAX, TEMPO_MIN, lint, lint_sync, repair
-from ..payload import CompositionPayload
+from ..lint import TEMPO_MAX, TEMPO_MIN, lint, lint_sync_problems, repair
 from ..sync import DownbeatRepair, TheoryReport, VideoSync
 from . import model as song_model
-from .compile import build_sync, compile_song
+from .compile import build_sync, compile_song, fit_sync
 from .scratch import scratch
 from .tuning import CONCERT_PITCH, Tuning
 from . import tuning as tuning_probe
@@ -68,20 +66,25 @@ class LintFailure(AnalysisError):
 
 @dataclass(frozen=True)
 class AnalysisOutcome:
-    """One analysis, at every difficulty, plus what the store needs to file it."""
+    """One recording, one analysis, one chart — plus what the store needs to file it.
+
+    This used to be two dicts keyed by difficulty (`songs`, `syncs`) because §5.5
+    made three charts out of every recording. There is one chart now: the chords
+    that were played.
+    """
 
     meta: VideoMeta
-    songs: dict[str, dict]          # difficulty → CompositionPayload wire dict
-    sync: VideoSync | None          # the sidecar itself; None when none was built
+    song: dict                      # the CompositionPayload wire dict
+    sync: VideoSync | None          # the §13 sidecar, or None (see below)
     low_confidence: bool
     engine_chords: str
     engine_beats: str
     analyzed_at: str
     duration_ms: int
     # §20's provenance, always present — on the outcome as well as on the
-    # sidecar, because a song whose sidecar was withheld (§13.3) still has an
-    # analysis worth reporting, and the benchmark still has to be able to read
-    # what the theory layer did to it.
+    # sidecar, because a song with no usable sidecar still has an analysis worth
+    # reporting, and the benchmark still has to be able to read what the theory
+    # layer did to it.
     theory: TheoryReport = field(default_factory=TheoryReport)
     # **Why** the song is low-confidence, when it is. Four different things set
     # that flag and they call for four different responses — a weak chord read
@@ -91,28 +94,15 @@ class AnalysisOutcome:
     # operator should have to be in. Not on the wire: the player is told the
     # sync is unavailable, which is all it can act on.
     low_confidence_reasons: tuple[str, ...] = ()
-    # **Which difficulties the sidecar is actually true of.**
-    #
-    # The sidecar is one object — it describes the *recording*, so its anchors,
-    # tempo and bar grid are the same whichever tier the player asked for. What is
-    # per-tier is whether the tier's chart still *agrees* with it: `model.impose`
-    # can drop a section from one tier, and `lint_sync` then rejects that pairing.
-    #
-    # That check used to withhold the sidecar from **every** tier on the first
-    # failure, so an `easy` render coming out a section short cost `hard` and
-    # `normal` their video sync too — and the log line named only the tier that
-    # failed, so the two that were fine looked untouched. Video sync is the
-    # product's differentiator, and it should not be all-or-nothing across renders
-    # that are allowed to differ by design. The store is already keyed on
-    # `(video_id, difficulty)`, which is exactly the granularity this needs.
-    #
-    # Empty when no sidecar was built at all (low confidence, §13.3).
-    sync_tiers: frozenset[str] = frozenset()
+    # `sync` is `None` only when the anchors were not a usable map at all (a
+    # `lint_sync` fatal — empty, non-monotonic, an axis the client cannot
+    # derive), which is the sole remaining way a song ships without video sync.
+    # Weak confidence does not produce this state: it ships the sidecar with
+    # `lowConfidence` set and lets the client say so.
 
-    def sync_for(self, difficulty: str) -> VideoSync | None:
-        """The sidecar to store against one difficulty — `None` when this tier's
-        chart and the sidecar disagree."""
-        return self.sync if difficulty in self.sync_tiers else None
+    @property
+    def has_sync(self) -> bool:
+        return self.sync is not None
 
 
 def gate(meta: VideoMeta, *, settings, store) -> None:
@@ -222,21 +212,22 @@ def assemble(
     energy: EnergyCurve | None = None,
     tuning: Tuning = CONCERT_PITCH,
 ) -> AnalysisOutcome:
-    """Features → songs. **Pure** — this is the half the tests drive directly."""
+    """Features → the song. **Pure** — this is the half the tests drive directly."""
     analyzed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     duration_ms = int(round(meta.duration_s * 1000))
 
-    # ONE musical model, built once from the richest tier: the meter is
-    # reconciled against the harmony, ONE beat axis is laid (the chart quantizes
-    # against it, the bars are sliced out of it, the onsets fold onto it and the
-    # anchors are read off it — see `axis.py`), the form is found, the repeats
-    # are voted into line, and one groove is extracted per repeat group.
-    # Each difficulty below is a *render* of this, not another analysis (§20.6).
+    # ONE musical model: the meter is reconciled against the harmony, ONE beat
+    # axis is laid (the chart quantizes against it, the bars are sliced out of
+    # it, the onsets fold onto it and the anchors are read off it — see
+    # `axis.py`), the form is found, the repeats are voted into line, and one
+    # groove is extracted per repeat group. The chart below is a *render* of
+    # this, not another analysis (§20.6).
     model = song_model.build(
         grid=grid, raw=raw, onsets=onsets, energy=energy,
         vote=getattr(settings, "theory_consensus", True),
         weigh=getattr(settings, "theory_belief", True),
         consolidate=getattr(settings, "theory_vocabulary", True),
+        key_audit=getattr(settings, "theory_key_audit", True),
         correct_octave=getattr(settings, "theory_tempo_octave", False),
         form_canonical=getattr(settings, "theory_form", True),
     )
@@ -261,8 +252,8 @@ def assemble(
     #                                   lint would have raised three lines later.
     #   inside it, still implausible    the song plays, but the axis it plays on
     #                                   is the thing in doubt — so it ships
-    #                                   low-confidence, which withholds the
-    #                                   sidecar and tells the player.
+    #                                   low-confidence, sidecar included, and the
+    #                                   client says so.
     if not (TEMPO_MIN <= tempo <= TEMPO_MAX):
         log.warning("tempo %d bpm is outside %d–%d for %s (octave suspect: %s)",
                     tempo, TEMPO_MIN, TEMPO_MAX, meta.video_id,
@@ -302,6 +293,9 @@ def assemble(
         weighedBars=model.consensus.weighed_bars,
         snappedSpans=model.vocabulary.snapped_spans,
         absorbedIslands=model.vocabulary.absorbed_islands,
+        resolvedSpans=model.key_audit.resolved_spans,
+        keyConflicts=model.key_audit.conflicts,
+        modulations=model.modulations,
         canonicalBars=model.canon.canonical_bars,
         settledBars=model.canon.settled_bars,
         heldBeats=model.canon.held_beats,
@@ -320,96 +314,105 @@ def assemble(
         tuningAmbiguous=tuning.ambiguous,
     )
 
-    songs: dict[str, dict] = {}
-    for difficulty in DIFFICULTIES:
-        sections = song_model.render(model, raw, difficulty)
-        if not sections:
-            continue
-
-        payload = compile_song(
-            video_id=meta.video_id,
-            title=meta.title,
-            sections=sections,
-            patterns=model.patterns,
-            key=key,
-            tempo=tempo,
-            time_signature=time_signature,
-            # One Library row per difficulty, so all three can coexist without
-            # `import` upserting one over another (§12.5).
-            difficulty=difficulty,
-        )
-        repair(payload)
-        problems = lint(payload)
-        if problems:
-            log.warning("lint rejected %s@%s: %s", meta.video_id, difficulty, problems)
-            raise LintFailure(problems)
-        songs[difficulty] = payload.wire_dict()
-
-    if not songs:
+    # The chart. One render, so a lint failure is fatal again — there are no
+    # sibling renders left for it to spare, and §12.4's rule ("never return a
+    # payload that would warn") has only one payload to hold to.
+    sections = song_model.render(model, raw)
+    if not sections:
         raise AnalysisError("No chords could be read from that video.")
 
+    payload = compile_song(
+        video_id=meta.video_id,
+        title=meta.title,
+        sections=sections,
+        patterns=model.patterns,
+        key=key,
+        tempo=tempo,
+        time_signature=time_signature,
+    )
+    repair(payload)
+    problems = lint(payload)
+    if problems:
+        log.warning("lint rejected %s: %s", meta.video_id, problems)
+        raise LintFailure(sorted(problems))
+    song = payload.wire_dict()
+
     # --- §13, the sidecar ----------------------------------------------------
-    sync: VideoSync | None = None
-    sync_tiers: set[str] = set()
-    if not low_confidence:
-        sync = build_sync(
-            video_id=meta.video_id,
-            duration_ms=duration_ms,
-            # The axis's downbeats, not the tracker's: `times_ms[k · bar_beats]`
-            # IS the time of the chart's bar k, so the anchor and the bar it
-            # addresses cannot disagree.
-            downbeats_ms=axis.downbeats_ms,
-            bar_beats=beats,
-            # The model's meter, not the tracker's: if §20.2 arbitrated the
-            # meter, the payload carries the arbitrated one and a sidecar naming
-            # the other would put the anchors on a different bar grid than the
-            # chart. They have to be the same string.
-            time_signature=time_signature,
-            # The **model's** tempo, not the tracker's. Same argument as the
-            # `time_signature` above it: the payload carries the reconciled
-            # number, the client derives one bar grid from it, and a sidecar
-            # quoting a different tempo would describe a different grid than the
-            # chart it is shipped beside.
-            bpm=float(tempo),
-            tempo_confidence=grid.confidence,
-            engine_chords=str(chords_engine),
-            engine_beats=str(beats_engine),
-            analyzed_at=analyzed_at,
-            low_confidence=low_confidence,
-            pattern_confidence=pattern_confidence,
-            total_bars=total_bars,
-            analysis=theory,
-        )
-        # §13.3 — degrade honestly. If the anchors and the chart disagree, the
-        # cursor would walk off the song, and a self-paced song that's right
-        # beats a video-synced one that's wrong. Drop the sidecar, keep the song.
+    #
+    # **Every song that came from a recording ships one.** That is the owner's
+    # rule and it replaces §13.3's "degrade honestly by withholding": a song
+    # arriving without video sync is a song the player cannot play with the
+    # video, and there is no reading of this product in which that is the good
+    # outcome. Withholding never repaired anything — it removed the recording and
+    # left the same chart behind, self-paced.
+    #
+    # What survives of §13.3 is the honesty, moved onto the sidecar itself: a
+    # weak analysis ships `lowConfidence: true`, and the client says so. The only
+    # thing that can still take the sidecar away is a `lint_sync` **fatal** —
+    # anchors that are not a map (empty, non-monotonic, an axis the client cannot
+    # derive), where there is nothing to hand over in the first place.
+    grid_sync = build_sync(
+        video_id=meta.video_id,
+        duration_ms=duration_ms,
+        # The axis's downbeats, not the tracker's: `times_ms[k · bar_beats]`
+        # IS the time of the chart's bar k, so the anchor and the bar it
+        # addresses cannot disagree.
+        downbeats_ms=axis.downbeats_ms,
+        bar_beats=beats,
+        # The model's meter, not the tracker's: if §20.2 arbitrated the
+        # meter, the payload carries the arbitrated one and a sidecar naming
+        # the other would put the anchors on a different bar grid than the
+        # chart. They have to be the same string.
+        time_signature=time_signature,
+        # The **model's** tempo, not the tracker's. Same argument as the
+        # `time_signature` above it: the payload carries the reconciled
+        # number, the client derives one bar grid from it, and a sidecar
+        # quoting a different tempo would describe a different grid than the
+        # chart it is shipped beside.
         #
-        # Checked against EVERY difficulty, not just the reference: one sidecar is
-        # returned alongside whichever tier the player asked for, so it has to be
-        # true of the tier being served. The tiers share a bar grid and normally
-        # agree — this catches the case where simplification shortened one of them.
-        #
-        # **Per tier, not all-or-nothing.** This used to `break` on the first
-        # failure and withhold the sidecar everywhere, which punished two renders
-        # for a third one's shape; `impose` is allowed to drop a section per tier,
-        # so that case is by design rather than a symptom. Each tier now keeps or
-        # loses video sync on its own evidence, and the log says which did what.
-        for tier, wire in sorted(songs.items()):
-            problems = lint_sync(CompositionPayload.model_validate(wire), sync)
-            if problems:
-                log.warning("sidecar withheld for %s (%s tier): %s",
-                            meta.video_id, tier, problems)
-            else:
-                sync_tiers.add(tier)
-        if not sync_tiers:
-            # No tier accepted it, so there is no sidecar to report either. Keeps
-            # "`sync is None`" meaning exactly what it always meant: this analysis
-            # has no usable video sync.
-            sync = None
+        # At the precision the grid was measured at, though, and not the
+        # container's integer. `meter._measured_bpm` reads the tempo off the
+        # beat list the anchors are laid on and keeps two decimals; `tempo` is
+        # that same number rounded because `CompositionPayload.tempo` is an int.
+        # Passing the rounded one made the sidecar's `tempo.bpm` a *worse*
+        # statement about the same grid — up to half a BPM out, which over a
+        # four-minute song is a bar and a half — for no gain, since the field is
+        # read by operators and by `run_bench`'s grid checks rather than by the
+        # client's bar arithmetic (that reads the payload). Same claim, higher
+        # precision.
+        bpm=float(model.meter.grid.bpm or tempo),
+        tempo_confidence=grid.confidence,
+        engine_chords=str(chords_engine),
+        engine_beats=str(beats_engine),
+        analyzed_at=analyzed_at,
+        low_confidence=low_confidence,
+        pattern_confidence=pattern_confidence,
+        total_bars=total_bars,
+        analysis=theory,
+    )
+
+    # Trimmed to the chart, because the two can disagree about where the song
+    # ends: `impose` may merge across a barline, leaving the chart shorter than
+    # the grid the anchors were built from. `fit_sync` trims the overrun instead
+    # of the song losing its sidecar for it.
+    sync: VideoSync | None = fit_sync(grid_sync, payload)
+    problems = lint_sync_problems(payload, sync)
+    if problems.fatal:
+        # Not a judgement about the recording — a statement that these anchors
+        # cannot be interpolated. Logged at warning because it should be rare
+        # enough to look at.
+        log.warning("sidecar withheld for %s — not a usable map: %s",
+                    meta.video_id, "; ".join(problems.fatal))
+        sync = None
+    elif problems.advisory:
+        # Shipped, and flagged. This is the case that used to disappear.
+        log.info("sidecar shipped low-confidence for %s: %s",
+                 meta.video_id, "; ".join(problems.advisory))
+        sync = sync.model_copy(update={"lowConfidence": True})
 
     return AnalysisOutcome(
         meta=meta,
-        songs=songs,
+        song=song,
         sync=sync,
         low_confidence=low_confidence,
         engine_chords=str(chords_engine),
@@ -418,5 +421,4 @@ def assemble(
         duration_ms=duration_ms,
         theory=theory,
         low_confidence_reasons=tuple(reasons),
-        sync_tiers=frozenset(sync_tiers),
     )

@@ -90,6 +90,16 @@ PHASE_MARGIN = 0.15
 # plausible is something `lint` will accept.
 TEMPO_MIN, TEMPO_MAX = float(PLAUSIBLE_TEMPO_MIN), float(PLAUSIBLE_TEMPO_MAX)
 
+# **The meter vocabulary is 4/4 against 3/4, and that is a ceiling rather than an
+# oversight** (F26). The trackers emit `n/4` and nothing else, so a 6/8 or 12/8
+# song is approximated as one of those two — usually 3/4 with a doubled bar, or
+# 4/4 with the bar length the downbeat repair measures. For a strumming app that
+# is survivable and sometimes right: §14's idiom set includes "6/8 in two", and
+# the anchors are absolute times taken off the recording either way, so playback
+# follows the video whatever the signature *says*. What it costs is the printed
+# time signature and, on a compound-time song, the sense of where beat 3 is.
+# Fixing it needs a tracker that reports compound meter, not a rule here.
+
 # Meters worth arbitrating between when the tracker is unsure. Not a general
 # meter finder: these are the two that cover almost everything here, and a wrong
 # answer between them is recoverable in a way that inventing 7/8 is not.

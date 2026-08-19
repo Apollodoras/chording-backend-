@@ -89,7 +89,7 @@ _STATUS_FOR_CODE = {
 }
 
 
-def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
+def run_job(*, job_id: str, video_id: str, uid: str,
             settings, store: Store, source, may_retry_elsewhere: bool = False) -> str:
     """Execute one analysis and record the outcome. Never raises.
 
@@ -148,9 +148,9 @@ def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
                        "That video couldn’t be analyzed.")
         return OUTCOME_FAILED
 
-    # One row per difficulty: all three tiers are computed from one analysis
-    # (§5.5 — "compute once, store all three, let the client pick") and stored
-    # together, so switching difficulty later is a cache hit rather than a job.
+    # One row per video. §5.5 used to make this three rows — "compute once, store
+    # all three, let the client pick" — and there is nothing left to pick between:
+    # the chart states what was played.
     #
     # Inside a `try` for exactly the reason the analysis above is. This half
     # talks to the database too, and it used to be the only exit path with no
@@ -170,25 +170,20 @@ def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
     # someone for our own storage failure is the one reading nobody would
     # defend.
     try:
-        # The sidecar is stored **per tier**, because it is only true of the tiers
-        # whose chart agrees with it (see `AnalysisOutcome.sync_tiers`). One
-        # shortened render used to cost every other render its video sync.
-        sync_wire = outcome.sync.model_dump() if outcome.sync else None
         # `owner_uid` is what keeps an upload private: it is somebody's own
         # recording, so it is not catalog material and not readable by id by
         # anyone else. Decided from the id rather than from the source, so it holds
         # whichever runner and whichever source produced it — `is_upload_id` is the
         # existing answer to "is this a content hash rather than a video".
         owner_uid = uid if is_upload_id(video_id) else None
-        for tier, song in outcome.songs.items():
-            store.put_map(
-                video_id=video_id, difficulty=tier, song=song,
-                sync=sync_wire if tier in outcome.sync_tiers else None,
-                engine_chords=outcome.engine_chords, engine_beats=outcome.engine_beats,
-                analyzed_at=outcome.analyzed_at, channel_id=outcome.meta.channel_id,
-                title=outcome.meta.title, duration_ms=outcome.duration_ms,
-                low_confidence=outcome.low_confidence, owner_uid=owner_uid,
-            )
+        store.put_map(
+            video_id=video_id, song=outcome.song,
+            sync=_sync_wire(outcome.sync),
+            engine_chords=outcome.engine_chords, engine_beats=outcome.engine_beats,
+            analyzed_at=outcome.analyzed_at, channel_id=outcome.meta.channel_id,
+            title=outcome.meta.title, duration_ms=outcome.duration_ms,
+            low_confidence=outcome.low_confidence, owner_uid=owner_uid,
+        )
         store.update_job(job_id, status=STATUS_READY, progress=1.0)
     except Exception:
         log.exception("job %s (%s) analyzed but could not be filed", job_id, video_id)
@@ -196,9 +191,14 @@ def run_job(*, job_id: str, video_id: str, difficulty: str, uid: str,
                        "That analysis finished but couldn’t be saved — try again.",
                        refund=True)
         return OUTCOME_FAILED
-    log.info("job %s ready: %s (%s) in %.1fs", job_id, video_id,
-             ", ".join(sorted(outcome.songs)), time.monotonic() - started)
+    log.info("job %s ready: %s (sync: %s) in %.1fs", job_id, video_id,
+             "yes" if outcome.sync is not None else "no", time.monotonic() - started)
     return OUTCOME_READY
+
+
+def _sync_wire(sync) -> dict | None:
+    """The sidecar as stored JSON, or `None` when the song has none."""
+    return sync.model_dump() if sync is not None else None
 
 
 def _finish_failed(store: Store, job_id: str, uid: str, code: str, message: str,
@@ -246,9 +246,9 @@ class JobRunner:
         self.store = store
         self.source = source
 
-    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str,
+    def submit(self, *, job_id: str, video_id: str, uid: str,
                audio: bytes | None = None, filename: str | None = None) -> None:
-        run_job(job_id=job_id, video_id=video_id, difficulty=difficulty, uid=uid,
+        run_job(job_id=job_id, video_id=video_id, uid=uid,
                 settings=self.settings, store=self.store,
                 source=self._source_for(audio, filename))
 
@@ -313,11 +313,11 @@ class ThreadJobRunner(JobRunner):
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="analysis")
         self._lock = threading.Lock()
 
-    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str,
+    def submit(self, *, job_id: str, video_id: str, uid: str,
                audio: bytes | None = None, filename: str | None = None) -> None:
         with self._lock:
             self._pool.submit(
-                run_job, job_id=job_id, video_id=video_id, difficulty=difficulty,
+                run_job, job_id=job_id, video_id=video_id,
                 uid=uid, settings=self.settings, store=self.store,
                 source=self._source_for(audio, filename),
             )
@@ -346,7 +346,7 @@ class RemoteJobRunner(JobRunner):
     and refunded either way (`REFUNDABLE_CODES` includes `feature_disabled`).
     """
 
-    def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str,
+    def submit(self, *, job_id: str, video_id: str, uid: str,
                audio: bytes | None = None, filename: str | None = None) -> None:
         raise NotImplementedError
 

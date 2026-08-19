@@ -187,7 +187,7 @@ def canonicalize(bars: list[list[BarChord]], groups: list[RepeatGroup], *,
 
     `record` writes the agreed progression back onto each `RepeatGroup` as its
     `canonical`, which is what the sidecar reports and what `compile` names. It
-    is off for a difficulty render for exactly the reason it is off in
+    is off for a render for exactly the reason it is off in
     `consensus.apply` — those groups are shared objects describing the reference
     analysis, and a render is a replay of it rather than a new finding.
     """
@@ -255,6 +255,17 @@ def _agreed(candidates: list[list[BarChord]], *, bar_beats: int, tonic_pc: int,
     what a held instrument does and what the container's spans mean. Only a tie
     at the head of the bar, where there is nothing behind it yet, reaches
     forwards instead.
+
+    **Voting per beat can in principle assemble a bar no occurrence played** —
+    each chord in it is one some occurrence played *in that bar*, but the
+    sequence can be new. The 2026-08-18 audit flagged this (F16) and recommended
+    constraining the output to whichever candidate bar is closest to the per-beat
+    consensus. Measured over the chart corpus: **3 slots out of 1744** come back
+    as a sequence no candidate held, 0.2%. That is not worth constraining the
+    vote for, and constraining it would give up the property the whole method was
+    chosen for — that occurrences disagreeing about *where* a change falls are
+    settled beat by beat rather than by a whole-bar plurality of composite
+    objects, which is where §21's +0.049 root came from.
     """
     settled: list[tuple[int, str] | None] = []
     confidences: list[float] = []
@@ -481,7 +492,8 @@ def settles_on_barlines(spans: list[GridSpan], bar_beats: int) -> bool:
     return bar_beats > 0 and harmonic_unit(spans) >= bar_beats - 1e-6
 
 
-def settle_to_bars(bars: list[list[BarChord]], bar_beats: int
+def settle_to_bars(bars: list[list[BarChord]], bar_beats: int,
+                   groups: list[RepeatGroup] | None = None
                    ) -> tuple[list[list[BarChord]], int]:
     """Give every bar the chord that holds most of it, where one clearly does.
 
@@ -489,12 +501,27 @@ def settle_to_bars(bars: list[list[BarChord]], bar_beats: int
     reaches `SETTLE_SHARE` is left exactly as it was heard: two chords sharing a
     bar down the middle is a real two-chord bar even in a song that mostly moves
     once a bar, and there is no reading of "the bar's chord" that covers it.
+
+    **And a split the song plays every time round is not settled either.** The
+    `SETTLE_SHARE` test asks one bar in isolation whether its second chord looks
+    like an anticipation, and one bar cannot tell an anticipation from a cadence:
+    `| IV V |` at the end of a phrase reads exactly like `| IV |` with the next
+    chord pushed early. What separates them is the *other passes of the same
+    slot* — an engine putting a change a beat early does it on some passes and
+    not others, and a song that really splits that bar splits it every time.
+    So where `groups` is supplied, a bar whose siblings mostly hold two chords is
+    left alone however lopsided this one occurrence happens to be.
+
+    `groups` optional so a caller with no form in hand (a test fixture, or the
+    replay in `model.render` before the groups exist) gets the old behaviour
+    rather than an error.
     """
     if bar_beats <= 0:
         return [list(bar) for bar in bars], 0
+    corroborated = _corroborated_splits(bars, groups, bar_beats)
     out: list[list[BarChord]] = []
     settled = 0
-    for bar in bars:
+    for index, bar in enumerate(bars):
         winner = _longest(bar)
         if winner is None or len(bar) == 1:
             out.append(list(bar))
@@ -502,11 +529,46 @@ def settle_to_bars(bars: list[list[BarChord]], bar_beats: int
         if winner.length_beats / bar_beats < SETTLE_SHARE:
             out.append(list(bar))
             continue
+        if index in corroborated:
+            out.append(list(bar))
+            continue
         out.append([BarChord(root_pc=winner.root_pc, quality=winner.quality,
                              start_beat=0.0, length_beats=float(bar_beats),
                              confidence=winner.confidence)])
         settled += 1
     return out, settled
+
+
+def _corroborated_splits(bars: list[list[BarChord]],
+                         groups: list[RepeatGroup] | None,
+                         bar_beats: int) -> frozenset[int]:
+    """Bar indices whose slot is split in most of the occurrences that hold it.
+
+    A slot is "split" in an occurrence when no chord in that bar reaches
+    `SETTLE_SHARE` — the same test `settle_to_bars` applies, asked of the
+    siblings. A strict majority is required, so a slot two passes disagree about
+    is still settled and only a slot the song keeps splitting is protected.
+    """
+    if not groups:
+        return frozenset()
+    protected: set[int] = set()
+    for group in groups:
+        if not group.is_repeat or group.length_bars <= 0:
+            continue
+        for slot in range(group.length_bars):
+            positions = [start + slot for start in group.occurrences
+                         if start + slot < len(bars)]
+            if len(positions) < 2:
+                continue
+            split = 0
+            for position in positions:
+                winner = _longest(bars[position])
+                if (len(bars[position]) > 1 and winner is not None
+                        and winner.length_beats / bar_beats < SETTLE_SHARE):
+                    split += 1
+            if split * 2 > len(positions):
+                protected.update(positions)
+    return frozenset(protected)
 
 
 def _longest(bar: list[BarChord]) -> BarChord | None:

@@ -480,3 +480,39 @@ def test_an_unhashable_file_reads_as_unverified(tmp_path):
     from app.analysis.adapters.btc import _is_pinned
 
     assert not _is_pinned(tmp_path / "does-not-exist.pt")
+
+
+# --- BTC's decoder ------------------------------------------------------------
+
+def test_the_decoder_removes_a_one_frame_flicker():
+    """F2, and the owner's first symptom at its source.
+
+    Twenty frames of `Bm` with one frame in the middle where `Bm7` wins the
+    argmax by a hair. Per-frame, that is three spans and a chord change the song
+    does not have; decoded, it is one chord, because a single frame is not enough
+    evidence to pay the transition cost.
+    """
+    import numpy as np
+    from app.analysis.adapters.btc import _viterbi
+
+    probabilities = np.full((20, 4), 0.01, dtype="float32")
+    probabilities[:, 0] = 0.9                # "Bm" everywhere
+    probabilities[10, 0], probabilities[10, 1] = 0.45, 0.46   # ...except one frame
+
+    assert probabilities.argmax(axis=1)[10] == 1, "the argmax really does flicker"
+    assert set(_viterbi(np, probabilities).tolist()) == {0}, "and the decoder does not"
+
+
+def test_the_decoder_still_hears_a_real_chord_change():
+    """The other half: a change the evidence supports has to survive. Ten frames
+    of one chord and ten of another is a bar of each at this frame rate, and no
+    stay-put prior worth having flattens that."""
+    import numpy as np
+    from app.analysis.adapters.btc import _viterbi
+
+    probabilities = np.full((20, 4), 0.01, dtype="float32")
+    probabilities[:10, 0] = 0.9
+    probabilities[10:, 1] = 0.9
+
+    path = _viterbi(np, probabilities).tolist()
+    assert path == [0] * 10 + [1] * 10

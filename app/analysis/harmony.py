@@ -148,11 +148,6 @@ def similarity(a: tuple[int, str], b: tuple[int, str]) -> float:
     return len(first & second) / len(union)
 
 
-def distance(a: tuple[int, str], b: tuple[int, str]) -> float:
-    """1 − `similarity`. The form `form.py` measures bars with."""
-    return 1.0 - similarity(a, b)
-
-
 # A quality → the triad underneath it. **Colour dropped, identity kept**: the
 # seventh and the suspension go, the major/minor/diminished/augmented distinction
 # stays. This is not `chords.simplify` and must not be confused with it —
@@ -228,10 +223,15 @@ def diatonic_fit(root_pc: int, quality: str, tonic_pc: int, mode: str) -> float:
 def roman(root_pc: int, quality: str, tonic_pc: int, mode: str) -> str:
     """The chord's scale degree, in the usual case-carrying notation.
 
-    Diagnostic rather than load-bearing: it is what makes a benchmark row or a
-    log line legible to a musician ("the section ends on V" rather than "the
-    section ends on 7-major"). `mode` is accepted for symmetry with the rest of
-    this module but does not change the spelling — see `_ROMAN`.
+    Read by `keyaudit.py`, which reports a key conflict as the two degrees in
+    dispute ("C#(VI) vs C#m(vi)") — a musician can tell at a glance from that
+    whether the audit found a secondary dominant or a misheard third, and cannot
+    tell from the chord names alone. `mode` is accepted for symmetry with the
+    rest of this module but does not change the spelling — see `_ROMAN`.
+
+    Two neighbours of this function, `distance` and `is_tonic`, were removed in
+    the 2026-08-18 audit: both were written for callers that never arrived, and a
+    helper nothing calls is a helper nobody has checked.
     """
     numeral = _ROMAN[(root_pc - tonic_pc) % 12]
     minorish = quality in {MINOR, MINOR7, DIMINISHED, DIMINISHED7, HALF_DIM7}
@@ -256,6 +256,3 @@ def is_dominant_of(root_pc: int, quality: str, tonic_pc: int) -> bool:
     """
     return (root_pc - tonic_pc) % 12 == 7 and quality in {MAJOR, DOMINANT7, SUS4}
 
-
-def is_tonic(root_pc: int, tonic_pc: int) -> bool:
-    return root_pc % 12 == tonic_pc % 12

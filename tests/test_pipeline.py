@@ -15,7 +15,6 @@ import pytest
 from app.analysis.pipeline import LintFailure, analyze, assemble
 from app.analysis.scratch import assert_clean
 from app.analysis.types import BeatGrid, EngineInfo, RawChordSpan, VideoMeta
-from app.chords import EASY, HARD, NORMAL
 from app.errors import (
     CODE_TEMPO_UNREADABLE,
     AnalysisError,
@@ -64,40 +63,38 @@ def run(settings, store, **overrides):
 
 # --- the happy path ---------------------------------------------------------
 
-def test_a_known_song_produces_all_three_difficulties(settings, store):
-    """§5.5: compute once, store all three, let the client pick. Never
-    re-analyze per difficulty."""
+def test_a_known_song_produces_one_chart(settings, store):
+    """§5.5 used to make three of these — easy/normal/hard — and the client
+    picked. The chart states what was played, so there is nothing to pick."""
     outcome = run(settings, store)
-    assert sorted(outcome.songs) == [EASY, HARD, NORMAL]
+    assert isinstance(outcome.song, dict) and outcome.song
 
 
 def test_the_song_is_the_progression_that_went_in(settings, store):
     outcome = run(settings, store)
-    payload = CompositionPayload.model_validate(outcome.songs[NORMAL])
+    payload = CompositionPayload.model_validate(outcome.song)
     assert payload.arrangement.sections[0].chordNames == ["G", "D", "Em", "C"]
     assert payload.tonic == "G" and payload.mode == "major"
     assert payload.tempo == 120
     assert payload.timeSignature == "4/4"
 
 
-def test_every_emitted_song_lints_clean(settings, store):
+def test_the_emitted_song_lints_clean(settings, store):
     """§12.4 made structural: there is no code path out of `analyze` that skips
     the lint, so this is asserting the guarantee rather than the output."""
     outcome = run(settings, store)
-    for wire in outcome.songs.values():
-        assert lint(CompositionPayload.model_validate(wire)) == []
+    assert lint(CompositionPayload.model_validate(outcome.song)) == []
 
 
-def test_the_sidecar_agrees_with_every_tier(settings, store):
+def test_the_sidecar_agrees_with_the_chart(settings, store):
     outcome = run(settings, store)
     assert outcome.sync is not None
-    for wire in outcome.songs.values():
-        assert lint_sync(CompositionPayload.model_validate(wire), outcome.sync) == []
+    assert lint_sync(CompositionPayload.model_validate(outcome.song), outcome.sync) == []
 
 
 def test_the_strumming_pattern_is_the_one_that_was_played(settings, store):
     outcome = run(settings, store)
-    payload = CompositionPayload.model_validate(outcome.songs[NORMAL])
+    payload = CompositionPayload.model_validate(outcome.song)
     strokes = payload.patterns[0].strokes
     assert [s.beat for s in strokes] == [0.0, 1.0, 1.5, 2.5, 3.0, 3.5]
     assert [s.direction for s in strokes] == ["down", "down", "up", "up", "down", "up"]
@@ -107,23 +104,16 @@ def test_with_no_onset_detector_the_song_still_plays(settings, store):
     """The app *requires* a pattern — a section without one is silently dropped.
     So no onsets means a quarter-note bar, not a failed job."""
     outcome = run(settings, store, onset_detector=None)
-    payload = CompositionPayload.model_validate(outcome.songs[NORMAL])
+    payload = CompositionPayload.model_validate(outcome.song)
     assert [s.beat for s in payload.patterns[0].strokes] == [0.0, 1.0, 2.0, 3.0]
 
 
-def test_the_easy_tier_has_no_more_chord_changes_than_the_hard_one(settings, store):
-    outcome = run(settings, store)
-    easy = CompositionPayload.model_validate(outcome.songs[EASY])
-    hard = CompositionPayload.model_validate(outcome.songs[HARD])
-    assert len(easy.arrangement.sections) <= len(hard.arrangement.sections)
-
-
-def test_the_sidecar_says_how_much_of_the_hard_tier_is_really_there(settings, store):
-    """`hard` promises "the full detected quality", and on a track the container
-    cannot spell it is quietly a fiction: `Gmaj9` ships as `Gmaj7`, plays fine,
-    lints clean and reports high confidence. `postprocess.exact_ratio` was
-    written for exactly that and then computed nowhere in production — so the one
-    signal that could say so said nothing.
+def test_the_sidecar_says_how_much_of_the_chart_is_really_there(settings, store):
+    """The chart promises what was played, and on a track the container cannot
+    spell it is quietly a fiction: `Gmaj9` ships as `Gmaj7`, plays fine, lints
+    clean and reports high confidence. `postprocess.exact_ratio` was written for
+    exactly that and then computed nowhere in production — so the one signal that
+    could say so said nothing.
     """
     outcome = run(settings, store)
     assert outcome.theory.exactRatio == 1.0
@@ -133,7 +123,7 @@ def test_the_sidecar_says_how_much_of_the_hard_tier_is_really_there(settings, st
               for span in known_chords()]
     reduced = run(settings, store, chord_engine=FakeChordEngine(spans=ninths))
     assert reduced.theory.exactRatio == 0.25, "only the one chord that wasn't a 9th"
-    assert lint(CompositionPayload.model_validate(reduced.songs[HARD])) == []
+    assert lint(CompositionPayload.model_validate(reduced.song)) == []
 
 
 # --- §2.1 ------------------------------------------------------------------
@@ -198,32 +188,68 @@ def test_the_kill_switch_stops_new_analysis(settings, store):
 
 # --- degrading honestly -----------------------------------------------------
 
-def test_a_weak_beat_grid_withholds_the_sidecar_but_keeps_the_song(settings, store):
-    """§13.3: "a self-paced campfire song that's right beats a video-synced one
-    that's wrong — the player has no scoring to protect, so the only cost of bad
-    sync is that it feels broken"."""
+def test_a_weak_beat_grid_still_ships_the_sidecar_and_says_it_is_weak(settings, store):
+    """The §13.3 amendment, and the defect that forced it.
+
+    The old rule was "a self-paced campfire song that's right beats a
+    video-synced one that's wrong", and it withheld the sidecar below the
+    confidence floor. What that actually did was take *playing along with the
+    recording* — the whole product — away from songs whose beat map was measured
+    on that very recording, and hand back the same chart with a metronome. It
+    repaired nothing: the chart is no better self-paced.
+
+    So the sidecar ships, carrying `lowConfidence: true`, and the client is the
+    one that says so.
+    """
     weak = FakeBeatTracker(grid=known_grid(confidence=0.2))
     outcome = run(settings, store, beat_tracker=weak)
-    assert outcome.sync is None
     assert outcome.low_confidence
-    assert outcome.songs, "the song still lands in the Library"
+    assert outcome.song, "the song still lands in the Library"
+    assert outcome.sync is not None, "a weak reading is still a reading"
+    assert outcome.sync.lowConfidence is True
 
 
-def test_low_chord_confidence_also_withholds_the_sidecar(settings, store):
+def test_low_chord_confidence_does_not_cost_the_song_its_video(settings, store):
+    """Chord confidence is a claim about the *harmony*; the sidecar is a claim
+    about the *timeline*. A weak read of the first has never been evidence
+    against the second — the beat grid is tracked independently — and withholding
+    on it conflated the two."""
     engine = FakeChordEngine(spans=known_chords(confidence=0.1))
     outcome = run(settings, store, chord_engine=engine)
-    assert outcome.sync is None and outcome.low_confidence
+    assert outcome.low_confidence
+    assert outcome.sync is not None and outcome.sync.lowConfidence is True
 
 
-def test_a_suspect_tempo_the_container_can_still_carry_ships_low_confidence(settings, store):
-    """206 bpm is outside what this repertoire plausibly is and inside what the
-    container accepts. So the song ships — but the axis it plays on is the thing
-    in doubt, and the sidecar is what would put a cursor on that axis."""
+def test_a_suspect_tempo_is_repaired_rather_than_only_flagged(settings, store):
+    """206 bpm is outside what this repertoire plausibly is (55–200) and inside
+    what the container accepts (40–220), so it used to ship flagged and uncorrected.
+
+    Since the 2026-08-18 audit the repair runs by default, and 206 is exactly the
+    reading it is for: a tracker counting a 103 bpm song in eighths. The song
+    ships at 103, confident, on a grid the correction rebuilt.
+    """
     fast = recording(ms_per_beat=291)   # 206.2 bpm
     outcome = _assemble(fast, settings)
-    assert outcome.songs, "the song still lands in the Library"
+    assert outcome.song, "the song still lands in the Library"
+    assert outcome.theory.tempoOctaveShift == -1
+    assert not outcome.theory.tempoOctaveSuspect
+    assert not outcome.low_confidence
+
+
+def test_a_suspect_tempo_still_ships_flagged_with_the_repair_off(settings, store):
+    """The supported posture, and the behaviour before the audit.
+
+    The anchors are the reason this is safe to ship rather than the reason to
+    withhold: they are absolute timestamps taken off the recording, so the cursor
+    follows the video whether or not the *name* we gave that tempo is an octave
+    out. What a suspect octave changes is how the bars are drawn, and that is
+    what `lowConfidence` is for.
+    """
+    fast = recording(ms_per_beat=291)   # 206.2 bpm
+    outcome = _assemble(fast, replace(settings, theory_tempo_octave=False))
+    assert outcome.song, "the song still lands in the Library"
     assert outcome.low_confidence
-    assert outcome.sync is None
+    assert outcome.sync is not None and outcome.sync.lowConfidence is True
     assert outcome.theory.tempoOctaveSuspect
     assert outcome.theory.tempoOctaveShift == 0
 
@@ -232,22 +258,30 @@ def test_a_tempo_the_container_cannot_carry_says_so_instead_of_failing_the_lint(
     """The defect this replaces: `meter` flagged the octave, `lint` refused the
     tempo, and the player was told "that video didn't produce a song we could
     play" — the one sentence that names none of what the pipeline had already
-    worked out."""
+    worked out.
+
+    Reachable now only with the repair off, since 235 is exactly one octave from
+    a plausible 118 and the repair takes it there. What it still guards is the
+    tempo the repair *cannot* reach, which is where this error belongs.
+    """
     too_fast = recording(ms_per_beat=255)   # 235.3 bpm
     with pytest.raises(TempoUnreadable) as caught:
-        _assemble(too_fast, settings)
+        _assemble(too_fast, replace(settings, theory_tempo_octave=False))
     assert "235" in caught.value.message
     assert caught.value.code == CODE_TEMPO_UNREADABLE
     assert not isinstance(caught.value, LintFailure)
 
 
-def test_the_octave_correction_is_off_until_it_is_asked_for(settings, store):
-    """It rewrites every bar line in the song and the corpus has no track that
-    triggers it, so there is no measurement to turn it on with. With it on, the
-    same recording that had no song at all is a song at half the tempo."""
+def test_the_octave_correction_repairs_a_song_that_had_no_song_at_all(settings, store):
+    """§20.2, on by default since the 2026-08-18 audit (F24).
+
+    It rewrites every bar line in the song, which is why it was off — but the only
+    recordings it can fire on are the ones `assemble` otherwise refuses outright,
+    so what it risks is measured against nothing rather than against a song that
+    was working. The user paid a quota charge for that refusal."""
     too_fast = recording(ms_per_beat=255)
-    outcome = _assemble(too_fast, replace(settings, theory_tempo_octave=True))
-    payload = CompositionPayload.model_validate(outcome.songs[HARD])
+    outcome = _assemble(too_fast, settings)
+    payload = CompositionPayload.model_validate(outcome.song)
     assert payload.tempo == 118            # 235.3 / 2
     assert outcome.theory.tempoOctaveShift == -1
     assert not outcome.theory.tempoOctaveSuspect
@@ -279,7 +313,7 @@ def test_a_no_chord_gap_is_held_rather_than_left_empty(settings, store):
         RawChordSpan(start_ms=16000, end_ms=32000, label="C:maj"),
     ]
     outcome = run(settings, store, chord_engine=FakeChordEngine(spans=spans))
-    payload = CompositionPayload.model_validate(outcome.songs[NORMAL])
+    payload = CompositionPayload.model_validate(outcome.song)
     for section in payload.arrangement.sections:
         assert section.chordNames or section.bars
 
@@ -297,15 +331,14 @@ def test_the_same_recording_produces_byte_identical_songs(settings, store):
     """
     first = run(settings, store)
     second = run(settings, store)
-    for tier in first.songs:
-        assert first.songs[tier] == second.songs[tier]
+    assert first.song == second.song
 
 
 def test_a_changed_groove_gets_a_new_pattern_id_but_the_song_keeps_its_own(settings, store):
     quiet = run(settings, store, onset_detector=None)
     strummed = run(settings, store)
-    assert quiet.songs[NORMAL]["id"] == strummed.songs[NORMAL]["id"]
-    assert quiet.songs[NORMAL]["patternID"] != strummed.songs[NORMAL]["patternID"]
+    assert quiet.song["id"] == strummed.song["id"]
+    assert quiet.song["patternID"] != strummed.song["patternID"]
 
 
 # --- the pure half ----------------------------------------------------------
@@ -324,94 +357,69 @@ def test_assemble_needs_no_audio_engine_or_network(settings):
     assert outcome.sync.engine.chords == "btc@1.2.0"
 
 
-# --- the sidecar is per difficulty -------------------------------------------
+# --- the sidecar ------------------------------------------------------------
 
-def test_the_sidecar_records_which_tiers_it_is_true_of(settings, store):
-    """One sidecar object, and a set of the tiers whose chart agrees with it.
+def test_an_advisory_problem_ships_the_sidecar_flagged_rather_than_withholding_it(
+        settings, store, monkeypatch):
+    """The change the fatal/advisory split exists for.
 
-    The sidecar describes the *recording* — anchors, tempo, bar grid — so it is the
-    same whichever tier the player asked for. What is per-tier is whether that
-    tier's chart still lines up with it, and the store is already keyed on
-    `(video_id, difficulty)`.
+    An advisory problem — a ragged bar, a tail short of the last anchor, a
+    section that is not whole bars — used to be indistinguishable from a fatal
+    one, and *any* of them withheld the sidecar. Those are the songs that reached
+    players with no "play with the video" option at all.
+
+    Now the map ships and says it is imperfect, which is the only version of this
+    the player can act on.
     """
+    from app.analysis import pipeline
+    from app.lint import SyncProblems
+
+    monkeypatch.setattr(pipeline, "lint_sync_problems",
+                        lambda payload, sync: SyncProblems(advisory=("ragged bars",)))
     outcome = run(settings, store)
 
     assert outcome.sync is not None
-    assert outcome.sync_tiers == frozenset(outcome.songs)
-    for tier in outcome.songs:
-        assert outcome.sync_for(tier) is outcome.sync
+    assert outcome.sync.lowConfidence is True, "shipped, and honest about it"
 
 
-def test_one_disagreeing_tier_no_longer_costs_the_others_their_sync(settings, store,
-                                                                    monkeypatch):
-    """The defect.
-
-    `impose` is allowed to drop a section from one tier — `easy`'s
-    drop-passing-chords rule can merge across a barline — so a tier disagreeing with
-    the sidecar is by design rather than a symptom. The check used to `break` on the
-    first failure and withhold the sidecar from **every** tier, punishing two renders
-    for a third one's shape, and the log line named only the tier that failed so the
-    two that were fine looked untouched.
-
-    Video sync is the product's differentiator; it should not be all-or-nothing
-    across renders that are allowed to differ.
-    """
+def test_only_a_fatal_leaves_a_song_without_video_sync(settings, store, monkeypatch):
+    """`sync is None` still means "this analysis has no usable video sync" — it
+    is just far harder to reach than it was, because only anchors that cannot be
+    interpolated get there. The *song* is unaffected either way."""
     from app.analysis import pipeline
+    from app.lint import SyncProblems
 
-    real_lint_sync = pipeline.lint_sync
-
-    def only_easy_disagrees(payload, sync):
-        # The tier is in the song id (`yt:<videoId>:<difficulty>`, §12.5) — the
-        # payload has no difficulty field of its own.
-        if payload.id.endswith(f":{EASY}"):
-            return ["bar count disagrees with the sidecar"]
-        return real_lint_sync(payload, sync)
-
-    monkeypatch.setattr(pipeline, "lint_sync", only_easy_disagrees)
-    outcome = run(settings, store)
-
-    assert EASY not in outcome.sync_tiers
-    assert {NORMAL, HARD} <= outcome.sync_tiers
-    assert outcome.sync is not None, \
-        "the sidecar is still true of two tiers, so it is still worth having"
-    assert outcome.sync_for(EASY) is None
-
-
-def test_no_tier_agreeing_still_means_no_sidecar_at_all(settings, store, monkeypatch):
-    """`sync is None` has to keep meaning exactly what it always meant — this
-    analysis has no usable video sync — or every reader of it becomes subtly
-    optimistic."""
-    from app.analysis import pipeline
-
-    monkeypatch.setattr(pipeline, "lint_sync", lambda payload, sync: ["nope"])
+    monkeypatch.setattr(pipeline, "lint_sync_problems",
+                        lambda payload, sync: SyncProblems(fatal=("nope",)))
     outcome = run(settings, store)
 
     assert outcome.sync is None
-    assert outcome.sync_tiers == frozenset()
+    assert outcome.song, "the chart still ships"
 
 
-def test_a_low_confidence_song_has_no_sync_tiers(settings, store):
-    """§13.3: no sidecar is built at all, so there is nothing for any tier to
-    agree with."""
+def test_a_low_confidence_song_still_ships_video_sync(settings, store):
+    """The rule the owner set: a song that came from a recording plays *with* the
+    recording. Confidence decides what the client is told, never whether the
+    sidecar exists."""
     weak = replace(settings, confidence_floor=0.99)
     outcome = run(weak, store)
 
-    assert outcome.sync is None
-    assert outcome.sync_tiers == frozenset()
+    assert outcome.low_confidence
+    assert outcome.sync is not None
+    assert outcome.sync.lowConfidence is True
 
 
-def test_only_the_agreeing_tiers_are_filed_with_a_sidecar(settings, store, monkeypatch):
-    """End to end through `run_job`, because the per-tier decision is only worth
-    anything if the store write honours it."""
+def test_a_song_with_an_unusable_map_is_filed_without_a_sidecar(settings, store, monkeypatch):
+    """End to end through `run_job`, because the decision is only worth anything
+    if the store write honours it."""
     from app.analysis import pipeline
     from app import jobs
     from app.jobs import run_job
 
-    real_lint_sync = pipeline.lint_sync
-    monkeypatch.setattr(
-        pipeline, "lint_sync",
-        lambda payload, sync: (["disagrees"] if payload.id.endswith(f":{EASY}")
-                               else real_lint_sync(payload, sync)))
+    from app.lint import SyncProblems
+
+    monkeypatch.setattr(pipeline, "lint_sync_problems",
+                        lambda payload, sync: SyncProblems(fatal=("beatAnchors is empty",)))
     # `run_job` builds its engines from the registry, which this module does not
     # populate — the fakes are passed straight to `analyze` everywhere else here.
     monkeypatch.setattr(jobs.engines, "build_chord_engine", lambda _s: FakeChordEngine())
@@ -419,10 +427,30 @@ def test_only_the_agreeing_tiers_are_filed_with_a_sidecar(settings, store, monke
     monkeypatch.setattr(jobs.engines, "build_onset_detector", lambda _s: FakeOnsetDetector())
     monkeypatch.setattr(jobs.engines, "build_structure_probe", lambda _s: None)
 
-    store.create_job(job_id="j1", uid="u1", video_id="dQw4w9WgXcQ", difficulty=NORMAL)
-    run_job(job_id="j1", video_id="dQw4w9WgXcQ", difficulty=NORMAL, uid="u1",
+    store.create_job(job_id="j1", uid="u1", video_id="dQw4w9WgXcQ")
+    run_job(job_id="j1", video_id="dQw4w9WgXcQ", uid="u1",
             settings=settings, store=store, source=FakeSource())
 
-    assert store.get_map("dQw4w9WgXcQ", EASY).sync is None
-    assert store.get_map("dQw4w9WgXcQ", NORMAL).sync is not None
-    assert store.get_map("dQw4w9WgXcQ", HARD).sync is not None
+    filed = store.get_map("dQw4w9WgXcQ")
+    assert filed is not None and filed.sync is None
+
+
+# --- a dirty chart is not a chart -------------------------------------------
+
+def test_a_song_that_would_warn_on_import_fails_rather_than_shipping():
+    """§12.4 made structural. There used to be three renders here and a dirty one
+    was *withheld* so its clean siblings could ship; with one chart there is no
+    sibling to spare, so nothing to ship and the lint's own words are the most
+    useful thing to raise."""
+    from app.analysis import pipeline as pipeline_module
+    from app.config import Settings
+
+    rec = recording()
+    real_lint = pipeline_module.lint
+    pipeline_module.lint = lambda payload: ["the chart is dirty"]
+    try:
+        with pytest.raises(LintFailure) as caught:
+            _assemble(rec, Settings(scratch_root="/tmp/chords-scratch"))
+    finally:
+        pipeline_module.lint = real_lint
+    assert caught.value.problems == ["the chart is dirty"]

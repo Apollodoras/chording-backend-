@@ -340,3 +340,45 @@ def test_settling_keeps_the_quality_it_settled_on():
     assert settled == 1
     assert (out[0][0].root_pc, out[0][0].quality) == (G, DOMINANT7)
     assert out[0][0].length_beats == 4.0
+
+
+def test_a_split_the_song_plays_every_time_is_not_settled():
+    """F15. `SETTLE_SHARE` asks one bar in isolation whether its second chord
+    looks like an anticipation, and one bar cannot tell an anticipation from a
+    cadence: `| IV V |` at the end of a phrase reads exactly like `| IV |` with
+    the next chord pushed early.
+
+    What separates them is the other passes of the same slot. An engine putting a
+    change a beat early does it on some passes and not others; a song that really
+    splits that bar splits it every time.
+    """
+    from app.analysis.canon import settle_to_bars
+    from app.analysis.form import RepeatGroup
+    from app.analysis.structure import BarChord
+
+    def whole(root):
+        return [BarChord(root_pc=root, quality=MAJOR, start_beat=0.0,
+                         length_beats=4.0, confidence=0.9)]
+
+    def split(first, second, share=2.0):
+        return [BarChord(root_pc=first, quality=MAJOR, start_beat=0.0,
+                         length_beats=4.0 - share, confidence=0.9),
+                BarChord(root_pc=second, quality=MAJOR, start_beat=4.0 - share,
+                         length_beats=share, confidence=0.9)]
+
+    # Four passes of | G | D | Em | C F |, and one where the F arrived a beat
+    # late so C holds three of the four beats.
+    def verse(last):
+        return [whole(7), whole(2), whole(4), last]
+
+    bars = (verse(split(0, 5)) + verse(split(0, 5))
+            + verse(split(0, 5)) + verse(split(0, 5, share=1.0)))
+    group = RepeatGroup(label="A", length_bars=4, occurrences=[0, 4, 8, 12])
+
+    settled_blind, count_blind = settle_to_bars(bars, 4)
+    assert count_blind == 1, "on its own the lopsided occurrence is flattened"
+    assert len(settled_blind[15]) == 1
+
+    settled, count = settle_to_bars(bars, 4, [group])
+    assert count == 0, "with its siblings in view it is a corroborated split"
+    assert len(settled[15]) == 2

@@ -32,7 +32,7 @@ import pytest
 
 from app.analysis.pipeline import assemble
 from app.analysis.types import EngineInfo
-from app.chords import DIFFICULTIES, HARD, normalize, prefers_flats, render
+from app.chords import normalize, prefers_flats, render
 from app.config import Settings
 from app.lint import lint, lint_sync
 from app.payload import CompositionPayload
@@ -46,10 +46,10 @@ _ENGINES = {"chords_engine": EngineInfo("exact", "1.0"),
             "beats_engine": EngineInfo("exact", "1.0")}
 
 
-def _analyze(rec, difficulty: str = HARD, **settings):
+def _analyze(rec, **settings):
     outcome = assemble(meta=rec.meta, grid=rec.grid, raw=rec.chords, onsets=[],
                        settings=Settings(**settings), **_ENGINES)
-    payload = CompositionPayload.model_validate(outcome.songs[difficulty])
+    payload = CompositionPayload.model_validate(outcome.song)
     return payload, outcome.sync
 
 
@@ -107,8 +107,7 @@ def test_song_starting_on_a_downbeat_is_exact():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("pickup", [1, 2, 3])
-@pytest.mark.parametrize("difficulty", DIFFICULTIES)
-def test_pickup_does_not_shift_the_chart(pickup, difficulty):
+def test_pickup_does_not_shift_the_chart(pickup):
     """A song whose first downbeat is not its first beat must still line up.
 
     This is the normal case, not an edge case: a beat tracker reports beats from
@@ -117,7 +116,7 @@ def test_pickup_does_not_shift_the_chart(pickup, difficulty):
     chart and the anchors cannot start from different places.
     """
     rec = recording(pickup_beats=pickup)
-    payload, sync = _analyze(rec, difficulty)
+    payload, sync = _analyze(rec)
 
     assert sync is not None
     frame, downbeat = score(rec, payload, sync)

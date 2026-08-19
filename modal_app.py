@@ -333,7 +333,7 @@ WORKER_TIMEOUT_S = 600
     max_containers=8,
     retries=0,          # a failed analysis is reported, never silently retried
 )
-def analysis_worker(job_id: str, video_id: str, difficulty: str, uid: str,
+def analysis_worker(job_id: str, video_id: str, uid: str,
                     audio: bytes | None = None, filename: str | None = None,
                     attempt: int = 1) -> None:
     """One analysis, in its own container, with its own image and secret.
@@ -393,15 +393,14 @@ def analysis_worker(job_id: str, video_id: str, difficulty: str, uid: str,
     retryable = audio is None and attempt < egress_attempt_budget(source)
 
     try:
-        outcome = run_job(job_id=job_id, video_id=video_id, difficulty=difficulty,
+        outcome = run_job(job_id=job_id, video_id=video_id,
                           uid=uid, settings=settings, store=store, source=source,
                           may_retry_elsewhere=retryable)
         if outcome == OUTCOME_EGRESS_BLOCKED:
             # Order matters: retire this container *before* spawning, so the new
             # input cannot be handed straight back to the IP that just failed.
             stop_fetching_inputs()
-            analysis_worker.spawn(job_id, video_id, difficulty, uid,
-                                  attempt=attempt + 1)
+            analysis_worker.spawn(job_id, video_id, uid, attempt=attempt + 1)
     finally:
         # The check a per-job cleanup can't do: catches a crash between mkdir and
         # the `with`. The container is about to die and take its filesystem with
@@ -489,10 +488,9 @@ def fastapi_app():
         `POST /v1/analyze` answered 503 on a deployment that was working.
         """
 
-        def submit(self, *, job_id: str, video_id: str, difficulty: str, uid: str,
+        def submit(self, *, job_id: str, video_id: str, uid: str,
                    audio: bytes | None = None, filename: str | None = None) -> None:
-            analysis_worker.spawn(job_id=job_id, video_id=video_id,
-                                  difficulty=difficulty, uid=uid,
+            analysis_worker.spawn(job_id=job_id, video_id=video_id, uid=uid,
                                   audio=audio, filename=filename)
 
         def can_accept_uploads(self) -> bool:

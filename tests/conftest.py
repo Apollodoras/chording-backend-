@@ -3,7 +3,7 @@
 The design point from `app/analysis/pipeline.py` pays off here: everything after
 `decode` is pure, so a chord engine is just "a function that returns a list of
 labelled spans". These fakes stand in for BTC/madmom/librosa and let the suite
-exercise quantization, structure, difficulty tiers, the compiler and §13.2's
+exercise quantization, structure, the compiler and §13.2's
 anchor invariant with **no audio, no model weights and no network** — which is
 also what makes it runnable in CI before the §8-step-2 benchmark has happened.
 

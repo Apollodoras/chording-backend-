@@ -14,7 +14,7 @@ Two sources, both real:
   bytes rather than the hand JSON.
 - **the pipeline itself**, run over the known song with fake engines. This is the
   more valuable half: it is the actual shape an analysis produces — bars mode,
-  extracted patterns, `yt:` ids, three difficulty tiers — and it needs no audio.
+  extracted patterns, `yt:` ids — and it needs no audio.
 
 Run:  python tests/emit_reference_fixtures.py
 
@@ -77,11 +77,10 @@ def emit_from_pipeline() -> int:
         chords_engine=EngineInfo("reference", "1.0.0"),
         beats_engine=EngineInfo("reference", "1.0.0"),
     )
-    for difficulty, wire in sorted(outcome.songs.items()):
-        name = f"pipeline-known-song-{difficulty}.json"
-        (EMITTED / name).write_text(json.dumps(wire, ensure_ascii=False,
-                                               sort_keys=True, indent=2) + "\n")
-        print(f"emitted {name}")
+    name = "pipeline-known-song.json"
+    (EMITTED / name).write_text(json.dumps(outcome.song, ensure_ascii=False,
+                                           sort_keys=True, indent=2) + "\n")
+    print(f"emitted {name}")
 
     # The sidecar rides alongside rather than inside the payload, so it gets its
     # own file — the app's contract test must be able to read a payload that is

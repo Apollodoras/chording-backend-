@@ -22,9 +22,9 @@ What it scores:
   separate from the chord-engine score above. Everything else here measures a
   *component* against ground truth; `delivered` measures the **deliverable** —
   it reconstructs "what chord is on screen at video millisecond t" from
-  `(song, videoSync)` the way the client does, after quantization, structure,
-  `repeats` and simplification have all had their say. The two can diverge a long
-  way, and when they do it is this one that describes the product.
+  `(song, videoSync)` the way the client does, after quantization, structure and
+  `repeats` have all had their say. The two can diverge a long way, and when they
+  do it is this one that describes the product.
 
 Two corpora, reported separately and never averaged together:
 
@@ -65,10 +65,8 @@ from app.analysis.pipeline import assemble  # noqa: E402
 from app.analysis.strumming import extract, fold_onsets  # noqa: E402
 from app.analysis.types import BeatGrid, EngineInfo, RawChordSpan, VideoMeta  # noqa: E402
 from app.chords import (  # noqa: E402
-    HARD,
     MAJOR,
     MINOR,
-    NORMAL,
     normalize,
     prefers_flats,
     render,
@@ -234,8 +232,7 @@ def delivered_accuracy(payload: CompositionPayload, sync, truth: dict) -> float:
     """Share of the track whose chord the **player actually sees** correctly.
 
     Everything above scores an *engine*: raw spans, straight against ground
-    truth, before quantization, structure, `repeats` and simplification have
-    touched them. This scores the *deliverable* — it reconstructs "what chord is
+    truth, before quantization, structure and `repeats` have touched them. This scores the *deliverable* — it reconstructs "what chord is
     on screen at video millisecond t" from `(song, videoSync)` exactly as the
     client does (`app/sync.py`) and compares that.
 
@@ -247,7 +244,7 @@ def delivered_accuracy(payload: CompositionPayload, sync, truth: dict) -> float:
 
     Returns NaN when there is no sidecar: a self-paced song has no map from video
     time to song beat, so the question doesn't apply and averaging a zero in
-    would libel a pairing that correctly declined to guess (§13.3).
+    would libel a pairing that had no anchors to be graded on.
     """
     if sync is None or not sync.beatAnchors:
         return float("nan")
@@ -413,22 +410,24 @@ def bench_pipeline(cases: list[Case]) -> None:
                     failed += 1
                     reasons[type(exc).__name__] = reasons.get(type(exc).__name__, 0) + 1
                     continue
-                payload = CompositionPayload.model_validate(outcome.songs[NORMAL])
+                payload = CompositionPayload.model_validate(outcome.song)
                 if not lint(payload):
                     clean += 1
+                # Counts a *spotless* sidecar — advisory problems and fatal ones
+                # both fail it — because that is what this column has always
+                # measured, and the service shipping the advisory ones is a
+                # separate decision from the bench reporting them.
                 if outcome.sync is not None and not lint_sync(payload, outcome.sync):
                     synced += 1
-                # Scored on `hard`, not on the `normal` payload linted above.
-                # `normal` deliberately folds diminished and augmented onto their
-                # nearest playable triad (§5.5), so scoring it against a truth
-                # containing those chords charges the pipeline for a reduction it
-                # was asked to make — Michelle reads 0.812 at `normal` and 0.952
-                # at `hard` for exactly that reason. `hard` is the whole grammar,
-                # so what it loses is pipeline error and nothing else.
-                accuracy = delivered_accuracy(
-                    CompositionPayload.model_validate(outcome.songs[HARD]),
-                    outcome.sync, case.truth,
-                )
+                # One chart, scored against the whole grammar. This used to read
+                # `hard` here and `normal` above, because `normal` folded
+                # diminished and augmented onto their nearest playable triad and
+                # scoring *that* against a truth containing those chords charged
+                # the pipeline for a reduction it had been asked to make —
+                # Michelle read 0.812 at `normal` and 0.952 at `hard` for exactly
+                # that reason. With the tiers gone, what the chart loses is
+                # pipeline error and nothing else.
+                accuracy = delivered_accuracy(payload, outcome.sync, case.truth)
                 if accuracy == accuracy:      # not NaN — a sidecar was emitted
                     delivered.append(accuracy)
             note = ", ".join(f"{k}×{v}" for k, v in sorted(reasons.items())) or "-"
@@ -464,7 +463,7 @@ def _analyze(case: Case, grid: BeatGrid, raw: list[RawChordSpan], *,
 
 def _delivered(outcome, truth: dict) -> float:
     return delivered_accuracy(
-        CompositionPayload.model_validate(outcome.songs[HARD]), outcome.sync, truth)
+        CompositionPayload.model_validate(outcome.song), outcome.sync, truth)
 
 
 def bench_theory(cases: list[Case]) -> None:
@@ -533,7 +532,7 @@ def bench_theory(cases: list[Case]) -> None:
             edits["rewritten"] += report.rewrittenBars
             edits["snapped"] += report.snappedSpans
             edits["islands"] += report.absorbedIslands
-            tonic = CompositionPayload.model_validate(outcomes["both"].songs[HARD]).tonic
+            tonic = CompositionPayload.model_validate(outcomes["both"].song).tonic
             print(f"{label:<8}{case.name:<22}{delivered['off']:>7.3f}"
                   f"{delivered['cons']:>7.3f}{delivered['both']:>7.3f}"
                   f"{delivered['both'] - delivered['off']:>+8.3f}"
@@ -723,7 +722,7 @@ def bench_calibration(cases: list[Case]) -> None:
         axis = build_axis(reconcile(grid, raw).grid)
         if axis is None:
             continue
-        for span in postprocess.process(raw, axis, difficulty=HARD):
+        for span in postprocess.process(raw, axis):
             played = _truth_chord_at(case.truth, axis, span)
             if played is None:
                 continue
@@ -955,7 +954,7 @@ def _per_beat(outcome, truth: dict) -> list[bool] | None:
     """
     if outcome.sync is None or not outcome.sync.beatAnchors:
         return None
-    payload = CompositionPayload.model_validate(outcome.songs[HARD])
+    payload = CompositionPayload.model_validate(outcome.song)
     flats = prefers_flats(payload.tonic, payload.mode)
     out: list[bool] = []
     for chord in truth["chords"]:

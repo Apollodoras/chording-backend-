@@ -113,7 +113,7 @@ def test_polling_a_finished_job_returns_the_song_and_its_sidecar(client):
     job_id = analyze(client).json()["jobId"]
     body = client.get(f"/v1/analyze/{job_id}", headers=AUTH).json()
     assert body["status"] == "ready"
-    assert body["song"]["id"] == f"yt:{VIDEO}:normal"
+    assert body["song"]["id"] == f"yt:{VIDEO}"
     assert body["videoSync"]["videoId"] == VIDEO
     assert body["videoSync"]["beatAnchors"]
 
@@ -187,7 +187,7 @@ def test_a_warm_request_returns_the_result_inline(client):
     analyze(client)
     response = analyze(client)
     assert response.status_code == 200
-    assert response.json()["song"]["id"] == f"yt:{VIDEO}:normal"
+    assert response.json()["song"]["id"] == f"yt:{VIDEO}"
 
 
 def test_a_cache_hit_costs_the_player_nothing(client):
@@ -207,13 +207,39 @@ def test_a_cache_hit_does_not_touch_the_recording_again(client):
     assert len(client.source.decoded) == decoded
 
 
-def test_all_three_difficulties_are_stored_by_one_analysis(client):
-    """Switching difficulty later is a cache hit, not a second job."""
+def test_one_analysis_stores_one_song_under_the_videos_own_id(client):
+    """Asking again is a cache hit. The id used to carry a difficulty suffix so
+    one video could hold three rows; it is the video's id now."""
     analyze(client)
-    for difficulty in ("easy", "normal", "hard"):
-        response = analyze(client, difficulty=difficulty)
-        assert response.status_code == 200
-        assert response.json()["song"]["id"] == f"yt:{VIDEO}:{difficulty}"
+    response = analyze(client)
+    assert response.status_code == 200
+    assert response.json()["song"]["id"] == f"yt:{VIDEO}"
+
+
+def test_a_client_still_sending_difficulty_is_not_rejected(client):
+    """The §5.5 tiers are gone from the wire, and a phone in someone's pocket
+    does not redeploy with the backend. An already-shipped client still sends
+    `{videoId, difficulty}`, and an extra field it no longer means anything to
+    read must be ignored rather than answered with a 422."""
+    response = client.post("/v1/analyze",
+                           json={"videoId": VIDEO, "difficulty": "easy"}, headers=AUTH)
+    assert response.status_code in (200, 202), response.text
+
+
+def test_the_old_difficulty_query_param_is_ignored(client):
+    """Same argument on the read path: `GET /v1/maps/{id}?difficulty=hard` is a
+    URL an old build constructs, and it addresses the video's one chart."""
+    analyze(client)
+    response = client.get(f"/v1/maps/{VIDEO}?difficulty=hard", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json()["song"]["id"] == f"yt:{VIDEO}"
+
+
+def test_the_catalog_card_no_longer_advertises_a_difficulty(client):
+    analyze(client)
+    card = client.get("/v1/catalog", headers=AUTH).json()["results"][0]
+    assert "difficulty" not in card
+    assert card["songId"] == f"yt:{VIDEO}"
 
 
 def test_a_pasted_url_works_as_well_as_an_id(client):
@@ -233,11 +259,6 @@ def test_something_that_is_not_a_video_is_rejected_clearly(client):
     response = client.post("/v1/analyze", json={"videoId": "not a video!"}, headers=AUTH)
     assert response.status_code == 400
     assert response.json()["code"] == "bad_request"
-
-
-def test_an_unknown_difficulty_is_rejected(client):
-    response = analyze(client, difficulty="expert")
-    assert response.status_code == 400
 
 
 def test_the_daily_quota_is_enforced_with_the_code_the_client_reads(settings, store):
@@ -278,7 +299,7 @@ def test_two_players_asking_at_once_join_one_job(settings, store):
     source = FakeSource()
     app = create_app(settings, store=store, source=source, runner=JobRunner(settings, store, source))
     with TestClient(app) as client:
-        store.create_job(job_id="inflight", uid="dev:local", video_id=VIDEO, difficulty="normal")
+        store.create_job(job_id="inflight", uid="dev:local", video_id=VIDEO)
         response = client.post("/v1/analyze", json={"videoId": VIDEO}, headers=AUTH)
     assert response.status_code == 202
     assert response.json()["jobId"] == "inflight"
@@ -289,7 +310,7 @@ def test_another_players_job_is_not_readable(client):
     """404 rather than 403: whether someone else's job exists is not this
     caller's business."""
     client.app.state.store.create_job(job_id="theirs", uid="someone-else",
-                                      video_id=VIDEO, difficulty="normal")
+                                      video_id=VIDEO)
     assert client.get("/v1/analyze/theirs", headers=AUTH).status_code == 404
 
 
@@ -302,7 +323,7 @@ def test_blocking_purges_the_cached_map_in_the_same_request(client):
     response = client.post("/v1/admin/block",
                            json={"videoId": VIDEO, "reason": "DMCA"}, headers=ADMIN)
     assert response.status_code == 200
-    assert response.json()["purged"]["maps"] == 3
+    assert response.json()["purged"]["maps"] == 1
 
     assert client.get(f"/v1/maps/{VIDEO}", headers=AUTH).status_code == 404
     assert analyze(client).status_code == 403
@@ -342,7 +363,7 @@ def test_the_audit_log_records_who_blocked_what(client):
 def test_a_purge_reports_what_it_actually_removed(client):
     analyze(client)
     body = client.delete(f"/v1/admin/maps/{VIDEO}", headers=ADMIN).json()
-    assert body["purged"]["maps"] == 3
+    assert body["purged"]["maps"] == 1
 
 
 # --- offset (§6) ------------------------------------------------------------
@@ -417,10 +438,10 @@ def test_a_blocked_video_never_appears_in_the_catalog(client):
 
 
 def test_a_video_analyzed_twice_is_one_song_in_the_catalog(client):
-    """Two difficulties are two analyses of one song, and the catalog lists
-    songs."""
-    analyze(client, difficulty="easy")
-    analyze(client, difficulty="hard")
+    """The catalog lists songs, not analyses: re-analyzing a video replaces its
+    row."""
+    analyze(client)
+    analyze(client)
 
     results = client.get("/v1/catalog", headers=AUTH).json()["results"]
     assert [row["videoId"] for row in results] == [VIDEO]

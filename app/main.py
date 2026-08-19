@@ -2,7 +2,7 @@
 
 | Endpoint | Body | Returns |
 |---|---|---|
-| `POST /v1/analyze` | `{videoId \\| url, difficulty?}` | `{song, videoSync}` or `{jobId, status}` |
+| `POST /v1/analyze` | `{videoId \\| url}` | `{song, videoSync}` or `{jobId, status}` |
 | `GET /v1/analyze/{jobId}` | — | `{status, progress, song?, videoSync?, message?}` |
 | `GET /v1/maps/{videoId}` | — | cached result or 404 |
 | `GET /v1/catalog` | `limit`, `offset` | `{results, version}` — every analyzed song, newest first |
@@ -34,7 +34,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -47,7 +47,6 @@ from .analysis.fetch import build_source, parse_video_id
 # "the API surface cannot touch audio" check asserts.
 from .analysis.file_source import MAX_UPLOAD_BYTES, upload_id
 from .auth import Authenticator, Principal, build_authenticator
-from .chords import DIFFICULTIES, NORMAL
 from .config import Settings, load_settings
 from .errors import (
     CODE_ANALYSIS_FAILED,
@@ -84,7 +83,6 @@ class AnalyzeRequest(BaseModel):
 
     videoId: str | None = Field(default=None, max_length=64)
     url: str | None = Field(default=None, max_length=2048)
-    difficulty: str | None = None
 
 
 class BlockRequest(BaseModel):
@@ -552,9 +550,8 @@ def _install_routes(app: FastAPI) -> None:
         store: Store = app.state.store
 
         video_id = _video_id(body)
-        difficulty = _difficulty(body.difficulty)
 
-        cached = store.get_map(video_id, difficulty)
+        cached = store.get_map(video_id)
         if cached is not None:
             if store.is_blocked(video_id=video_id, channel_id=cached.channel_id):
                 raise fail(403, "That video isn’t available for chord analysis.", CODE_VIDEO_BLOCKED)
@@ -580,7 +577,7 @@ def _install_routes(app: FastAPI) -> None:
         # refuses it. They were told, forever, that the analysis had expired —
         # and retrying handed back the same dead id, so one player asking first
         # made the video permanently un-analyzable for everyone else.
-        existing = store.active_job_for(video_id, difficulty)
+        existing = store.active_job_for(video_id)
         if existing is not None:
             store.follow_job(existing.job_id, principal.uid)
             return JSONResponse(status_code=202,
@@ -588,10 +585,9 @@ def _install_routes(app: FastAPI) -> None:
 
         _charge(app, principal)
         job_id = uuid.uuid4().hex
-        store.create_job(job_id=job_id, uid=principal.uid, video_id=video_id, difficulty=difficulty)
+        store.create_job(job_id=job_id, uid=principal.uid, video_id=video_id)
         try:
-            app.state.runner.submit(job_id=job_id, video_id=video_id, difficulty=difficulty,
-                                    uid=principal.uid)
+            app.state.runner.submit(job_id=job_id, video_id=video_id, uid=principal.uid)
         except Exception:
             # The dispatch itself failed — Modal refusing a spawn, the thread
             # pool shutting down. Without this the caller is charged for a job
@@ -608,7 +604,6 @@ def _install_routes(app: FastAPI) -> None:
 
     @app.post("/v1/analyze/upload")
     async def analyze_upload(request: Request, file: UploadFile = File(...),
-                             difficulty: str | None = Form(default=None),
                              principal: Principal = Depends(_principal_checked)):
         """Analyze audio the player supplied, rather than a video we fetched.
 
@@ -646,19 +641,18 @@ def _install_routes(app: FastAPI) -> None:
             raise fail(503, "Uploads aren’t available on this deployment yet.",
                        CODE_FEATURE_DISABLED)
 
-        tier = _difficulty(difficulty)
         async with _upload_slot():
             data = await _read_upload(file, settings)
             video_id = upload_id(data)
 
-            cached = store.get_map(video_id, tier)
+            cached = store.get_map(video_id)
             if cached is not None:
                 return _result(cached)
             if store.is_blocked(video_id=video_id):
                 raise fail(403, "That audio isn’t available for chord analysis.",
                            CODE_VIDEO_BLOCKED)
 
-            existing = store.active_job_for(video_id, tier)
+            existing = store.active_job_for(video_id)
             if existing is not None:
                 store.follow_job(existing.job_id, principal.uid)
                 return JSONResponse(status_code=202,
@@ -666,10 +660,9 @@ def _install_routes(app: FastAPI) -> None:
 
             _charge(app, principal)
             job_id = uuid.uuid4().hex
-            store.create_job(job_id=job_id, uid=principal.uid, video_id=video_id,
-                             difficulty=tier)
+            store.create_job(job_id=job_id, uid=principal.uid, video_id=video_id)
             try:
-                app.state.runner.submit(job_id=job_id, video_id=video_id, difficulty=tier,
+                app.state.runner.submit(job_id=job_id, video_id=video_id,
                                         uid=principal.uid, audio=data, filename=file.filename)
             except Exception:
                 log.exception("failed to submit upload job %s", job_id)
@@ -695,7 +688,7 @@ def _install_routes(app: FastAPI) -> None:
 
         body: dict = {"status": job.status, "progress": round(job.progress, 3)}
         if job.status == STATUS_READY:
-            cached = store.get_map(job.video_id, job.difficulty)
+            cached = store.get_map(job.video_id)
             if cached is None:
                 # The map went away between finishing and polling. Which of the
                 # two reasons it was decides what the player is told, and
@@ -716,7 +709,7 @@ def _install_routes(app: FastAPI) -> None:
         return body
 
     @app.get("/v1/maps/{video_id}")
-    async def get_map(video_id: str, difficulty: str | None = None,
+    async def get_map(video_id: str,
                       principal: Principal = Depends(_principal_polling)):
         """A cached analysis by id — **only if this caller may read it.**
 
@@ -732,7 +725,7 @@ def _install_routes(app: FastAPI) -> None:
         authorizes the read there.
         """
         store: Store = app.state.store
-        cached = store.get_map(video_id, _difficulty(difficulty))
+        cached = store.get_map(video_id)
         if cached is None or not _may_read(cached, principal):
             raise fail(404, "No analysis for that video yet.", CODE_NOT_FOUND)
         if store.is_blocked(video_id=video_id, channel_id=cached.channel_id):
@@ -984,14 +977,6 @@ async def _read_upload(file: UploadFile, settings: Settings) -> bytearray:
     return buffer
 
 
-def _difficulty(value: str | None) -> str:
-    if value is None:
-        return NORMAL
-    if value not in DIFFICULTIES:
-        raise fail(400, f"Difficulty must be one of {', '.join(DIFFICULTIES)}.", CODE_BAD_REQUEST)
-    return value
-
-
 def _may_read(cached, principal: Principal) -> bool:
     """Whether this caller is entitled to a stored map.
 
@@ -1040,7 +1025,6 @@ def _catalog_row(entry) -> dict:
         "tempo": entry.tempo,
         "tonic": entry.tonic,
         "mode": entry.mode,
-        "difficulty": entry.difficulty,
         "analyzedAt": entry.analyzed_at,
         "lowConfidence": bool(entry.low_confidence),
         "embeddable": True,

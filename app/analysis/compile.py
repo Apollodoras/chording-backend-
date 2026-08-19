@@ -42,6 +42,7 @@ from ..payload import (
     bar_beats as parse_bar_beats,
     derived_uuid,
     song_id,
+    total_beats,
 )
 from ..sync import Confidence, EngineVersions, TheoryReport, VideoSync, anchors_for
 from .keyfinder import DetectedKey
@@ -53,7 +54,7 @@ _EPS = 1e-6
 
 @dataclass(frozen=True)
 class CompiledSong:
-    """What one difficulty tier compiles to."""
+    """What one analysis compiles to."""
 
     payload: CompositionPayload
     sync: VideoSync | None
@@ -68,7 +69,6 @@ def compile_song(
     key: DetectedKey,
     tempo: int,
     time_signature: str,
-    difficulty: str | None = None,
 ) -> CompositionPayload:
     """Sections → a `CompositionPayload` v2.
 
@@ -84,7 +84,7 @@ def compile_song(
     payload_sections: list[SongSection] = []
     embedded: dict[str, PatternPayload] = {}
 
-    song = song_id(video_id, difficulty)
+    song = song_id(video_id)
     for index, section in enumerate(sections):
         extracted = patterns.get(section.group)
         if extracted is None:
@@ -291,12 +291,55 @@ def build_sync(
         videoId=video_id,
         durationMs=duration_ms,
         offsetMs=offset_ms,
-        tempo=Confidence(bpm=round(bpm, 2), confidence=round(tempo_confidence, 3)),
+        # Clamped, not asserted. Both are engine-reported and the container's
+        # domain is 0…1; a tracker handing back 1.02 is a bug in the tracker, and
+        # the sidecar's job is not to lose the whole beat map over it. `lint_sync`
+        # still calls an out-of-range value fatal, which is now a statement about
+        # *this* function having failed rather than about the recording.
+        tempo=Confidence(bpm=round(bpm, 2), confidence=round(_unit(tempo_confidence), 3)),
         timeSignature=time_signature,
         lowConfidence=low_confidence,
-        patternConfidence=pattern_confidence,
+        patternConfidence=None if pattern_confidence is None else _unit(pattern_confidence),
         beatAnchors=anchors_for(usable, bar_beats=bar_beats),
         engine=EngineVersions(chords=engine_chords, beats=engine_beats),
         analyzedAt=analyzed_at,
         analysis=analysis,
     )
+
+
+def _unit(value: float) -> float:
+    return min(1.0, max(0.0, float(value)))
+
+
+def fit_sync(sync: VideoSync, payload: CompositionPayload) -> VideoSync:
+    """The same sidecar, trimmed to what **this** chart actually covers.
+
+    The anchors are measured on the **recording** and the chart is measured in
+    bars, and the two can disagree about where the song ends: `model.impose` may
+    expand or merge across a barline, so the chart can come out shorter than the
+    grid the anchors were built from. The anchors past its last beat then address
+    bars that do not exist, and the cursor walks off the end of the chart.
+
+    That used to cost the song its sidecar entirely — `lint_sync` reported the
+    overrun and §13.3 withheld. It is a trim, so it is now trimmed: drop the
+    anchors beyond the chart's final barline and keep the map for everything the
+    chart does cover. Nothing else about the sidecar is touched; a sidecar that
+    already fits is returned unchanged rather than copied.
+
+    The last anchor kept is the one *at* the song's final beat — it marks the
+    closing boundary of the last bar, which is why an N-bar song ships N+1
+    anchors and why the bound is inclusive.
+    """
+    song_length = total_beats(payload)
+    if song_length <= 0:
+        return sync
+    kept = [a for a in sync.beatAnchors if a.songBeat <= song_length + _FIT_EPS]
+    if len(kept) == len(sync.beatAnchors):
+        return sync
+    # Fewer than two anchors is not a map, and `lint_sync` says so as a fatal.
+    # Handing the untrimmed sidecar back instead would trade one reported problem
+    # for a worse unreported one, so the trim stands and the lint decides.
+    return sync.model_copy(update={"beatAnchors": kept})
+
+
+_FIT_EPS = 1e-6

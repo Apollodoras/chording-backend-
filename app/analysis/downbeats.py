@@ -67,8 +67,8 @@ GAP_TOLERANCE = 0.25
 # may genuinely not be in that meter — Anti Nowhere League's So What sits at
 # 42% — and forcing it would be exactly the confident mistake §20 exists to
 # avoid. The repair still runs (a self-consistent grid is worth having either
-# way) but the song is flagged, and §13.3 withholds the sidecar rather than
-# shipping a video sync nobody checked.
+# way) but the song is flagged `lowConfidence`, which since the §13.3 amendment
+# is what it says to the player instead of the sidecar being withheld.
 IRREGULAR_CEILING = 0.35
 
 # Fewer bars than this and there is no mode worth trusting: three gaps can be

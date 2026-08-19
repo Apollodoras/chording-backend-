@@ -121,7 +121,6 @@ def analyze_one(name: str) -> dict:
     import time
     import traceback
 
-    from app.chords import NORMAL
     from app.config import load_settings
     from app.payload import bar_beats
     from app.analysis import engines, pipeline
@@ -186,7 +185,6 @@ def analyze_one(name: str) -> dict:
     report["engines"] = {"chords": outcome.engine_chords, "beats": outcome.engine_beats}
     report["lowConfidence"] = outcome.low_confidence
     report["lowConfidenceReasons"] = list(outcome.low_confidence_reasons)
-    report["difficulties"] = sorted(outcome.songs)
     report["hasSync"] = outcome.sync is not None
 
     # The beat map, which this gate never looked at. A song can run end to end,
@@ -210,14 +208,14 @@ def analyze_one(name: str) -> dict:
     # Read everything below off the wire payload the client would actually
     # receive, not off internal state, so a field that fails to serialize shows
     # up here rather than on someone's phone.
-    # `NORMAL`, not "intermediate" — the tiers are `easy`/`normal`/`hard`
-    # (`app.chords.DIFFICULTIES`), and there has never been a tier by that name.
-    # The `or` fallback meant this never failed: it silently took
-    # `sorted(...)[0]`, which is **easy**, so every chord count and root
-    # histogram this gate has ever printed described the simplified tier while
-    # the code read as though it described the middle one.
-    wire = outcome.songs[NORMAL]
-    report["tierRead"] = NORMAL
+    #
+    # There used to be three of these — one per difficulty tier — and this gate
+    # read the wrong one for its whole life: the lookup named a tier that did not
+    # exist and the `or` fallback silently took `sorted(...)[0]`, which is
+    # **easy**, so every chord count and root histogram it printed described the
+    # simplified chart. There is one chart now, and no way left to read the
+    # wrong one.
+    wire = outcome.song
     report["payloadKeys"] = sorted(wire)
     report["payloadBytes"] = len(json.dumps(wire))
 

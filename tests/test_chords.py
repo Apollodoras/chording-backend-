@@ -1,4 +1,4 @@
-"""The chord grammar, the normalization §12.2 demands, and the difficulty tiers.
+"""The chord grammar and the normalization §12.2 demands.
 
 The grammar half is a port of the app's `ChordSymbol(name:)` and is tested the
 same way Mo tests it. The normalization half is this service's own, and it is
@@ -16,14 +16,11 @@ from app.chords import (
     DIMINISHED,
     DIMINISHED7,
     DOMINANT7,
-    EASY,
     HALF_DIM7,
-    HARD,
     MAJOR,
     MAJOR7,
     MINOR,
     MINOR7,
-    NORMAL,
     SUS2,
     SUS4,
     is_valid_chord,
@@ -33,7 +30,6 @@ from app.chords import (
     parse_chord,
     prefers_flats,
     render,
-    simplify,
 )
 
 
@@ -143,35 +139,31 @@ def test_quality_reduction_reports_exactness():
     assert normalize_quality("13") == (DOMINANT7, False)
 
 
-# --- difficulty -------------------------------------------------------------
+# --- no simplification ------------------------------------------------------
 
-def test_easy_is_major_and_minor_only():
-    """§5.5 as re-scoped by §12.2. `easy` is the tier a beginner plays, so every
-    quality has to land on a triad they can hold."""
-    for quality in (MAJOR7, DOMINANT7, AUGMENTED, SUS2, SUS4):
-        assert simplify(quality, EASY) == MAJOR
-    for quality in (MINOR7, DIMINISHED, DIMINISHED7, HALF_DIM7):
-        assert simplify(quality, EASY) == MINOR
+def test_the_grammar_offers_no_way_to_make_a_chord_easier():
+    """The §5.5 difficulty tiers are gone, and this is the guard on them staying
+    gone: the chart states what was played, so nothing in this module may take a
+    quality and hand back a simpler one. `simplify`, `DIFFICULTIES`, `EASY`,
+    `NORMAL` and `HARD` were that API."""
+    import app.chords as chords
 
-
-def test_normal_keeps_sevenths_and_sus_but_not_the_exotics():
-    assert simplify(MAJOR7, NORMAL) == MAJOR7
-    assert simplify(DOMINANT7, NORMAL) == DOMINANT7
-    assert simplify(MINOR7, NORMAL) == MINOR7
-    assert simplify(SUS4, NORMAL) == SUS4
-    # Grammar-legal, but not campfire chords.
-    assert simplify(DIMINISHED, NORMAL) == MINOR
-    assert simplify(HALF_DIM7, NORMAL) == MINOR7
-    assert simplify(AUGMENTED, NORMAL) == MAJOR
+    for name in ("simplify", "DIFFICULTIES", "EASY", "NORMAL", "HARD"):
+        assert not hasattr(chords, name), f"app.chords.{name} is back"
 
 
-def test_hard_is_the_grammar_ceiling_not_full_detected_quality():
-    """§12.2 is explicit that `hard` cannot mean "everything the engine heard" —
-    the ceiling is what `ChordSymbol(name:)` parses. So `hard` is a pass-through,
-    and the reduction has already happened in `normalize`."""
-    for quality in (MAJOR, MINOR, DOMINANT7, MAJOR7, MINOR7, DIMINISHED,
-                    DIMINISHED7, HALF_DIM7, AUGMENTED, SUS4, SUS2):
-        assert simplify(quality, HARD) == quality
+def test_normalization_is_the_only_reduction_and_it_reports_itself():
+    """What survives is the app's grammar, which is a ceiling rather than a
+    choice — and every quality inside it comes back untouched. A chord that had
+    to be reduced to fit says so, which is what `exactRatio` counts."""
+    for token, quality in (("maj", MAJOR), ("min", MINOR), ("7", DOMINANT7),
+                           ("maj7", MAJOR7), ("min7", MINOR7), ("dim", DIMINISHED),
+                           ("dim7", DIMINISHED7), ("hdim7", HALF_DIM7),
+                           ("aug", AUGMENTED), ("sus4", SUS4), ("sus2", SUS2)):
+        assert normalize_quality(token) == (quality, True), token
+    # Cmaj7 stays a major 7. It is not a C, at any level of anything.
+    assert normalize("C:maj7") == (0, MAJOR7, True)
+    assert normalize("A:min7") == (9, MINOR7, True)
 
 
 # --- spelling ---------------------------------------------------------------

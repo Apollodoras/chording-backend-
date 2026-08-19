@@ -15,7 +15,7 @@
     "videoId": "EkHTsc9PU2A",
     "title": "I'm Yours",
     "artist": "Jason Mraz",
-    "note": "C G Am F throughout. Offbeat reggae strum — onsets land between beats, which the beat tracker has to not follow."
+    "note": "C G Am F throughout. Offbeat reggae strum \u2014 onsets land between beats, which the beat tracker has to not follow."
   },
   "three-little-birds": {
     "videoId": "HNBCVM4KbUM",
@@ -27,7 +27,7 @@
     "videoId": "1vrEljMfXYo",
     "title": "Take Me Home, Country Roads",
     "artist": "John Denver",
-    "note": "A major, verse and chorus harmonically distinct — the form score has something to be wrong about."
+    "note": "A major, verse and chorus harmonically distinct \u2014 the form score has something to be wrong about."
   },
   "wonderwall": {
     "videoId": "6hzrDeceEKc",
@@ -39,13 +39,13 @@
     "videoId": "hLQl3WQQoQ0",
     "title": "Someone Like You",
     "artist": "Adele",
-    "note": "Piano only, arpeggiated. No strum, no band — the chord engine has the least evidence per frame here."
+    "note": "Piano only, arpeggiated. No strum, no band \u2014 the chord engine has the least evidence per frame here."
   },
   "dont-stop-believin": {
     "videoId": "1k8craCGpgs",
     "title": "Don't Stop Believin'",
     "artist": "Journey",
-    "note": "E major, four-bar loop, but the chorus arrives once at the very end — a form with a genuine hapax in it."
+    "note": "E major, four-bar loop, but the chorus arrives once at the very end \u2014 a form with a genuine hapax in it."
   },
   "viva-la-vida": {
     "videoId": "dvgZkm1xWPE",
@@ -58,5 +58,11 @@
     "title": "Smooth Criminal",
     "artist": "Michael Jackson",
     "note": "The owner's own failing case, on the exact video they ran: the 9:26 short film, whose first minute is dialogue and whose song proper is an Am vamp."
+  },
+  "mary-janes-last-dance": {
+    "videoId": "aowSGxim_O8",
+    "title": "Mary Jane's Last Dance",
+    "artist": "Tom Petty and The Heartbreakers",
+    "note": "48 cents sharp \u2014 the only recording in the book that is not at concert pitch, and the one case that exercises the tuning gate and the semitone slip. Added 2026-08-18 with the analysis audit; the ten songs above remain the row every earlier number in the docs was measured on."
   }
 }

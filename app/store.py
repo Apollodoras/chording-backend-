@@ -168,9 +168,12 @@ _SCHEMA = [
     """,
     "CREATE INDEX IF NOT EXISTS rate_events_lookup ON rate_events (scope, key, ts)",
     # §2.2 — the derived map, and NOTHING from which audio could be
-    # reconstructed. `song_json` is a CompositionPayload v2; `sync_json` is the
-    # §13 sidecar (nullable — §13.3 returns the song without it rather than
-    # faking a grid). `engine_chords`/`engine_beats` are stored per §5.3 so a
+    # reconstructed. **One row per video**: the §5.5 difficulty tiers used to put
+    # three here, keyed `(video_id, difficulty)`, and there is one chart now.
+    # `song_json` is a CompositionPayload v2; `sync_json` is the §13 sidecar
+    # (nullable — anchors that are not a usable map are filed without one rather
+    # than with a faked grid; since the §13.3 amendment that is the only thing
+    # that empties this column). `engine_chords`/`engine_beats` are stored per §5.3 so a
     # cache can be invalidated selectively when one engine is upgraded.
     #
     # `owner_uid` is what makes an **upload** private. Uploaded audio lands in
@@ -191,7 +194,6 @@ _SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS chord_maps (
         video_id      TEXT NOT NULL,
-        difficulty    TEXT NOT NULL,
         channel_id    TEXT,
         title         TEXT,
         duration_ms   INTEGER NOT NULL DEFAULT 0,
@@ -209,19 +211,19 @@ _SCHEMA = [
         tonic         TEXT,
         mode          TEXT,
         chord_names   TEXT,
-        PRIMARY KEY (video_id, difficulty)
+        PRIMARY KEY (video_id)
     )
     """,
     "CREATE INDEX IF NOT EXISTS chord_maps_channel ON chord_maps (channel_id)",
-    # Job lifecycle (§16.1). `result_difficulty` points at the chord_maps row a
-    # finished job produced, so a purge can find and clear the jobs that would
-    # otherwise keep handing out a map that no longer exists.
+    # Job lifecycle (§16.1). A job is identified by its video: `video_id` points
+    # at the chord_maps row a finished job produced, so a purge can find and
+    # clear the jobs that would otherwise keep handing out a map that no longer
+    # exists.
     """
     CREATE TABLE IF NOT EXISTS jobs (
         job_id            TEXT PRIMARY KEY,
         uid               TEXT NOT NULL,
         video_id          TEXT NOT NULL,
-        difficulty        TEXT NOT NULL,
         status            TEXT NOT NULL,
         progress          DOUBLE PRECISION NOT NULL DEFAULT 0,
         error_code        TEXT,
@@ -325,7 +327,6 @@ class ChordMap:
     """A cached analysis, as it comes back out of the store."""
 
     video_id: str
-    difficulty: str
     song: dict
     sync: Optional[dict]
     offset_ms: Optional[int]
@@ -356,7 +357,6 @@ class CatalogEntry:
     """
 
     video_id: str
-    difficulty: str
     title: Optional[str]
     artist: Optional[str]
     duration_ms: int
@@ -374,7 +374,6 @@ class Job:
     job_id: str
     uid: str
     video_id: str
-    difficulty: str
     status: str
     progress: float
     error_code: Optional[str]
@@ -449,6 +448,7 @@ class Store:
             cur.fetchone()
 
     def _migrate(self) -> None:
+        self._drop_difficulty()
         with self._cursor(write=True) as cur:
             for statement in _SCHEMA:
                 cur.execute(statement.format(id_column=self._ID_COLUMN))
@@ -457,6 +457,66 @@ class Store:
             for statement in _POST_MIGRATION_SCHEMA:
                 cur.execute(statement)
         self._denormalize_catalog()
+
+    def _drop_difficulty(self) -> None:
+        """Collapse the §5.5 difficulty tiers out of an already-written database.
+
+        The one migration in this file that is neither additive nor nullable, and
+        so the one written by hand and meant to be read by a person. It runs
+        **before** `_SCHEMA`, because it drops and recreates the two tables and
+        `CREATE TABLE IF NOT EXISTS` then puts back every index that went with
+        them. On a database that never had the column — a fresh one, or one
+        already migrated — `_columns` comes back without it and this is two
+        cheap lookups.
+
+        `chord_maps` cannot be migrated with `ALTER TABLE … DROP COLUMN`:
+        `difficulty` is half of its primary key. So the table is rebuilt, and
+        rebuilding forces the question of *which* of a video's three rows is the
+        one row it keeps. It keeps **`hard`** — that was the reference render,
+        the one built at the full grammar, and the only one of the three that
+        ever claimed to state what was played. `easy` and `normal` were
+        reductions of it, and a reduction is exactly what this change exists to
+        stop shipping, so they are dropped rather than merged or preferred. A
+        video that somehow has no `hard` row keeps `normal`, then `easy`, then
+        the most recent of whatever is left; the `ORDER BY` says so.
+
+        `jobs` is rebuilt the same way rather than with `DROP COLUMN`, which is
+        available on both backends but not on every SQLite a container might
+        carry (3.35+). Job rows survive the copy; they are short-lived and
+        lease-reaped either way, but losing one would strand a client polling it.
+        """
+        keep = ("CASE difficulty WHEN 'hard' THEN 0 WHEN 'normal' THEN 1 "
+                "ELSE 2 END, analyzed_at DESC")
+        rebuilds = (
+            # table, the row to keep per key, the key
+            ("chord_maps", keep, "video_id"),
+            ("jobs", None, None),
+        )
+        for table, order, key in rebuilds:
+            with self._cursor(write=True) as cur:
+                present = self._columns(cur, table)
+                if "difficulty" not in present:
+                    continue
+                ddl = next(st for st in _SCHEMA
+                           if f"CREATE TABLE IF NOT EXISTS {table} (" in st)
+                staging = f"{table}_migrating"
+                cur.execute(ddl.format(id_column=self._ID_COLUMN)
+                            .replace(f"IF NOT EXISTS {table} (", f"{staging} ("))
+                # The intersection, so this is correct whichever columns the old
+                # database happens to have — `_migrate_columns` has not run yet.
+                columns = [c for c in self._columns(cur, staging) if c in present]
+                names = ", ".join(columns)
+                where = "" if order is None else (
+                    f" WHERE difficulty = (SELECT d.difficulty FROM {table} d "
+                    f"WHERE d.{key} = {table}.{key} ORDER BY "
+                    f"{order.replace('difficulty', 'd.difficulty').replace('analyzed_at', 'd.analyzed_at')}"
+                    " LIMIT 1)"
+                )
+                cur.execute(f"INSERT INTO {staging} ({names}) "
+                            f"SELECT {names} FROM {table}{where}")
+                cur.execute(f"DROP TABLE {table}")
+                cur.execute(f"ALTER TABLE {staging} RENAME TO {table}")
+            log.info("migrating: dropped the difficulty tiers from %s", table)
 
     def _migrate_columns(self) -> None:
         """Add any column in `_ADDED_COLUMNS` this database is missing."""
@@ -496,18 +556,17 @@ class Store:
         while True:
             with self._cursor() as cur:
                 cur.execute(self._sql(
-                    "SELECT video_id, difficulty, song_json FROM chord_maps "
+                    "SELECT video_id, song_json FROM chord_maps "
                     "WHERE denormalized = 0 LIMIT ?"
                 ), (batch,))
                 rows = cur.fetchall()
             if not rows:
                 break
-            for video_id, difficulty, song_json in rows:
+            for video_id, song_json in rows:
                 try:
                     song = json.loads(song_json) if song_json else {}
                 except (TypeError, ValueError):
-                    log.warning("chord map %s@%s has undecodable song_json",
-                                video_id, difficulty)
+                    log.warning("chord map %s has undecodable song_json", video_id)
                     song = {}
                 with self._cursor(write=True) as cur:
                     cur.execute(self._sql(
@@ -515,9 +574,9 @@ class Store:
                         UPDATE chord_maps
                         SET song_id = ?, artist = ?, tempo = ?, tonic = ?, mode = ?,
                             chord_names = ?, denormalized = 1
-                        WHERE video_id = ? AND difficulty = ?
+                        WHERE video_id = ?
                         """
-                    ), (*_catalog_scalars(song), video_id, difficulty))
+                    ), (*_catalog_scalars(song), video_id))
             total += len(rows)
         if total:
             log.info("migrating: denormalized %d chord map(s) for the catalog", total)
@@ -812,7 +871,7 @@ class Store:
 
     # -- chord maps (the cache) ----------------------------------------------
 
-    def put_map(self, *, video_id: str, difficulty: str, song: dict,
+    def put_map(self, *, video_id: str, song: dict,
                 sync: dict | None, engine_chords: str, engine_beats: str,
                 analyzed_at: str, channel_id: str | None = None,
                 title: str | None = None, duration_ms: int = 0,
@@ -833,20 +892,20 @@ class Store:
         """
         with self._cursor(write=True) as cur:
             cur.execute(self._sql(
-                "SELECT offset_ms, owner_uid FROM chord_maps WHERE video_id = ? AND difficulty = ?"
-            ), (video_id, difficulty))
+                "SELECT offset_ms, owner_uid FROM chord_maps WHERE video_id = ?"
+            ), (video_id,))
             row = cur.fetchone()
             preserved = row[0] if row and row[0] is not None else offset_ms
             owner = row[1] if row and row[1] is not None else owner_uid
             cur.execute(self._sql(
                 """
-                INSERT INTO chord_maps (video_id, difficulty, channel_id, title, duration_ms,
+                INSERT INTO chord_maps (video_id, channel_id, title, duration_ms,
                                         song_json, sync_json, offset_ms, low_confidence,
                                         engine_chords, engine_beats, analyzed_at, owner_uid,
                                         song_id, artist, tempo, tonic, mode, chord_names,
                                         denormalized)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(video_id, difficulty) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(video_id) DO UPDATE SET
                     channel_id = EXCLUDED.channel_id,
                     title = EXCLUDED.title,
                     duration_ms = EXCLUDED.duration_ms,
@@ -866,31 +925,31 @@ class Store:
                     chord_names = EXCLUDED.chord_names,
                     denormalized = 1
                 """
-            ), (video_id, difficulty, channel_id, title, duration_ms,
+            ), (video_id, channel_id, title, duration_ms,
                 json.dumps(song, ensure_ascii=False), json.dumps(sync, ensure_ascii=False) if sync else None,
                 preserved, 1 if low_confidence else 0, engine_chords, engine_beats, analyzed_at,
                 owner, *_catalog_scalars(song)))
 
-    def get_map(self, video_id: str, difficulty: str) -> ChordMap | None:
+    def get_map(self, video_id: str) -> ChordMap | None:
         with self._cursor() as cur:
             cur.execute(self._sql(
                 """
-                SELECT video_id, difficulty, song_json, sync_json, offset_ms, low_confidence,
+                SELECT video_id, song_json, sync_json, offset_ms, low_confidence,
                        engine_chords, engine_beats, analyzed_at, channel_id, title, duration_ms,
                        owner_uid
-                FROM chord_maps WHERE video_id = ? AND difficulty = ?
+                FROM chord_maps WHERE video_id = ?
                 """
-            ), (video_id, difficulty))
+            ), (video_id,))
             row = cur.fetchone()
         if row is None:
             return None
         return ChordMap(
-            video_id=row[0], difficulty=row[1],
-            song=json.loads(row[2]), sync=json.loads(row[3]) if row[3] else None,
-            offset_ms=row[4], low_confidence=bool(row[5]),
-            engine_chords=row[6], engine_beats=row[7], analyzed_at=row[8],
-            channel_id=row[9], title=row[10], duration_ms=row[11] or 0,
-            owner_uid=row[12],
+            video_id=row[0],
+            song=json.loads(row[1]), sync=json.loads(row[2]) if row[2] else None,
+            offset_ms=row[3], low_confidence=bool(row[4]),
+            engine_chords=row[5], engine_beats=row[6], analyzed_at=row[7],
+            channel_id=row[8], title=row[9], duration_ms=row[10] or 0,
+            owner_uid=row[11],
         )
 
     # The catalog is public rows only: `owner_uid IS NULL`. Spelled once, because
@@ -899,8 +958,7 @@ class Store:
     # other player their home screen had changed, and then show them nothing.
     _PUBLIC = "m.owner_uid IS NULL"
 
-    def list_catalog(self, *, limit: int = 60, offset: int = 0,
-                     difficulty: str | None = None) -> list[CatalogEntry]:
+    def list_catalog(self, *, limit: int = 60, offset: int = 0) -> list[CatalogEntry]:
         """The **catalog**: everything analyzed so far, newest first.
 
         This is what the app's Home screen is built from. Every row here is a
@@ -921,13 +979,12 @@ class Store:
           ``GET /v1/maps/{id}``; a blocked video that vanishes from the detail
           endpoint but still sits on the home screen is a takedown that didn't
           happen.
-        - **One row per video, and the page is a page.** A video analyzed at two
-          difficulties has two rows, and the catalog is a list of *songs*, so it
-          collapses to the newest per video id — in SQL, with `ROW_NUMBER`, and
-          then `LIMIT`/`OFFSET`. Collapsing in Python meant fetching and decoding
-          the entire table to return sixty rows, so a catalog hit cost a second of
-          CPU at two thousand maps and grew from there, with `offset` buying
-          nothing at all.
+        - **The page is a page.** `LIMIT`/`OFFSET` in SQL, never a slice in
+          Python: fetching and decoding the entire table to return sixty rows
+          cost a second of CPU at two thousand maps and grew from there, with
+          `offset` buying nothing at all. One row per video is now the primary
+          key rather than a `ROW_NUMBER` collapse over the difficulty tiers, so
+          this walks `chord_maps_catalog` in order and stops.
 
         The five scalars come from their own columns rather than from
         ``song_json``: this endpoint reads exactly those, and decoding a whole
@@ -940,30 +997,14 @@ class Store:
                          OR (b.kind = ? AND b.key = m.channel_id)
                   )"""]
         params: list = [BLOCK_VIDEO, BLOCK_CHANNEL]
-        if difficulty is not None:
-            where.append("m.difficulty = ?")
-            params.append(difficulty)
 
-        # `ROW_NUMBER` rather than `GROUP BY`: the collapse has to keep the
-        # *winning row's* other columns, which a grouped query cannot hand back
-        # portably. Ordered by difficulty as the tiebreak so two tiers analyzed in
-        # the same instant still collapse deterministically (§16.5).
         sql = f"""
-            SELECT video_id, difficulty, title, artist, duration_ms, song_id,
-                   chord_names, tempo, tonic, mode, analyzed_at, low_confidence
-            FROM (
-                SELECT m.video_id, m.difficulty, m.title, m.artist, m.duration_ms,
-                       m.song_id, m.chord_names, m.tempo, m.tonic, m.mode,
-                       m.analyzed_at, m.low_confidence,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY m.video_id
-                           ORDER BY m.analyzed_at DESC, m.difficulty DESC
-                       ) AS rank_in_video
-                FROM chord_maps m
-                WHERE {' AND '.join(where)}
-            ) ranked
-            WHERE rank_in_video = 1
-            ORDER BY analyzed_at DESC, video_id DESC
+            SELECT m.video_id, m.title, m.artist, m.duration_ms, m.song_id,
+                   m.chord_names, m.tempo, m.tonic, m.mode, m.analyzed_at,
+                   m.low_confidence
+            FROM chord_maps m
+            WHERE {' AND '.join(where)}
+            ORDER BY m.analyzed_at DESC, m.video_id DESC
             LIMIT ? OFFSET ?
         """
         params += [max(0, limit), max(0, offset)]
@@ -973,11 +1014,11 @@ class Store:
             rows = cur.fetchall()
         return [
             CatalogEntry(
-                video_id=row[0], difficulty=row[1], title=row[2], artist=row[3],
-                duration_ms=row[4] or 0, song_id=row[5],
-                chord_names=_decode_chord_names(row[6]),
-                tempo=row[7], tonic=row[8], mode=row[9],
-                analyzed_at=row[10], low_confidence=bool(row[11]),
+                video_id=row[0], title=row[1], artist=row[2],
+                duration_ms=row[3] or 0, song_id=row[4],
+                chord_names=_decode_chord_names(row[5]),
+                tempo=row[6], tonic=row[7], mode=row[8],
+                analyzed_at=row[9], low_confidence=bool(row[10]),
             )
             for row in rows
         ]
@@ -1010,7 +1051,7 @@ class Store:
         return f"{count}:{newest}"
 
     def set_offset(self, video_id: str, offset_ms: int | None) -> int:
-        """The §6 admin knob: shift every difficulty of this video's chart against
+        """The §6 admin knob: shift this video's chart against
         the recording. Returns how many rows moved."""
         with self._cursor(write=True) as cur:
             cur.execute(self._sql("UPDATE chord_maps SET offset_ms = ? WHERE video_id = ?"),
@@ -1019,19 +1060,19 @@ class Store:
 
     # -- jobs ----------------------------------------------------------------
 
-    def create_job(self, *, job_id: str, uid: str, video_id: str, difficulty: str) -> Job:
+    def create_job(self, *, job_id: str, uid: str, video_id: str) -> Job:
         self._maybe_prune_jobs()
         self._maybe_reap_stale_jobs()
         now = _now_iso()
         with self._cursor(write=True) as cur:
             cur.execute(self._sql(
                 """
-                INSERT INTO jobs (job_id, uid, video_id, difficulty, status, progress,
+                INSERT INTO jobs (job_id, uid, video_id, status, progress,
                                   error_code, error_message, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, 0, NULL, NULL, ?, ?)
                 """
-            ), (job_id, uid, video_id, difficulty, STATUS_QUEUED, now, now))
-        return Job(job_id, uid, video_id, difficulty, STATUS_QUEUED, 0.0, None, None, now, now)
+            ), (job_id, uid, video_id, STATUS_QUEUED, now, now))
+        return Job(job_id, uid, video_id, STATUS_QUEUED, 0.0, None, None, now, now)
 
     def update_job(self, job_id: str, *, status: str | None = None,
                    progress: float | None = None, error_code: str | None = None,
@@ -1061,7 +1102,7 @@ class Store:
         with self._cursor() as cur:
             cur.execute(self._sql(
                 """
-                SELECT job_id, uid, video_id, difficulty, status, progress,
+                SELECT job_id, uid, video_id, status, progress,
                        error_code, error_message, created_at, updated_at
                 FROM jobs WHERE job_id = ?
                 """
@@ -1100,8 +1141,8 @@ class Store:
             )
             return cur.fetchone() is not None
 
-    def active_job_for(self, video_id: str, difficulty: str) -> Job | None:
-        """An in-flight job for this exact analysis, if one exists.
+    def active_job_for(self, video_id: str) -> Job | None:
+        """An in-flight job for this video, if one exists.
 
         Two players asking for the same video at the same time should join one
         job, not start two: the second would decode the same recording again for
@@ -1123,14 +1164,14 @@ class Store:
         with self._cursor() as cur:
             cur.execute(self._sql(
                 f"""
-                SELECT job_id, uid, video_id, difficulty, status, progress,
+                SELECT job_id, uid, video_id, status, progress,
                        error_code, error_message, created_at, updated_at
                 FROM jobs
-                WHERE video_id = ? AND difficulty = ? AND status NOT IN ({placeholders})
+                WHERE video_id = ? AND status NOT IN ({placeholders})
                   AND updated_at >= ?
                 ORDER BY created_at DESC
                 """
-            ), (video_id, difficulty, *sorted(TERMINAL_STATUSES), fresh_since))
+            ), (video_id, *sorted(TERMINAL_STATUSES), fresh_since))
             row = cur.fetchone()
         return Job(*row) if row else None
 

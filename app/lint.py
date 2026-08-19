@@ -23,6 +23,7 @@ the payload's own embedded ``patterns``.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from statistics import median
 
 from .chords import is_valid_chord, pitch_class
@@ -220,21 +221,65 @@ def lint(payload: CompositionPayload) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def lint_sync(payload: CompositionPayload, sync: VideoSync) -> list[str]:
-    """Everything that would let the cursor walk off the song (§13.2).
+    """Every §13.2 problem with a sidecar, fatal and advisory together.
+
+    Kept as the flat list it has always been, because that is what the bench and
+    the contract fixtures assert on ("this pairing is clean"). The pipeline reads
+    `lint_sync_problems` instead, which is the same walk with the severities kept
+    apart — see that function for why the distinction had to exist.
+    """
+    return list(lint_sync_problems(payload, sync).all)
+
+
+@dataclass(frozen=True)
+class SyncProblems:
+    """A sidecar's problems, split by what they cost the player.
+
+    **fatal** — the sidecar is not a usable map from video time to song beat, so
+    handing it to the client produces a cursor that does something nonsensical:
+    no anchors to interpolate between, an axis that runs backwards, a bar grid
+    the client cannot derive. There is nothing to ship.
+
+    **advisory** — the map works; it is imperfect. The tail runs on extrapolated
+    tempo, a bar or two is a different length from its neighbours, the chart's
+    sections are not whole bars. The song plays against the recording and the
+    cursor tracks it; some of it is less exact than we would like.
+
+    The split exists because the two used to be one list, and *any* entry in it
+    withheld the sidecar (§13.3). That rule is what made "play with the video"
+    disappear from songs that had a perfectly serviceable beat map with a ragged
+    tail — and withholding does not repair a chart, it only removes the video.
+    An imperfect sidecar shipped `lowConfidence: true` tells the player the truth
+    and still lets them play along; withholding it tells them nothing and takes
+    the product's whole differentiator away. See `analysis/pipeline.py`.
+    """
+
+    fatal: tuple[str, ...] = ()
+    advisory: tuple[str, ...] = ()
+
+    @property
+    def all(self) -> tuple[str, ...]:
+        return self.fatal + self.advisory
+
+
+def lint_sync_problems(payload: CompositionPayload, sync: VideoSync) -> SyncProblems:
+    """Everything that would let the cursor walk off the song (§13.2), by severity.
 
     Run only when a sidecar is actually being returned. A song with
-    ``videoSync: None`` plays self-paced and none of this applies — which is the
-    whole point of §13.3's "degrade honestly".
+    ``videoSync: None`` plays self-paced and none of this applies — and after the
+    §13.3 amendment that is a state only `fatal` can produce.
     """
-    problems: list[str] = []
-    add = problems.append
+    fatal: list[str] = []
+    advisory: list[str] = []
+    stop = fatal.append          # the map is unusable
+    warn = advisory.append       # the map is usable and imperfect
 
     beats = bar_beats(payload.timeSignature)
     if beats is None:
-        add(f'videoSync: the song\'s timeSignature "{payload.timeSignature}" is not an "n/d" meter string')
-        return problems
+        stop(f'videoSync: the song\'s timeSignature "{payload.timeSignature}" is not an "n/d" meter string')
+        return SyncProblems(tuple(fatal), tuple(advisory))
     if sync.timeSignature != payload.timeSignature:
-        add(
+        stop(
             f'videoSync: timeSignature "{sync.timeSignature}" disagrees with the song\'s '
             f'"{payload.timeSignature}" — they address the same bars'
         )
@@ -244,16 +289,17 @@ def lint_sync(payload: CompositionPayload, sync: VideoSync) -> list[str]:
     # --- One uniform grid ----------------------------------------------------
     # The client derives bar index as floor(beat / barBeats) on a SINGLE
     # song-level tempo and meter (JamSongSheet.from), so an override makes the
-    # beat axis the anchors address stop existing. See the module docstring.
+    # beat axis the anchors address stop existing. Fatal for exactly that reason:
+    # not "less accurate", but "there is no axis to be accurate on".
     for section in sections:
         if section.tempoOverride is not None:
-            add(
+            stop(
                 f"{section.display_name}: a video-synced song may not carry tempoOverride — "
                 f"the client's bar grid is computed on one song-level tempo, so tempo drift "
                 f"belongs in beatAnchors instead"
             )
         if section.timeSignatureOverride is not None:
-            add(
+            stop(
                 f"{section.display_name}: a video-synced song may not carry "
                 f"timeSignatureOverride — same reason as tempoOverride"
             )
@@ -262,10 +308,15 @@ def lint_sync(payload: CompositionPayload, sync: VideoSync) -> list[str]:
     # Sections concatenate, so a section that isn't a whole number of bars slides
     # every later bar off the recording's downbeats — silently, and further with
     # each section.
+    #
+    # Advisory, and the reasoning is the one that runs through this whole split:
+    # the chart is equally wrong played self-paced, so withholding the sidecar
+    # fixes nothing and costs the player the recording. The drift is real and it
+    # is reported; `lowConfidence` carries it to the client.
     for section in sections:
         length = section_beats(section, beats)
         if abs(length / beats - round(length / beats)) > _EPS:
-            add(
+            warn(
                 f"{section.display_name}: is {length:g} beats, which is not a whole number of "
                 f"{beats:g}-beat bars — every later bar would drift off the recording's downbeats"
             )
@@ -273,18 +324,22 @@ def lint_sync(payload: CompositionPayload, sync: VideoSync) -> list[str]:
     # --- The anchors themselves ---------------------------------------------
     anchors = sync.beatAnchors
     if not anchors:
-        add("videoSync: beatAnchors is empty — without it there is no map from video time to song beat")
-        return problems
+        stop("videoSync: beatAnchors is empty — without it there is no map from video time to song beat")
+        return SyncProblems(tuple(fatal), tuple(advisory))
     if len(anchors) < 2:
-        add("videoSync: a single anchor cannot express tempo — emit one per bar (every downbeat is ideal)")
+        stop("videoSync: a single anchor cannot express tempo — emit one per bar (every downbeat is ideal)")
 
+    # Both directions of monotonicity are fatal: `song_beat_at` interpolates
+    # between neighbouring anchors, so a repeated or reversed tMs divides by a
+    # non-positive span and a reversed songBeat runs the cursor backwards
+    # through the chart. Neither is "imprecise"; both are broken.
     for previous, current in zip(anchors, anchors[1:]):
         if current.tMs <= previous.tMs:
-            add(f"videoSync: beatAnchors must strictly increase in tMs (saw {previous.tMs} then {current.tMs})")
+            stop(f"videoSync: beatAnchors must strictly increase in tMs (saw {previous.tMs} then {current.tMs})")
             break
     for previous, current in zip(anchors, anchors[1:]):
         if current.songBeat <= previous.songBeat:
-            add(
+            stop(
                 f"videoSync: beatAnchors must strictly increase in songBeat "
                 f"(saw {previous.songBeat} then {current.songBeat})"
             )
@@ -306,27 +361,34 @@ def lint_sync(payload: CompositionPayload, sync: VideoSync) -> list[str]:
     #   comparing to it would pass exactly the songs that are broken.
     #
     #   withhold on a share, not on one bar. Real recordings have rubato and real
-    #   songs have the occasional inserted bar; a single-bar trigger would
-    #   withhold the sidecar from songs that are fine.
-    _lint_anchor_gaps(anchors, add)
+    #   songs have the occasional inserted bar; a single-bar trigger would flag
+    #   songs that are fine.
+    #
+    # Advisory since the §13.3 amendment. The anchors still track the recording —
+    # they were *measured* on it — so a song with ragged bars plays against the
+    # video better than it plays against a metronome, which is the only other
+    # thing on offer. It ships flagged.
+    _lint_anchor_gaps(anchors, warn)
 
     # Anchors are downbeats, so each must land on a bar boundary of the axis the
-    # chart produces — that IS the §13.2 invariant, stated as a check.
+    # chart produces — that IS the §13.2 invariant, stated as a check. Advisory:
+    # an anchor a fraction of a beat off a barline still interpolates, and the
+    # error it introduces is bounded by that fraction.
     for anchor in anchors:
         bars_in = anchor.songBeat / beats
         if abs(bars_in - round(bars_in)) > _EPS:
-            add(
+            warn(
                 f"videoSync: anchor at songBeat {anchor.songBeat:g} is not on a bar boundary "
                 f"({beats:g} beats/bar) — anchors mark downbeats"
             )
             break
 
     if any(a.tMs < 0 for a in anchors):
-        add("videoSync: anchor timestamps are milliseconds from video start and cannot be negative")
+        stop("videoSync: anchor timestamps are milliseconds from video start and cannot be negative")
     if sync.durationMs <= 0:
-        add(f"videoSync: durationMs {sync.durationMs} must be positive")
+        stop(f"videoSync: durationMs {sync.durationMs} must be positive")
     elif anchors[-1].tMs > sync.durationMs:
-        add(
+        warn(
             f"videoSync: the last anchor ({anchors[-1].tMs} ms) is past the end of the video "
             f"({sync.durationMs} ms)"
         )
@@ -337,32 +399,36 @@ def lint_sync(payload: CompositionPayload, sync: VideoSync) -> list[str]:
     # which is exactly what the anchors exist to avoid.
     song_length = total_beats(payload)
     if song_length > 0 and anchors[-1].songBeat + beats < song_length - _EPS:
-        add(
+        warn(
             f"videoSync: anchors stop at songBeat {anchors[-1].songBeat:g} but the song is "
             f"{song_length:g} beats — the tail would run on extrapolated tempo"
         )
-    # And the other end of the same rule, which was missing. An anchor past the
-    # song's last beat addresses a bar that does not exist: the map claims the
-    # recording is still playing chart at a point where the chart has run out,
-    # and the cursor walks off the end of it. `song_length` itself is fine and
-    # expected — that anchor marks the *end* boundary of the final bar, which is
-    # why a song of N bars ships N+1 anchors.
+    # And the other end of the same rule. An anchor past the song's last beat
+    # addresses a bar that does not exist: the map claims the recording is still
+    # playing chart at a point where the chart has run out. `song_length` itself
+    # is fine and expected — that anchor marks the *end* boundary of the final
+    # bar, which is why a song of N bars ships N+1 anchors.
     #
-    # This is the check a dropped section would have tripped: the anchors are
-    # built from the model's bar count, so a song compiled short (see
-    # `compile_song`) keeps anchors for the bars it lost.
+    # This is the check a dropped section trips, and it is now **repaired rather
+    # than reported**: `fit_sync` trims the overrun before the sidecar
+    # is ever linted (see `analysis/compile.py`). Reaching it here means the trim
+    # did not, so it stays advisory — an overrun tail is extrapolation the client
+    # already survives, not a broken map.
     if song_length > 0 and anchors[-1].songBeat > song_length + _EPS:
-        add(
+        warn(
             f"videoSync: anchors run to songBeat {anchors[-1].songBeat:g} but the song ends at "
             f"{song_length:g} beats — those anchors address bars that do not exist"
         )
 
+    # Out-of-range confidences are a *bug*, not a weak reading — `build_sync`
+    # clamps both — so they stay fatal: a container field outside its own domain
+    # is the one thing here that says the producer, not the recording, is wrong.
     if not (0.0 <= sync.tempo.confidence <= 1.0):
-        add(f"videoSync: tempo confidence {sync.tempo.confidence} must be between 0 and 1")
+        stop(f"videoSync: tempo confidence {sync.tempo.confidence} must be between 0 and 1")
     if sync.patternConfidence is not None and not (0.0 <= sync.patternConfidence <= 1.0):
-        add(f"videoSync: patternConfidence {sync.patternConfidence} must be between 0 and 1")
+        stop(f"videoSync: patternConfidence {sync.patternConfidence} must be between 0 and 1")
 
-    return problems
+    return SyncProblems(tuple(fatal), tuple(advisory))
 
 
 def _lint_anchor_gaps(anchors: list, add) -> None:

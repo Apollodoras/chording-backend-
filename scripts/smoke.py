@@ -262,11 +262,14 @@ def _check_payload(body: dict) -> None:
 
     sync = body.get("videoSync")
     if sync is None:
-        # Withheld below the confidence floor (§13.3) — a correct outcome, and
-        # the song still plays self-paced, which is Phase 1's whole promise.
+        # Fatal, and it was not always. This used to be the expected outcome of a
+        # weak analysis — the confidence floor withheld the sidecar and the song
+        # played self-paced — so the gate recorded it as a warning and moved on.
+        # The rule is now that a song from a recording ships video sync unless
+        # its anchors are not a map at all, which is rare enough that seeing it
+        # here means something is wrong rather than something was doubtful.
         check("videoSync sidecar", False,
-              "withheld — low confidence (§13.3); the song still plays self-paced",
-              fatal=False)
+              "absent — the song cannot be played against its own recording")
     else:
         anchors = sync.get("beatAnchors") or []
         check("videoSync sidecar", bool(anchors), "present but carries no anchors",

@@ -22,9 +22,9 @@ from app.store import (
 )
 
 
-def put(store, video_id="dQw4w9WgXcQ", difficulty="normal", channel_id="UCtest"):
+def put(store, video_id="dQw4w9WgXcQ", channel_id="UCtest"):
     store.put_map(
-        video_id=video_id, difficulty=difficulty,
+        video_id=video_id,
         song={"version": 2, "id": f"yt:{video_id}"}, sync={"videoId": video_id},
         engine_chords="fake@1", engine_beats="fake@1",
         analyzed_at="2026-08-03T10:00:00Z", channel_id=channel_id,
@@ -97,7 +97,7 @@ def test_pruning_removes_windows_nobody_is_inside(store):
 
 def test_a_map_round_trips(store):
     put(store)
-    cached = store.get_map("dQw4w9WgXcQ", "normal")
+    cached = store.get_map("dQw4w9WgXcQ")
     assert cached.song["id"] == "yt:dQw4w9WgXcQ"
     assert cached.sync["videoId"] == "dQw4w9WgXcQ"
     assert cached.channel_id == "UCtest"
@@ -105,11 +105,11 @@ def test_a_map_round_trips(store):
 
 def test_re_analysis_replaces_rather_than_duplicates(store):
     put(store)
-    store.put_map(video_id="dQw4w9WgXcQ", difficulty="normal",
+    store.put_map(video_id="dQw4w9WgXcQ",
                   song={"version": 2, "id": "yt:dQw4w9WgXcQ", "title": "Better"},
                   sync=None, engine_chords="fake@2", engine_beats="fake@1",
                   analyzed_at="2026-08-04T10:00:00Z")
-    cached = store.get_map("dQw4w9WgXcQ", "normal")
+    cached = store.get_map("dQw4w9WgXcQ")
     assert cached.song["title"] == "Better"
     assert cached.engine_chords == "fake@2"
 
@@ -120,13 +120,12 @@ def test_an_admin_offset_survives_a_re_analysis(store):
     put(store)
     store.set_offset("dQw4w9WgXcQ", -250)
     put(store)
-    assert store.get_map("dQw4w9WgXcQ", "normal").offset_ms == -250
+    assert store.get_map("dQw4w9WgXcQ").offset_ms == -250
 
 
-def test_the_offset_moves_every_difficulty_of_a_video(store):
-    for difficulty in ("easy", "normal", "hard"):
-        put(store, difficulty=difficulty)
-    assert store.set_offset("dQw4w9WgXcQ", 120) == 3
+def test_the_offset_reaches_the_videos_chart(store):
+    put(store)
+    assert store.set_offset("dQw4w9WgXcQ", 120) == 1
 
 
 # --- blocklist (§3) ---------------------------------------------------------
@@ -161,14 +160,13 @@ def test_a_purge_actually_cascades(store):
     """"Verify it actually cascades" — the handoff's own instruction. Blocking
     while a cached map keeps being served is the failure that gets a DMCA agent's
     attention."""
-    for difficulty in ("easy", "normal", "hard"):
-        put(store, difficulty=difficulty)
-    store.create_job(job_id="j1", uid="uid", video_id="dQw4w9WgXcQ", difficulty="normal")
+    put(store)
+    store.create_job(job_id="j1", uid="uid", video_id="dQw4w9WgXcQ")
 
     counts = store.purge("dQw4w9WgXcQ", actor="agent", reason="DMCA")
 
-    assert counts == {"maps": 3, "jobs": 1}
-    assert store.get_map("dQw4w9WgXcQ", "normal") is None
+    assert counts == {"maps": 1, "jobs": 1}
+    assert store.get_map("dQw4w9WgXcQ") is None
     assert store.get_job("j1") is None
 
 
@@ -180,7 +178,7 @@ def test_purging_a_channel_reaches_every_video_we_know_of_it(store):
     counts = store.purge_channel("UCtest", actor="agent", reason="label request")
 
     assert counts["videos"] == 2 and counts["maps"] == 2
-    assert store.get_map("ccccccccccc", "normal") is not None
+    assert store.get_map("ccccccccccc") is not None
 
 
 def test_a_purge_that_matched_nothing_says_so(store):
@@ -225,7 +223,7 @@ def test_the_store_exposes_no_way_to_edit_or_delete_the_audit_log():
 # --- jobs -------------------------------------------------------------------
 
 def test_a_job_moves_through_its_lifecycle(store):
-    job = store.create_job(job_id="j1", uid="uid", video_id="dQw4w9WgXcQ", difficulty="normal")
+    job = store.create_job(job_id="j1", uid="uid", video_id="dQw4w9WgXcQ")
     assert job.status == STATUS_QUEUED
     store.update_job("j1", status=STATUS_READY, progress=1.0)
     assert store.get_job("j1").status == STATUS_READY
@@ -235,15 +233,15 @@ def test_two_players_asking_at_once_find_one_another_s_job(store):
     """Rather than decoding the same recording twice for an identical result —
     which is both the expensive thing and the thing §2 wants to happen as rarely
     as possible."""
-    store.create_job(job_id="j1", uid="a", video_id="dQw4w9WgXcQ", difficulty="normal")
-    found = store.active_job_for("dQw4w9WgXcQ", "normal")
+    store.create_job(job_id="j1", uid="a", video_id="dQw4w9WgXcQ")
+    found = store.active_job_for("dQw4w9WgXcQ")
     assert found is not None and found.job_id == "j1"
 
 
 def test_a_finished_job_is_not_joined(store):
-    store.create_job(job_id="j1", uid="a", video_id="dQw4w9WgXcQ", difficulty="normal")
+    store.create_job(job_id="j1", uid="a", video_id="dQw4w9WgXcQ")
     store.update_job("j1", status=STATUS_READY)
-    assert store.active_job_for("dQw4w9WgXcQ", "normal") is None
+    assert store.active_job_for("dQw4w9WgXcQ") is None
 
 
 # --- the schema itself ------------------------------------------------------
@@ -270,7 +268,7 @@ def _put_many(store, count, *, prefix="vid", owner_uid=None):
     for index in range(count):
         video_id = f"{prefix}{index:07d}"
         store.put_map(
-            video_id=video_id, difficulty="normal",
+            video_id=video_id,
             song={"version": 2, "id": f"yt:{video_id}", "artist": "A Band",
                   "tempo": 120, "tonic": "G", "mode": "major",
                   "chordNames": ["G", "D", "Em", "C"]},
@@ -329,11 +327,12 @@ def test_the_catalog_reads_its_scalars_from_columns_not_from_the_payload(store):
     assert not hasattr(row, "song")
 
 
-def test_a_video_at_two_difficulties_is_one_catalog_row(store):
-    """The catalog lists songs, not analyses — collapsed in SQL now, and the page
-    size therefore means "songs", which is what the caller asked for."""
-    put(store, difficulty="easy")
-    put(store, difficulty="hard")
+def test_a_video_analyzed_twice_is_one_catalog_row(store):
+    """The catalog lists songs, not analyses. This used to need a `ROW_NUMBER`
+    collapse because a video held one row per difficulty; it is the primary key
+    now, so re-analyzing upserts."""
+    put(store)
+    put(store)
 
     rows = store.list_catalog()
     assert [row.video_id for row in rows] == ["dQw4w9WgXcQ"]
@@ -344,8 +343,7 @@ def test_the_collapse_survives_paging(store):
     the limit would make a page of ten duplicated rows come back as fewer than ten
     songs, and would drop songs off the end of the listing entirely."""
     for index in range(12):
-        for tier in ("easy", "normal", "hard"):
-            put(store, video_id=f"vid{index:07d}", difficulty=tier)
+        put(store, video_id=f"vid{index:07d}")
 
     page = store.list_catalog(limit=5, offset=0)
     assert len(page) == 5
@@ -375,7 +373,7 @@ def test_the_catalog_version_counts_only_public_rows(store):
     put(store)
     public = store.catalog_version()
 
-    store.put_map(video_id="up_abcdef0123456789", difficulty="normal",
+    store.put_map(video_id="up_abcdef0123456789",
                   song={"version": 2, "id": "yt:up_x"}, sync=None,
                   engine_chords="f@1", engine_beats="f@1",
                   analyzed_at="2027-01-01T00:00:00Z", owner_uid="alice")
@@ -426,9 +424,99 @@ def test_a_database_written_before_the_new_columns_still_opens(tmp_path):
         assert row.chord_names == ["G", "D"]
         assert (row.tempo, row.tonic, row.mode, row.artist) == (120, "G", "major", "A Band")
         # And the legacy row is public: it predates uploads existing at all.
-        assert store.get_map("dQw4w9WgXcQ", "normal").owner_uid is None
+        assert store.get_map("dQw4w9WgXcQ").owner_uid is None
     finally:
         store.close()
+
+
+def test_a_database_written_with_difficulty_tiers_collapses_to_one_row(tmp_path):
+    """The one migration here that is neither additive nor nullable.
+
+    `difficulty` was half of `chord_maps`' primary key, so the table is rebuilt —
+    and rebuilding has to choose which of a video's three rows survives. It keeps
+    `hard`: that was the reference render, built at the full grammar, and the only
+    one of the three that ever claimed to state what was played.
+    """
+    import json
+    import sqlite3
+
+    from app.store import SQLiteStore
+
+    path = tmp_path / "tiered.sqlite3"
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        """
+        CREATE TABLE chord_maps (
+            video_id TEXT NOT NULL, difficulty TEXT NOT NULL, channel_id TEXT,
+            title TEXT, duration_ms INTEGER NOT NULL DEFAULT 0,
+            song_json TEXT NOT NULL, sync_json TEXT, offset_ms INTEGER,
+            low_confidence INTEGER NOT NULL DEFAULT 0, engine_chords TEXT NOT NULL,
+            engine_beats TEXT NOT NULL, analyzed_at TEXT NOT NULL,
+            owner_uid TEXT, song_id TEXT, artist TEXT, tempo INTEGER, tonic TEXT,
+            mode TEXT, chord_names TEXT, denormalized INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (video_id, difficulty)
+        )
+        """
+    )
+    legacy.execute(
+        """
+        CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY, uid TEXT NOT NULL, video_id TEXT NOT NULL,
+            difficulty TEXT NOT NULL, status TEXT NOT NULL,
+            progress DOUBLE PRECISION NOT NULL DEFAULT 0, error_code TEXT,
+            error_message TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    def song(names):
+        return json.dumps({"version": 2, "id": "yt:dQw4w9WgXcQ", "tempo": 120,
+                           "tonic": "G", "mode": "major", "chordNames": names})
+
+    # `easy` is the newest, so "most recent wins" would pick the wrong one.
+    for tier, when, names in (("easy", "2026-08-03T12:00:00Z", ["G", "Em"]),
+                              ("normal", "2026-08-03T11:00:00Z", ["G", "Em7"]),
+                              ("hard", "2026-08-03T10:00:00Z", ["Gmaj7", "Em7"])):
+        legacy.execute(
+            "INSERT INTO chord_maps (video_id, difficulty, song_json, engine_chords,"
+            " engine_beats, analyzed_at, offset_ms, denormalized, title, chord_names)"
+            " VALUES (?,?,?,?,?,?,?,1,?,?)",
+            ("dQw4w9WgXcQ", tier, song(names), "f@1", "f@1", when, -250,
+             "Known Song", json.dumps(names)),
+        )
+    # A video that never produced a `hard` render still keeps a chart.
+    legacy.execute(
+        "INSERT INTO chord_maps (video_id, difficulty, song_json, engine_chords,"
+        " engine_beats, analyzed_at, denormalized) VALUES (?,?,?,?,?,?,1)",
+        ("bbbbbbbbbbb", "normal", song(["C"]), "f@1", "f@1", "2026-08-04T10:00:00Z"),
+    )
+    legacy.execute(
+        "INSERT INTO jobs VALUES ('j1','u1','ccccccccccc','easy','analyzing',0.5,"
+        "NULL,NULL,'2026-08-04T10:00:00Z','2026-08-04T10:00:00Z')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    store = SQLiteStore(str(path))
+    try:
+        kept = store.get_map("dQw4w9WgXcQ")
+        assert kept.song["chordNames"] == ["Gmaj7", "Em7"], "the `hard` render survived"
+        # The admin's own correction is not a property of a tier, so it comes along.
+        assert kept.offset_ms == -250
+        assert store.get_map("bbbbbbbbbbb").song["chordNames"] == ["C"]
+        assert [row.video_id for row in store.list_catalog()] == \
+            ["bbbbbbbbbbb", "dQw4w9WgXcQ"]
+        # A job in flight across the deploy is still pollable.
+        assert store.get_job("j1").video_id == "ccccccccccc"
+    finally:
+        store.close()
+
+    # Idempotent: opening it again is two column lookups and no rebuild.
+    again = SQLiteStore(str(path))
+    try:
+        assert len(again.list_catalog()) == 2
+    finally:
+        again.close()
 
 
 def test_an_undecodable_payload_does_not_stop_the_store_from_opening(tmp_path):
@@ -491,8 +579,7 @@ def test_the_charge_day_comes_off_the_job_row(store):
     `created_at` *is* the day it was charged to."""
     from app.store import day_of
 
-    job = store.create_job(job_id="j1", uid="u1", video_id="dQw4w9WgXcQ",
-                           difficulty="normal")
+    job = store.create_job(job_id="j1", uid="u1", video_id="dQw4w9WgXcQ")
     assert store.charge_day_for_job("j1") == day_of(job.created_at)
     assert store.charge_day_for_job("nope") is None
 
@@ -500,8 +587,7 @@ def test_the_charge_day_comes_off_the_job_row(store):
 # --- job followers -----------------------------------------------------------
 
 def test_a_follower_may_read_the_job_they_joined(store):
-    job = store.create_job(job_id="j1", uid="alice", video_id="dQw4w9WgXcQ",
-                           difficulty="normal")
+    job = store.create_job(job_id="j1", uid="alice", video_id="dQw4w9WgXcQ")
 
     assert store.may_read_job(job, "alice")
     assert not store.may_read_job(job, "bob")
@@ -513,8 +599,7 @@ def test_a_follower_may_read_the_job_they_joined(store):
 
 def test_following_twice_is_not_an_error(store):
     """The client may well ask for the same video twice while it is running."""
-    job = store.create_job(job_id="j1", uid="alice", video_id="dQw4w9WgXcQ",
-                           difficulty="normal")
+    job = store.create_job(job_id="j1", uid="alice", video_id="dQw4w9WgXcQ")
     store.follow_job("j1", "bob")
     store.follow_job("j1", "bob")
 
@@ -524,8 +609,7 @@ def test_following_twice_is_not_an_error(store):
 def test_followers_are_collected_with_the_jobs_they_point_at(store):
     """There is no foreign key in this schema, so an orphaned follower row would
     accumulate forever holding a uid."""
-    store.create_job(job_id="j1", uid="alice", video_id="dQw4w9WgXcQ",
-                     difficulty="normal")
+    store.create_job(job_id="j1", uid="alice", video_id="dQw4w9WgXcQ")
     store.follow_job("j1", "bob")
     store.update_job("j1", status=STATUS_READY, progress=1.0)
 
@@ -537,8 +621,7 @@ def test_followers_are_collected_with_the_jobs_they_point_at(store):
 
 
 def test_a_purge_takes_the_followers_with_it(store):
-    store.create_job(job_id="j1", uid="alice", video_id="dQw4w9WgXcQ",
-                     difficulty="normal")
+    store.create_job(job_id="j1", uid="alice", video_id="dQw4w9WgXcQ")
     store.follow_job("j1", "bob")
 
     store.purge("dQw4w9WgXcQ")
@@ -589,16 +672,15 @@ def test_sqlite_needs_no_extra_serialization(store):
         assert store._serialize_rate_key(cur, RATE_SCOPE_UID, "uid") is None
 
 
-def test_the_catalog_can_be_filtered_to_one_difficulty(store):
-    """An unused parameter is still a parameter, and the SQL rewrite moved it into
-    a subquery where its placeholder order could plausibly have gone wrong."""
-    put(store, video_id="aaaaaaaaaaa", difficulty="easy")
-    put(store, video_id="bbbbbbbbbbb", difficulty="hard")
+def test_re_analyzing_a_video_replaces_its_catalog_row_rather_than_adding_one(store):
+    """One row per video is the primary key now, not a `ROW_NUMBER` collapse over
+    the difficulty tiers — so the listing cannot show the same song twice."""
+    put(store, video_id="aaaaaaaaaaa")
+    put(store, video_id="bbbbbbbbbbb")
+    put(store, video_id="aaaaaaaaaaa")
 
-    easy = store.list_catalog(difficulty="easy")
-    assert [row.video_id for row in easy] == ["aaaaaaaaaaa"]
-    assert easy[0].difficulty == "easy"
-    assert len(store.list_catalog()) == 2
+    rows = store.list_catalog()
+    assert sorted(row.video_id for row in rows) == ["aaaaaaaaaaa", "bbbbbbbbbbb"]
 
 
 def test_the_backfill_covers_more_rows_than_one_batch(tmp_path):

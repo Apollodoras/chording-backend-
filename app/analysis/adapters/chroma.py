@@ -32,6 +32,15 @@ _PITCH_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 # the app's full grammar on purpose: a template matcher cannot reliably tell a
 # maj9 from a maj7, and inventing distinctions it cannot support would make the
 # comparison against real engines flattering rather than honest.
+#
+# **Which means this engine's output distribution is not BTC's, and every
+# threshold in §20 was calibrated on BTC's.** No `dim`, no `sus`, no `maj7` — so
+# `vocabulary.SNAP_TO`'s rows for those qualities are unreachable here,
+# `postprocess.exact_ratio` reads high because nothing is ever reduced, and
+# `keyaudit`'s conflicts can only ever be major-against-minor. None of that is a
+# defect in the fallback; it is what a fallback is. It is written down because
+# the numbers in this repo are BTC's numbers, and a build running on chroma
+# should not be read against them (F5).
 _TEMPLATES: tuple[tuple[str, tuple[int, ...]], ...] = (
     ("maj", (0, 4, 7)),
     ("min", (0, 3, 7)),

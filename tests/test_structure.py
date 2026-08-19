@@ -18,7 +18,7 @@ from app.analysis.structure import (
     spans_from_bars,
 )
 from app.analysis.types import GridSpan
-from app.chords import MAJOR, MINOR, NORMAL
+from app.chords import MAJOR, MINOR
 from tests.conftest import known_axis, known_chords
 
 
@@ -61,7 +61,7 @@ def test_a_trailing_partial_bar_is_dropped():
 
 
 def test_no_bar_ever_overflows_its_meter():
-    spans = process(known_chords(), known_axis(), difficulty=NORMAL)
+    spans = process(known_chords(), known_axis())
     for bar in bars_from_spans(spans, 4):
         for chord in bar:
             assert chord.start_beat + chord.length_beats <= 4 + 1e-9
@@ -169,15 +169,25 @@ def test_sections_tile_the_song_with_no_gaps():
     assert cursor == len(bars)
 
 
-def test_without_an_energy_hint_sections_are_honestly_unnamed():
-    """§15's fallback. Naming a section requires evidence; "Part 1" is what we
-    have. **Never** name a section from lyrics — §2.4 means we must not have
+def test_without_an_energy_hint_the_structure_still_names_the_sections():
+    """Repetition is evidence even when loudness is missing (F21): the group that
+    opens the song is the verse, the one that follows it and repeats is the
+    chorus. **Never** name a section from lyrics — §2.4 means we must not have
     lyrics at all."""
     verse = [_bar(7), _bar(2), _bar(4, MINOR), _bar(0)]
     chorus = [_bar(0), _bar(0), _bar(7), _bar(7)]
     sections = segment(verse * 2 + chorus * 2)
-    assert [s.kind for s in sections] == ["custom", "custom"]
-    assert [s.name for s in sections] == ["Part 1", "Part 2"]
+    assert [s.kind for s in sections] == ["verse", "chorus"]
+
+
+def test_with_no_repetition_at_all_sections_are_honestly_unnamed():
+    """§15's fallback, and the only way left to reach it. With nothing repeating
+    there is no chorus to find and no verse to contrast it with, so "Part 1" is
+    what we have and it is the honest answer."""
+    sections = segment([_bar(7), _bar(2), _bar(4, MINOR), _bar(0),
+                        _bar(5), _bar(9, MINOR), _bar(11), _bar(3)])
+    assert {s.kind for s in sections} == {"custom"}
+    assert all(s.name.startswith("Part ") for s in sections)
 
 
 def test_with_an_energy_hint_the_loudest_repeated_block_is_the_chorus():
@@ -188,3 +198,23 @@ def test_with_an_energy_hint_the_loudest_repeated_block_is_the_chorus():
     sections = segment(bars, energy=energy)
     assert [s.kind for s in sections] == ["verse", "chorus"]
     assert all(s.name == "" for s in sections), "empty name = use the kind's own label"
+
+
+def test_a_bar_no_chord_reaches_is_held_rather_than_dropped():
+    """F28. `bars_from_spans` used to filter empty bars out, which shifts every
+    bar after them by one — and the sections, their `start_bar`s and the sidecar's
+    anchors all move relative to the chart while every self-consistency check
+    still passes. It cannot happen today because `hold_through_gaps` runs first,
+    but that is an invariant enforced in a different module, and this is the one
+    failure that is silent and total if it ever stops holding."""
+    from app.analysis.structure import bars_from_spans
+    from app.analysis.types import GridSpan
+
+    spans = [GridSpan(start_beat=0, length_beats=4, root_pc=7, quality=MAJOR,
+                      confidence=0.9, exact=True),
+             GridSpan(start_beat=8, length_beats=4, root_pc=2, quality=MAJOR,
+                      confidence=0.9, exact=True)]
+    bars = bars_from_spans(spans, 4)
+    assert len(bars) == 3, "three bars of timeline, three bars out"
+    assert all(bar for bar in bars), "and none of them empty"
+    assert [bar[0].root_pc for bar in bars] == [7, 7, 2], "the hole holds the chord before it"
