@@ -516,3 +516,69 @@ def test_the_decoder_still_hears_a_real_chord_change():
 
     path = _viterbi(np, probabilities).tolist()
     assert path == [0] * 10 + [1] * 10
+
+
+# --- §14.1: which band an attack arrived in ---------------------------------
+#
+# These are plumbing tests in the sense the module docstring means: a sine-wave
+# bass note is not a recording. What they can prove is the thing the label is
+# actually built on — that two attacks an octave and a half apart end up on
+# opposite sides of the split, and that one attack covering both ends up on
+# neither.
+
+def _struck(events, seconds: float, rate: int = SAMPLE_RATE):
+    """`events` = [(start_seconds, [midi notes])] → one mono buffer."""
+    out = np.zeros(int(seconds * rate), dtype="float32")
+    for start, notes in events:
+        at = int(start * rate)
+        for note in notes:
+            wave = tone(note, seconds - start, rate)
+            room = min(len(wave), len(out) - at)
+            out[at:at + room] += wave[:room]
+    return (out / (np.abs(out).max() + 1e-9)).astype("float32")
+
+
+def test_a_bass_note_and_a_chord_over_it_are_labelled_apart():
+    """An oom-pah: a root octave on beats 1 and 3, a right hand on 2 and 4."""
+    from app.analysis.adapters.librosa_beats import HarmonicOnsetDetector
+
+    beat, bars = 0.5, 4
+    events = []
+    for bar in range(bars):
+        base = bar * 4 * beat
+        for offset in (0.0, 2.0):
+            events.append((base + offset * beat, [36, 48]))          # C2 + C3
+        for offset in (1.0, 3.0):
+            events.append((base + offset * beat, [72, 76, 79]))      # C5 E5 G5
+    onsets = HarmonicOnsetDetector().detect(_struck(events, bars * 4 * beat + 1.0),
+                                            SAMPLE_RATE)
+    bands = [o.band for o in onsets]
+    assert "low" in bands and "mid" in bands
+    # Every labelled attack is on the side it was played on: nothing in the bass
+    # band came back chordal, and nothing in the right hand came back as bass.
+    for onset in onsets:
+        played_bass = round((onset.t_ms / 1000.0) / beat) % 2 == 0
+        assert onset.band in ("low" if played_bass else "mid", "full"), onset
+
+
+def test_a_full_range_strum_is_not_labelled_as_either_band():
+    """The commonest stroke there is, and the one that must stay `full`: a chord
+    voiced across the split moves both bands, so neither owns it."""
+    from app.analysis.adapters.librosa_beats import HarmonicOnsetDetector
+
+    # Struck a second apart. `tone` decays slowly enough that strikes half a
+    # second apart overlap into a second detection each, and a decay tail loses
+    # its bass before its treble — so a denser stimulus measures the shape of the
+    # test signal rather than the shape of the rule.
+    events = [(float(i), [40, 47, 52, 56, 59, 64]) for i in range(8)]    # E2…E4
+    onsets = HarmonicOnsetDetector().detect(_struck(events, 9.0), SAMPLE_RATE)
+    assert len(onsets) == len(events)
+    assert all(o.band == "full" for o in onsets)
+
+
+def test_a_detector_with_no_signal_to_look_at_claims_nothing():
+    """`_bands` is additive by construction — without audio to split, every
+    attack keeps the `full` that an unlabelled onset has always meant."""
+    from app.analysis.adapters.librosa_beats import _bands
+
+    assert _bands(None, SAMPLE_RATE, [10, 20, 30]) == ["full"] * 3

@@ -1,0 +1,45 @@
+{
+  "version": 2,
+  "id": "yt:bAnDeD00Pah:hard",
+  "title": "Oom-Pah",
+  "tonic": "C",
+  "mode": "major",
+  "tempo": 100,
+  "timeSignature": "4/4",
+  "chordNames": ["C", "G", "Am", "F"],
+  "patternID": "yt:pat-reference-oompah",
+  "beatsPerChord": 4,
+  "repeats": 1,
+  "arrangement": {
+    "sections": [
+      {
+        "id": "4A1E6C2E-0000-4000-8000-000000000301",
+        "name": "Part 1",
+        "kindRaw": "custom",
+        "chordNames": ["C", "G", "Am", "F"],
+        "patternID": "yt:pat-reference-oompah",
+        "beatsPerChord": 4,
+        "repeats": 1,
+        "tempoOverride": null,
+        "timeSignatureOverride": null,
+        "bars": null
+      }
+    ]
+  },
+  "patterns": [
+    {
+      "id": "yt:pat-reference-oompah",
+      "name": "Part 1 strum",
+      "timeSignature": "4/4",
+      "tempo": 100,
+      "strokes": [
+        { "id": "4A1E6C2E-0000-4000-8000-000000000311", "beat": 0.0, "direction": "down", "accent": true, "msOffset": 0, "strings": null, "band": "low" },
+        { "id": "4A1E6C2E-0000-4000-8000-000000000312", "beat": 1.0, "direction": "down", "accent": false, "msOffset": 0, "strings": null, "band": "mid" },
+        { "id": "4A1E6C2E-0000-4000-8000-000000000313", "beat": 2.0, "direction": "down", "accent": false, "msOffset": 0, "strings": null, "band": "low" },
+        { "id": "4A1E6C2E-0000-4000-8000-000000000314", "beat": 3.0, "direction": "down", "accent": false, "msOffset": 0, "strings": null, "band": "mid" }
+      ],
+      "tags": ["yt", "extracted", "directions-by-convention", "banded"]
+    }
+  ],
+  "progressions": []
+}

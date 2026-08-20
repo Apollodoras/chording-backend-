@@ -26,10 +26,68 @@ beat this, it isn't earning a torch dependency in the worker image.
 
 from __future__ import annotations
 
-from ..types import PCM, BeatGrid, Onset
+from ..types import FULL, LOW, MID, PCM, BeatGrid, Onset
 
 HOP = 512               # ~23 ms — onset-rate, unlike the chord engine's hop
 _METERS = (4, 3)        # what to consider; 4 first so it wins ties
+
+# Where the bass stops and the chord starts, for §14.1's band label.
+#
+# **Measured, on the synthetic oom-pah in `bench/synth.py`** (a root octave at C2
+# on beats 1 and 3, a C-major right hand at C4–G4 on 2 and 4), comparing each
+# band's own peak-normalized onset strength at the detected frames:
+#
+#     split    bass strokes (low/mid)      chord strokes (low/mid)
+#     180 Hz   median  90, min  5.2        median 0.04, max 0.09
+#     250 Hz   median 202, min  8.1        median 0.07, max 0.16
+#     320 Hz   median 184, min  8.9        median 0.34, max 0.39
+#
+# 250 Hz separates them by the widest margin. 320 leaks the bass's upper partials
+# into the chordal band — a third of the chord strokes' energy arrives as "low" —
+# and 180 sits below the fundamental of a guitar's own low strings, so an ordinary
+# strum starts reading as mid-only. The figure is also where the conventional
+# bass/low-mid boundary sits, which is not a coincidence: it is under the root of
+# a piano's left hand and over the fundamental of most bass notes.
+BAND_SPLIT_HZ = 250.0
+
+# How hard a band has to be struck, **against its own typical attack on this
+# recording**, to count as struck here at all. Both bands struck ⇒ `FULL`.
+#
+# **The obvious rule is wrong and the measurement is what says so.** The first
+# cut asked which band was louder — a ratio between the two — and it separates a
+# bass note from a chord stab beautifully (a factor of 8 the one way, 0.16 the
+# other). It then labels an ordinary strummed guitar `MID`, on every specimen in
+# `bench/synth.py`: a chord voiced from E3 up puts most of its attack energy
+# above 250 Hz, so "which band is louder" has a definite answer for a stroke
+# where the honest answer is *both*. A rule that calls a plain strum a
+# right-hand-only stroke would hand a piano a song with no bass in it.
+#
+# So each band is asked about on its own, and against itself: *relative to how
+# hard this band is struck when it is struck on this recording, was it struck
+# here?* That is the same self-relative discipline `strumming.py` already uses
+# everywhere — support as a share of bars, prominence against the bar's own mean,
+# contrast against the bar's strongest cell — and it is what makes the label
+# survive a mix where one band is simply quieter than the other.
+#
+# Measured end to end, as the share of a specimen's onsets landing on the right
+# label (`bench/synth.py`, plus a synthetic oom-pah — a root octave at C2 on
+# beats 1 and 3, a C-major right hand at C4–G4 on 2 and 4):
+#
+#     presence   oom-pah (want low/mid)   folk strum (want full)
+#     0.35       30/36                    43/54
+#     0.50       30/36                    37/54
+#     0.65       31/36                    32/54
+#
+# 0.35 is the best of them on both questions at once, and the per-onset noise it
+# leaves is not what ships: `strumming._band_of` takes a majority across every
+# bar that struck a cell, so a stroke has to be mislabelled in most of its bars
+# before the pattern says so.
+BAND_PRESENCE = 0.35
+
+# librosa's own default for a mel spectrogram; named because `_bands`
+# converts a frequency to a *mel bin index* against it, and the two have to
+# agree or the split lands somewhere nobody chose.
+_MEL_BANDS = 128
 
 
 class LibrosaBeatTracker:
@@ -176,7 +234,11 @@ class HarmonicOnsetDetector:
 
         harmonic = librosa.effects.harmonic(pcm, margin=self.margin)
         envelope = librosa.onset.onset_strength(y=harmonic, sr=sr, hop_length=HOP)
-        return _peaks(envelope, sr)
+        # Labelled off the *harmonic* component, the same signal the onsets were
+        # found in — a kick drum is bass-band energy that no hand played, and
+        # labelling against the full mix would hand every one of them to the left
+        # hand.
+        return _peaks(envelope, sr, signal=harmonic)
 
 
 class LibrosaOnsetDetector:
@@ -200,11 +262,24 @@ class LibrosaOnsetDetector:
         import librosa
 
         envelope = librosa.onset.onset_strength(y=pcm, sr=sr, hop_length=HOP)
-        return _peaks(envelope, sr)
+        return _peaks(envelope, sr, signal=pcm)
 
 
-def _peaks(envelope, sr: int) -> list[Onset]:
-    """An onset-strength envelope → the attacks in it."""
+def _peaks(envelope, sr: int, *, signal=None) -> list[Onset]:
+    """An onset-strength envelope → the attacks in it.
+
+    `signal` is the audio the envelope was computed from. Given one, each attack
+    is also labelled with the band it arrived in (§14.1); without one every
+    attack is `FULL`, which is what an unlabelled onset has always meant.
+
+    **The onset times and strengths do not depend on the labelling**, and that is
+    the point of doing it this way rather than peak-picking each band separately.
+    Every threshold in `strumming.py` was tuned against the onsets this function
+    already returned; a second detector running on a third of the spectrum would
+    move all of them at once, for a label that is meant to be additive. So the
+    attacks are found exactly as before and the bands only get a vote on *what*
+    was struck, never on *whether*.
+    """
     import librosa
 
     # `backtrack=False` on purpose. Backtracking rolls each detection back to the
@@ -221,8 +296,80 @@ def _peaks(envelope, sr: int) -> list[Onset]:
         return []
     times = librosa.frames_to_time(frames, sr=sr, hop_length=HOP)
     peak = float(envelope.max()) or 1.0
+    bands = _bands(signal, sr, frames)
     return [
         Onset(t_ms=int(round(t * 1000)),
-              strength=float(envelope[min(int(f), len(envelope) - 1)] / peak))
-        for f, t in zip(frames, times)
+              strength=float(envelope[min(int(f), len(envelope) - 1)] / peak),
+              band=band)
+        for f, t, band in zip(frames, times, bands)
     ]
+
+
+def _bands(signal, sr: int, frames) -> list[str]:
+    """Which band each already-detected attack arrived in (§14.1).
+
+    Two onset-strength envelopes over the same STFT — one below `BAND_SPLIT_HZ`,
+    one above — read at the frames the detector already chose.
+
+    **Each band is normalized by its own peak before they are compared.** Without
+    that, the label would be a report on the mix's balance rather than on the
+    playing: a record with a loud bass guitar would call every attack `LOW` and a
+    thin one would call every attack `MID`, in both cases without a single note
+    having been played differently. Normalized, the question becomes the one worth
+    asking — *relative to how hard this band is ever hit on this recording, was it
+    hit here?* — which is the same self-relative discipline `strength` and
+    `ACCENT_RATIO` already use.
+    """
+    if signal is None or len(frames) == 0:
+        return [FULL] * len(frames)
+    import librosa
+    import numpy as np
+
+    mels = librosa.mel_frequencies(n_mels=_MEL_BANDS, fmin=0, fmax=sr / 2)
+    split = int(np.searchsorted(mels, BAND_SPLIT_HZ))
+    # A split at either end leaves one band empty, and an empty band cannot
+    # out-shout anything — so say so rather than emit a column of one label.
+    if split <= 0 or split >= _MEL_BANDS:
+        return [FULL] * len(frames)
+
+    envelopes = librosa.onset.onset_strength_multi(
+        y=signal, sr=sr, hop_length=HOP, n_mels=_MEL_BANDS,
+        channels=[0, split, _MEL_BANDS],
+    )
+    low, mid = envelopes[0], envelopes[1]
+    indices = [min(int(f), len(low) - 1, len(mid) - 1) for f in frames]
+    at_low = [float(low[i]) for i in indices]
+    at_mid = [float(mid[i]) for i in indices]
+
+    # Each band's own typical attack: the median of what it does at the moments
+    # something was struck. Not the peak — one loud bass note would then set the
+    # bar for every other stroke on the record — and not the mean, which the same
+    # loud note drags. The median is what "normally" means here.
+    reference_low = _median(at_low) or 1.0
+    reference_mid = _median(at_mid) or 1.0
+
+    out: list[str] = []
+    for bass, chordal in zip(at_low, at_mid):
+        struck_low = bass >= BAND_PRESENCE * reference_low
+        struck_mid = chordal >= BAND_PRESENCE * reference_mid
+        if struck_low and struck_mid:
+            out.append(FULL)
+        elif struck_low:
+            out.append(LOW)
+        elif struck_mid:
+            out.append(MID)
+        else:
+            # Quieter than usual in both bands — a ghost stroke. It was played,
+            # so it keeps its onset; nothing is claimed about how.
+            out.append(FULL)
+    return out
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0

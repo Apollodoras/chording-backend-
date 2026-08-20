@@ -36,6 +36,7 @@ from .payload import (
     SECTION_KINDS,
     SONG_PREFIX,
     STROKE_DIRECTIONS,
+    STROKE_BANDS,
     TEMPO_MAX,
     TEMPO_MIN,
     CompositionPayload,
@@ -578,6 +579,13 @@ def _lint_strokes(label: str, strokes: list[Stroke], beats_in_bar: float | None,
                 add(f"{label}: stroke at beat {stroke.beat} has an empty strings list — omit the field for a full strum")
             elif any(not (1 <= lane <= 6) for lane in stroke.strings):
                 add(f"{label}: stroke at beat {stroke.beat} names string lanes outside 1–6 (1 = high E)")
+        if stroke.band is not None and stroke.band not in STROKE_BANDS:
+            # "full" is caught by this too, and deliberately: it is a real band
+            # but not a transmissible one — the wire spells it as an absent field
+            # (§14.1), and a payload that says it out loud would read as a claim
+            # the client has no rule for.
+            add(f'{label}: stroke at beat {stroke.beat} has band "{stroke.band}" — '
+                f"must be one of {'/'.join(STROKE_BANDS)}, or omitted for a full-range stroke")
         key = round(stroke.beat, 6)
         if key in seen_beats:
             add(f"{label}: two strokes share beat {stroke.beat} — merge them (one stroke per onset)")

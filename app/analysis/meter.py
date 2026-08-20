@@ -60,6 +60,7 @@ from __future__ import annotations
 import logging
 from bisect import bisect_left
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from ..chords import normalize
 from ..payload import PLAUSIBLE_TEMPO_MAX, PLAUSIBLE_TEMPO_MIN
@@ -161,12 +162,26 @@ def reconcile(grid: BeatGrid, raw: list[RawChordSpan], *,
     source = "tracker"
     if grid.confidence < 0.5:
         arbitrated = _meter_from_harmony(grid, raw, bar_beats)
-        if arbitrated is not None and arbitrated != bar_beats:
-            log.info("meter arbitrated from harmony: %d/4 (tracker said %d/4, confidence %.2f)",
-                     arbitrated, bar_beats, grid.confidence)
-            bar_beats = arbitrated
-            time_signature = f"{arbitrated}/4"
-            source = "harmony"
+        if arbitrated is not None and arbitrated.meter != bar_beats:
+            # **The downbeats move with the meter, or the meter does not move.**
+            # Relabelling `bar_beats` while leaving the tracker's bar starts
+            # where they were is not a smaller intervention, it is a broken one:
+            # every bar then holds the wrong number of beats, `axis` resamples
+            # all of them, and the whole song is quantized against a grid running
+            # at `arbitrated/tracked` of its real beat. Measured, a tracked 2/4
+            # relabelled 4/4 gave an axis beat of 250 ms on a 500 ms song.
+            rebuilt = _rebuild_downbeats(grid, arbitrated)
+            if rebuilt is None:
+                log.info("meter arbitration declined: %d/4 leaves too little grid to "
+                         "lay bars on (tracker said %d/4)", arbitrated.meter, bar_beats)
+            else:
+                log.info("meter arbitrated from harmony: %d/4 phase %d "
+                         "(tracker said %d/4, confidence %.2f)",
+                         arbitrated.meter, arbitrated.phase, bar_beats, grid.confidence)
+                grid = rebuilt
+                bar_beats = arbitrated.meter
+                time_signature = f"{arbitrated.meter}/4"
+                source = "harmony"
 
     # The octave first, because it decides which beats exist: halving the grid
     # removes every other beat, and the phase vote counts residues over the beats
@@ -419,6 +434,38 @@ def _rotate(grid: BeatGrid, bar_beats: int, shift: int) -> BeatGrid | None:
     )
 
 
+def _rebuild_downbeats(grid: BeatGrid, vote: _MeterVote) -> BeatGrid | None:
+    """The grid's bar starts, re-derived for a meter the harmony just chose.
+
+    `_rotate` argues at length against deriving downbeats as
+    `beats[start::bar_beats]`, and it is right — *for the case it is in*. There
+    the tracker's bar structure is being kept and only its phase changed, so a
+    song with an 11/8 bar in the middle of it must not have every later downbeat
+    dragged one beat off by a uniform slice.
+
+    Here the premise is the opposite: the meter itself was overruled, so the
+    tracker's bar starts are bars of the wrong length and there is no structure
+    left to preserve. What there is instead is the hypothesis that just won —
+    "changes land on residue `phase` of an `meter`-beat bar" — and that
+    hypothesis *is* a uniform slice. Scoring one grid and then shipping a
+    different one is how the two came apart in the first place, so the grid
+    returned here is the one the score was measured on.
+
+    Returns None when the slice leaves too little to build an axis on, in which
+    case the caller keeps the tracker's meter as well as its downbeats.
+    """
+    beats = sorted({int(t) for t in grid.beats_ms})
+    if len(beats) < vote.meter * 2:
+        return None
+    downbeats = beats[vote.phase % vote.meter::vote.meter]
+    if len(downbeats) < 3:
+        return None
+    return BeatGrid(
+        beats_ms=grid.beats_ms, downbeats_ms=downbeats, bpm=grid.bpm,
+        confidence=grid.confidence, time_signature=f"{vote.meter}/4",
+    )
+
+
 # --- the tempo octave -------------------------------------------------------
 
 def _octave(grid: BeatGrid, bar_beats: int) -> tuple[BeatGrid, int] | None:
@@ -506,31 +553,63 @@ def _double(grid: BeatGrid, bar_beats: int) -> BeatGrid | None:
 
 # --- meter arbitration ------------------------------------------------------
 
-def _meter_from_harmony(grid: BeatGrid, raw: list[RawChordSpan], tracked: int) -> int | None:
+class _MeterVote(NamedTuple):
+    """A candidate meter, where its "one" falls, and how well it explains the
+    chord changes. `phase` is a residue class over the beat list — the same
+    coordinate `_residues` counts in — so `beats[phase::meter]` is exactly the
+    barline hypothesis `score` was measured on."""
+
+    meter: int
+    phase: int
+    score: float
+
+
+def _meter_from_harmony(grid: BeatGrid, raw: list[RawChordSpan],
+                        tracked: int) -> _MeterVote | None:
     """Pick the meter whose barlines the chord changes best respect.
 
-    Only consulted when the tracker reports low confidence, and only between 4
-    and 3 — the two that cover this repertoire. Returns None when the evidence
-    is too thin to prefer either, which leaves the tracker's answer standing.
+    Only consulted when the tracker reports low confidence. Returns None when the
+    evidence is too thin to prefer anything, which leaves the tracker's answer
+    standing.
+
+    **The tracker's own meter is scored, not assumed to be zero.** It used to be
+    absent from the candidate list, so `scores.get(tracked, 0.0)` was 0.0 for any
+    tracker reading outside `CANDIDATE_METERS` and *any* candidate clearing
+    `PHASE_MARGIN` on its own beat it by default. A genuine 2/4 — which
+    `beat_this` does emit — has its chord changes on every second beat, which
+    lands them on residue 0 of a 4-beat bar half the time and hands meter 4 a
+    score of 0.5 automatically. Cut-time and marches were being overruled by
+    evidence that agreed with them.
+
+    **Scored against chance, not raw.** A share of the changes falling in the
+    best of `m` residue classes is worth less the larger `m` is: spread the
+    changes uniformly and meter 3 scores 1/3 while meter 4 scores 1/4, so the
+    raw comparison carried a standing bias toward the shorter bar. What each
+    candidate is charged with explaining is its excess over chance.
     """
     beats = sorted(set(int(t) for t in grid.beats_ms))
     changes = _changes_ms(raw)
     if len(beats) < 8 or len(changes) < 8:
         return None
 
-    scores: dict[int, float] = {}
-    for candidate in CANDIDATE_METERS:
+    votes: dict[int, _MeterVote] = {}
+    for candidate in dict.fromkeys((*CANDIDATE_METERS, tracked)):
+        if candidate < 2:
+            continue
         residues = _residues(beats, changes, candidate)
         if not residues:
             continue
         counts = [residues.count(r) / len(residues) for r in range(candidate)]
-        scores[candidate] = max(counts)
+        phase = max(range(candidate), key=lambda r: (counts[r], -r))
+        votes[candidate] = _MeterVote(meter=candidate, phase=phase,
+                                      score=counts[phase] - 1.0 / candidate)
 
-    if not scores:
+    if not votes:
         return None
-    best = max(scores, key=lambda m: (scores[m], m == tracked, -m))
+    best = max(votes.values(), key=lambda v: (v.score, v.meter == tracked, -v.meter))
     # A meter change is a big intervention; require it to be clearly better than
     # the tracker's, not merely different.
-    if best != tracked and scores[best] - scores.get(tracked, 0.0) < PHASE_MARGIN:
-        return tracked
+    if best.meter != tracked and tracked in votes:
+        if best.score - votes[tracked].score < PHASE_MARGIN:
+            return votes[tracked]
     return best

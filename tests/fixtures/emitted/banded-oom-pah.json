@@ -1,0 +1,85 @@
+{
+  "arrangement": {
+    "sections": [
+      {
+        "beatsPerChord": 4,
+        "chordNames": [
+          "C",
+          "G",
+          "Am",
+          "F"
+        ],
+        "id": "4A1E6C2E-0000-4000-8000-000000000301",
+        "kindRaw": "custom",
+        "name": "Part 1",
+        "patternID": "yt:pat-reference-oompah",
+        "repeats": 1
+      }
+    ]
+  },
+  "beatsPerChord": 4,
+  "chordNames": [
+    "C",
+    "G",
+    "Am",
+    "F"
+  ],
+  "id": "yt:bAnDeD00Pah:hard",
+  "mode": "major",
+  "patternID": "yt:pat-reference-oompah",
+  "patterns": [
+    {
+      "id": "yt:pat-reference-oompah",
+      "name": "Part 1 strum",
+      "strokes": [
+        {
+          "accent": true,
+          "band": "low",
+          "beat": 0.0,
+          "direction": "down",
+          "id": "4A1E6C2E-0000-4000-8000-000000000311",
+          "msOffset": 0
+        },
+        {
+          "accent": false,
+          "band": "mid",
+          "beat": 1.0,
+          "direction": "down",
+          "id": "4A1E6C2E-0000-4000-8000-000000000312",
+          "msOffset": 0
+        },
+        {
+          "accent": false,
+          "band": "low",
+          "beat": 2.0,
+          "direction": "down",
+          "id": "4A1E6C2E-0000-4000-8000-000000000313",
+          "msOffset": 0
+        },
+        {
+          "accent": false,
+          "band": "mid",
+          "beat": 3.0,
+          "direction": "down",
+          "id": "4A1E6C2E-0000-4000-8000-000000000314",
+          "msOffset": 0
+        }
+      ],
+      "tags": [
+        "yt",
+        "extracted",
+        "directions-by-convention",
+        "banded"
+      ],
+      "tempo": 100,
+      "timeSignature": "4/4"
+    }
+  ],
+  "progressions": [],
+  "repeats": 1,
+  "tempo": 100,
+  "timeSignature": "4/4",
+  "title": "Oom-Pah",
+  "tonic": "C",
+  "version": 2
+}

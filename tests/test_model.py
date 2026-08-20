@@ -569,6 +569,45 @@ def test_grooves_that_are_genuinely_different_are_not_merged():
     assert merged["B"].pattern.id == offbeats.pattern.id
 
 
+def test_a_verse_in_halves_and_a_chorus_in_eighths_are_two_grooves():
+    """Jaccard between a groove and a strict superset of it is just the ratio of
+    their sizes, so a groove of exactly half the density scores exactly 0.5 and
+    used to clear the threshold by rounding. Half notes against quarters and
+    quarters against eighths both measured 0.500 and both merged — and that pair
+    is not one groove measured twice, it is the same groove at half and double
+    time, which is the main dynamic contrast most guitar arrangements have."""
+    from app.analysis.model import _consolidate
+    from app.analysis.strumming import extract
+
+    halves = extract([(bar, p, 1.0) for bar in range(16) for p in (0.0, 2.0)],
+                     bar_beats=4.0, bars=16, tempo=120, name="Verse strum")
+    eighths = extract([(bar, p, 1.0) for bar in range(16) for p in
+                       (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)],
+                      bar_beats=4.0, bars=16, tempo=120, name="Chorus strum")
+
+    merged = _consolidate({"A": halves, "B": eighths}, {"A": 32, "B": 32})
+    assert merged["B"].pattern.id == eighths.pattern.id
+    assert merged["A"].pattern.id == halves.pattern.id
+
+
+def test_grooves_of_comparable_density_still_merge():
+    """The density guard is about doubling, not about shape. The campfire
+    pattern against straight eighths is 6 strokes to 8 — the merge the measured
+    threshold was tuned to make, and it still happens."""
+    from app.analysis.model import _consolidate
+    from app.analysis.strumming import extract
+
+    campfire = extract([(bar, p, 1.0) for bar in range(16) for p in
+                        (0.0, 1.0, 1.5, 2.5, 3.0, 3.5)],
+                       bar_beats=4.0, bars=16, tempo=120, name="Verse strum")
+    eighths = extract([(bar, p, 1.0) for bar in range(16) for p in
+                       (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)],
+                      bar_beats=4.0, bars=16, tempo=120, name="Chorus strum")
+
+    merged = _consolidate({"A": campfire, "B": eighths}, {"A": 32, "B": 8})
+    assert merged["B"].pattern.id == campfire.pattern.id
+
+
 # --- the reported defect, end to end -----------------------------------------
 
 def test_a_four_chord_song_heard_with_variants_charts_as_four_chords():

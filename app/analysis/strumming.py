@@ -10,8 +10,20 @@ in every emitted pattern's `tags`:
 | onset positions | yes | fold this section's onsets onto one bar of the grid |
 | subdivision (8ths vs 16ths) | yes | quantize onsets modulo the bar; keep the coarsest grid they sit on |
 | accent | roughly | onset strength against the bar's own mean |
+| **band (bass/chordal)** | yes | which frequency band the attack arrived in |
 | **direction (down/up)** | **no — convention** | the alternating-hand rule, below |
 | mute / percussive | not in a full mix | **never emitted** |
+
+**The band is the one dimension here that is instrument-neutral *and* measured**
+(§14.1), and it is worth saying why it earns a place beside direction, which is
+neither. You cannot hear which way a hand moved, but you can absolutely hear
+whether the bass moved on its own — a root on the beat and a chord off it are
+separated by an octave and a half, and a band split finds them. So the extraction
+says *what was struck*, in bands, and leaves *who struck it* to whichever
+instrument the player picked: a guitar reads a low-only stroke as a bass note
+(boom-chick), a piano reads it as the left hand. Neither reading is taken here,
+and that is deliberate — one analysis has to serve both, because the catalog is
+shared and a song is analyzed once.
 
 **Direction is a convention, not a measurement.** You cannot hear which way a
 hand moved in a mixed recording. §14 states the rule as "an onset on a beat is a
@@ -22,6 +34,17 @@ subdivisions are down and the odd ones are up. On an 8th grid that gives D on th
 beat and U on the "&"; on a 16th grid it gives D-U-D-U, with the 'e' and 'a' as
 ups — exactly §14's parenthetical. It is also *correct* far more often than not,
 because that is how the instrument is physically played.
+
+That reading is a rule about **grid cells**, and it holds only where the grid is
+a *duple* division of the beat — there the hand crosses the strings once per cell
+whether or not the cell is struck, which is precisely why the "&" of a bar of
+16ths is a downstroke. On a **triple** grid there is no such pendulum: three
+cells cannot be walked by a hand alternating at a fixed rate, so cell parity made
+a shuffle — the beat and the "let", the commonest triple feel there is — come out
+Down-Down, which no one has ever played or taught. Under a triple subdivision the
+strokes therefore alternate over what is actually *sounded*, restarting downward
+on each beat. `direction_for` is the cell rule; `directions_for` is the one the
+extraction calls, and it picks between them.
 
 **Don't over-fit.** Campfire draws the pattern as direction triangles under the
 bar and the player strums through it. A 16-onset syncopated transcription of a
@@ -60,7 +83,7 @@ from typing import NamedTuple
 
 from ..payload import PATTERN_PREFIX, PatternPayload, Stroke, derived_uuid
 from .axis import position_in
-from .types import Onset
+from .types import FULL, LOW, MID, Onset
 
 log = logging.getLogger("chords.strumming")
 
@@ -213,6 +236,27 @@ SOLID_SUPPORT = 0.9
 
 DOWN, UP = "down", "up"
 
+# What share of a cell's onsets have to agree that a band was struck before the
+# cell claims that band was there (§14.1).
+#
+# It gates **presence**, not exclusivity, which is the opposite of how it reads
+# and is why the first value here was wrong. Raising it does not make the labels
+# more cautious — it makes it harder for *both* bands to be claimed, so the first
+# thing a high threshold destroys is `FULL`, and a plain strum starts coming back
+# as chord-only. Measured across the specimens, as the labels the bar emits:
+#
+#     majority   oom-pah              folk strum
+#     0.50       full mid low mid     one stroke mid, rest full
+#     0.67       low  mid low mid     one stroke mid, rest full
+#     0.75       low  mid low mid     three strokes mid
+#
+# Two thirds is where the oom-pah's own downbeat stops being masked by the
+# previous bar still ringing under it, and it is still well short of where a
+# strum starts losing its bass. The stray `mid` both of the lower values leave on
+# a strummed bar is not fixed here at all — see `_hands_apart`, which is the rule
+# that actually answers it.
+BAND_MAJORITY = 2.0 / 3.0
+
 # Tags every emitted pattern carries, so nobody downstream — or in six months —
 # mistakes the direction assignment for detection.
 CONVENTION_TAGS = ["yt", "extracted", "directions-by-convention"]
@@ -223,28 +267,52 @@ CONVENTION_TAGS = ["yt", "extracted", "directions-by-convention"]
 # side, and named the same way on purpose.
 SNAPPED_TAG = "snapped-to-idiom"
 
+class Idiom(NamedTuple):
+    """One strum from the library, and optionally how it is fingered.
+
+    `directions` exists because the pendulum rule below is a rule about *grid
+    cells*, and a named idiom is allowed to know better than the grid it happens
+    to land on. "6/8 in two" is the specimen: its two strokes are the dotted-
+    quarter pulses of a bar counted in two, both of them main beats and both
+    played downward, but they sit on cells 0 and 3 of a 2-per-beat grid, and the
+    pendulum reads cell 3 as an offbeat and hands back an upstroke. Nothing in
+    the grid can see the difference — only the name can.
+
+    Left None for every entry the pendulum already fingers correctly, which is
+    most of them: an idiom that is a plain subdivision of the beat *is* the case
+    the pendulum was written for, and duplicating its answer here would be one
+    more thing to keep in step.
+    """
+
+    name: str
+    positions: tuple[float, ...]
+    directions: tuple[str, ...] | None = None
+
+
 # The strums people actually play, in bar-local quarter-note beats, keyed by the
 # bar's length. Small and deliberately unambitious: this is a *vocabulary*, not a
 # generator, and its job is to catch an extraction that came within one cell of
 # something idiomatic — not to have an entry for every groove in the world.
-IDIOMS: dict[float, tuple[tuple[str, tuple[float, ...]], ...]] = {
+IDIOMS: dict[float, tuple[Idiom, ...]] = {
     4.0: (
-        ("half notes", (0.0, 2.0)),
-        ("quarters", (0.0, 1.0, 2.0, 3.0)),
-        ("the campfire pattern", (0.0, 1.0, 1.5, 2.5, 3.0, 3.5)),
-        ("offbeats", (0.5, 1.5, 2.5, 3.5)),
-        ("eighths", (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)),
+        Idiom("half notes", (0.0, 2.0)),
+        Idiom("quarters", (0.0, 1.0, 2.0, 3.0)),
+        Idiom("the campfire pattern", (0.0, 1.0, 1.5, 2.5, 3.0, 3.5)),
+        Idiom("offbeats", (0.5, 1.5, 2.5, 3.5)),
+        Idiom("eighths", (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)),
     ),
     3.0: (
-        ("dotted half", (0.0,)),
-        ("waltz quarters", (0.0, 1.0, 2.0)),
-        ("waltz eighths", (0.0, 0.5, 1.0, 1.5, 2.0, 2.5)),
-        ("6/8 in two", (0.0, 1.5)),
+        Idiom("dotted half", (0.0,)),
+        Idiom("waltz quarters", (0.0, 1.0, 2.0)),
+        Idiom("waltz eighths", (0.0, 0.5, 1.0, 1.5, 2.0, 2.5)),
+        # Both strokes are the bar's own pulses, so both are downstrokes — see
+        # `Idiom.directions`.
+        Idiom("6/8 in two", (0.0, 1.5), (DOWN, DOWN)),
     ),
     2.0: (
-        ("halves", (0.0,)),
-        ("quarters", (0.0, 1.0)),
-        ("eighths", (0.0, 0.5, 1.0, 1.5)),
+        Idiom("halves", (0.0,)),
+        Idiom("quarters", (0.0, 1.0)),
+        Idiom("eighths", (0.0, 0.5, 1.0, 1.5)),
     ),
 }
 
@@ -294,6 +362,7 @@ class FoldedOnset(NamedTuple):
     bar: int
     position: float     # bar-local, in quarter-note beats
     strength: float
+    band: str = FULL
 
 
 class _Cell(NamedTuple):
@@ -309,6 +378,10 @@ class _Cell(NamedTuple):
     support: float
     strength: float
     prominence: float
+    # Which band(s) this cell was struck in, across the bars that struck it — the
+    # majority verdict of its onsets (`_band_of`). `FULL` for a cell whose
+    # onsets disagree, which is the honest answer and also the harmless one.
+    band: str = FULL
 
 
 @dataclass(frozen=True)
@@ -371,7 +444,8 @@ def fold_onsets(onsets: list[Onset], axis, *, bar_beats: float,
             bar += 1
         if bar >= bar_limit:
             continue
-        folded.append(FoldedOnset(bar=bar, position=local, strength=onset.strength))
+        folded.append(FoldedOnset(bar=bar, position=local, strength=onset.strength,
+                                  band=onset.band))
     return folded
 
 
@@ -432,10 +506,60 @@ def direction_for(position: float, subdivision: int) -> str:
 
     Strokes alternate from each beat: even subdivisions within the beat are down,
     odd ones are up. This is a **convention**, not a measurement.
+
+    Correct on its own only for a **duple** grid, where the hand really does
+    cross the strings once per cell whether or not the cell is struck. On a
+    triple grid it is not, and `directions_for` — which is what `extract` calls —
+    handles that case instead of this one.
     """
     within_beat = position - int(position)
     cell = round(within_beat * subdivision)
     return DOWN if cell % 2 == 0 else UP
+
+
+def directions_for(positions: list[float], subdivision: int) -> list[str]:
+    """Directions for a whole bar of strokes, which is the only scale at which
+    the question is answerable.
+
+    **A duple grid keeps the pendulum**, and it has to. There the hand crosses
+    the strings once per cell regardless of whether that cell is struck, so a
+    stroke's direction is a property of *where it is* and its neighbours cannot
+    change it. That is exactly what makes the "&" of a bar of 16ths a
+    **downstroke** — 1 e & a is D-U-D-U — and any rule that alternated over the
+    sounded strokes instead would call it an upstroke and be wrong. This is also
+    why `extract` re-reads the subdivision off the strokes it kept before asking:
+    the pendulum's answer is only as good as the grid it is swinging on.
+
+    **A triple grid has no such pendulum**, and this is the bug that was here.
+    Under `subdivision == 3` the cells of a beat are 0, 1, 2, and parity makes
+    cell 2 a downstroke — so a **shuffle**, the beat and the "let" and nothing in
+    between, came out Down-Down. That is the single most common triple feel there
+    is (blues, 12/8 ballads, anything swung) and it is played, taught and
+    notated Down-Up; the hand cannot make two downstrokes in a row at tempo
+    without a wasted pass through the strings. The reason parity fails is that a
+    triplet's three cells cannot be walked by a hand alternating at a fixed rate
+    — one of the three has to be taken in the same direction as its neighbour,
+    and which one depends on which cells are *played*.
+
+    So on a triple grid the strokes alternate over what is actually sounded,
+    restarting downward on every beat. That gives D-U for the shuffle, D-U-D for
+    a full triplet (which is what parity gave too, and is right), and D for a
+    beat struck alone — and the restart is what keeps the hand coming back down
+    on the beat, which is the part of the convention nobody argues about.
+    """
+    if subdivision % 2 == 0:
+        return [direction_for(position, subdivision) for position in positions]
+
+    out = [DOWN] * len(positions)
+    struck_in_beat: dict[int, int] = {}
+    for index in sorted(range(len(positions)), key=lambda i: positions[i]):
+        # Via the grid cell rather than the raw float, so a position carrying a
+        # rounding hair below the beat is still counted into that beat.
+        beat = int(round(positions[index] * subdivision)) // subdivision
+        rank = struck_in_beat.get(beat, 0)
+        struck_in_beat[beat] = rank + 1
+        out[index] = DOWN if rank % 2 == 0 else UP
+    return out
 
 
 def extract(onsets_in_bar: list[FoldedOnset], *, bar_beats: float, bars: int,
@@ -477,7 +601,15 @@ def extract(onsets_in_bar: list[FoldedOnset], *, bar_beats: float, bars: int,
         strength = sum(o.strength for o in matched) / len(matched) if matched else 0.0
         relative = strength / mean_onset_strength if mean_onset_strength else 0.0
         scored.append(_Cell(position=position, support=support, strength=strength,
-                            prominence=support * relative))
+                            prominence=support * relative,
+                            band=_band_of(matched)))
+
+    # Before anything reads a band: if this bar has no two hands in it, it has no
+    # bands either (`_hands_apart`). Applied here rather than at the end so that
+    # `_with_contrast`'s per-band reference collapses back to the bar-wide peak
+    # too — an unsplit bar takes the identical path it took before §14.1.
+    if not _hands_apart(scored):
+        scored = [c._replace(band=FULL) for c in scored]
 
     kept = _with_contrast(scored)
     if not _is_a_pattern(kept):
@@ -486,7 +618,7 @@ def extract(onsets_in_bar: list[FoldedOnset], *, bar_beats: float, bars: int,
         return fallback(bar_beats=bar_beats, tempo=tempo, name=name,
                         time_signature=time_signature)
 
-    kept, snapped = snap_to_idiom(kept, bar_beats=bar_beats, scored=scored)
+    kept, snapped, fingering = snap_to_idiom(kept, bar_beats=bar_beats, scored=scored)
 
     # Re-read the grid off the strokes that survived, because that is the grid
     # the pattern is actually on and `direction_for` reads directions from it.
@@ -496,14 +628,27 @@ def extract(onsets_in_bar: list[FoldedOnset], *, bar_beats: float, bars: int,
     # the other side.
     subdivision = choose_subdivision([c.position for c in kept])
 
+    # The library's fingering when the snap supplied one, the convention
+    # otherwise — and only when it fits, so a stale entry can never hand out
+    # more or fewer directions than there are strokes.
+    if fingering and len(fingering) == len(kept):
+        directions = list(fingering)
+    else:
+        directions = directions_for([c.position for c in kept], subdivision)
+
     mean_strength = sum(c.strength for c in kept) / len(kept)
     strokes = [
         Stroke(
             beat=round(c.position, 4),
-            direction=direction_for(c.position, subdivision),
+            direction=direction,
             accent=c.strength >= mean_strength * ACCENT_RATIO,
+            # Only ever `low` or `mid` on the wire. `FULL` is both the commonest
+            # answer and the one that asks the client for nothing, so it travels
+            # as an absent field — which also keeps every song that is simply
+            # strummed byte-identical to what this module emitted before §14.1.
+            band=c.band if c.band in (LOW, MID) else None,
         )
-        for c in kept
+        for c, direction in zip(kept, directions)
     ]
     # Confidence is the mean support of the strokes we kept: how reliably this
     # bar's shape actually repeated across the section.
@@ -548,21 +693,105 @@ def _with_contrast(scored: list[_Cell]) -> list[_Cell]:
     See `SPARSE_GRID_SHARE` for why the condition is sparsity and not loudness:
     a hi-hat and a real upstroke overlap on loudness, so there is no threshold
     that separates them, and they do not overlap on this at all.
+
+    **Contrast is measured within a band** (§14.1), and it has to be, because the
+    rule above compares a cell against the loudest thing in the bar and a bass
+    note is quieter than the chord over it. Measured on the synthetic oom-pah — a
+    root octave on beats 1 and 3, a right hand on 2 and 4 — judging every cell
+    against one bar-wide peak deleted *both bass strokes* and emitted the two
+    chord stabs as the whole pattern. That is the correct answer to "which cells
+    are loudest" and the wrong answer to "what was played", and it would have
+    handed a piano an accompaniment with no left hand in it.
+
+    So a cell's reference is the loudest cell **that was struck in the same band
+    as it**: a bass note competes with the other bass notes, a chord stab with
+    the other chord stabs. On a recording where nothing is labelled — which is
+    every strummed song, and every specimen this rule was tuned against — all
+    cells share one band and the reference is the bar's peak exactly as before,
+    so this generalizes the rule without moving it.
+
+    The cost is real and worth naming: a band with only one cell in it is its own
+    reference and therefore always clears contrast, leaving `SUPPORT_THRESHOLD`
+    as the only gate on it. That is the right trade here — support still demands
+    the player struck it in half the bars, and the alternative is the measured
+    failure above — but it is why this reads the band a cell *has* rather than
+    trying to infer one.
     """
     if not scored:
         return []
-    peak = max(c.strength for c in scored)
     empty = sum(1 for c in scored if c.support < SUPPORT_THRESHOLD)
     sparse = empty >= max(1, round(SPARSE_GRID_SHARE * len(scored)))
+    peaks: dict[str, float] = {}
+    for cell in scored:
+        peaks[cell.band] = max(peaks.get(cell.band, 0.0), cell.strength)
     kept = [c for c in scored
             if c.support >= SUPPORT_THRESHOLD
-            and (sparse or c.strength >= peak * CONTRAST_RATIO)]
+            and (sparse or c.strength >= peaks[c.band] * CONTRAST_RATIO)]
 
     budget = max(1, int(round(MAX_STROKES_PER_BEAT * _beats_in(scored))))
     if len(kept) > budget:
         kept = sorted(sorted(kept, key=lambda c: c.position),
                       key=lambda c: (-c.prominence, -_metrical_weight(c.position)))[:budget]
     return sorted(kept, key=lambda c: c.position)
+
+
+def _hands_apart(scored: list[_Cell]) -> bool:
+    """Whether this bar genuinely has two hands in it (§14.1).
+
+    **A `MID` label means nothing without a `LOW` somewhere to mean it against.**
+    A song whose bass is simply quiet, or buried, produces bar after bar of
+    chord-band-only strokes — and read literally that says "this accompaniment
+    has no left hand", which is not something any recording has ever meant. It is
+    the one systematic error the band split makes on ordinary strummed material,
+    and no threshold fixes it, because on those bars the measurement is not
+    ambiguous — it is confidently reporting a fact about the mix rather than
+    about the playing.
+
+    So a bar's labels survive only when the bar actually splits: something was
+    struck in the bass band alone, and something else was not. Otherwise every
+    cell is `FULL` and the rest of this module runs exactly as it did before
+    §14.1 existed — same contrast reference, same strokes, same content-addressed
+    id. That last property is worth the rule on its own: it means a strummed song
+    cannot change because bands were added.
+
+    Read off the *supported* cells only. An empty cell has no onsets and so no
+    band, and letting a grid position nobody struck vote on whether the player
+    has two hands would decide it by how fine the grid happened to be.
+    """
+    supported = [c for c in scored if c.support >= SUPPORT_THRESHOLD]
+    return (any(c.band == LOW for c in supported)
+            and any(c.band != LOW for c in supported))
+
+
+def _band_of(matched: list[FoldedOnset]) -> str:
+    """The band(s) a cell was struck in, from the onsets that landed on it.
+
+    Each onset is read as the *set* of bands it moved — `LOW` and `MID` name one,
+    `FULL` names both — and a band belongs to the cell when a majority of its
+    onsets moved it. That framing is what makes the three labels combine sanely:
+    a cell struck by a bass note in every bar and by the whole band in one is
+    still a bass stroke, and a cell where half the bars caught the bass and half
+    did not is `FULL`, because it genuinely is both.
+
+    Bars, not onsets, would be the stricter denominator — `support` counts that
+    way for a reason. It is not used here because a cell's onsets have already
+    been reduced to one per bar in every case that matters, and because the
+    failure this would guard against (one bar with a flam voting twice) changes a
+    label rather than the existence of a stroke.
+    """
+    if not matched:
+        return FULL
+    low = sum(1 for o in matched if o.band in (LOW, FULL))
+    mid = sum(1 for o in matched if o.band in (MID, FULL))
+    threshold = len(matched) * BAND_MAJORITY
+    has_low, has_mid = low > threshold, mid > threshold
+    if has_low and has_mid:
+        return FULL
+    if has_low:
+        return LOW
+    if has_mid:
+        return MID
+    return FULL
 
 
 def _beats_in(scored: list[_Cell]) -> float:
@@ -591,7 +820,8 @@ def _metrical_weight(position: float) -> float:
 
 
 def snap_to_idiom(kept: list[_Cell], *, bar_beats: float,
-                  scored: list[_Cell] | None = None) -> tuple[list[_Cell], bool]:
+                  scored: list[_Cell] | None = None,
+                  ) -> tuple[list[_Cell], bool, tuple[str, ...] | None]:
     """Pull an extraction onto the nearest strum people actually play (§14).
 
     The direct answer to "patterns should be more musical". The chord side
@@ -610,24 +840,30 @@ def snap_to_idiom(kept: list[_Cell], *, bar_beats: float,
     """
     library = IDIOMS.get(round(bar_beats, 3))
     if not library or not kept:
-        return kept, False
+        return kept, False, None
 
     positions = [c.position for c in kept]
-    best_name, best_positions, best_score = "", (), 0.0
-    for name, candidate in library:
+    best_idiom, best_score = None, 0.0
+    for idiom in library:
+        candidate = idiom.positions
         if not _supportable(candidate, kept, scored or kept, bar_beats):
             continue
         score = stroke_similarity(positions, candidate)
         # Ties go to the sparser entry: "don't over-fit" applies to the library
         # exactly as it applies to the grid.
-        if (score, -len(candidate)) > (best_score, -len(best_positions)):
-            best_name, best_positions, best_score = name, candidate, score
+        if (score, -len(candidate)) > (best_score,
+                                       -len(best_idiom.positions) if best_idiom else 0):
+            best_idiom, best_score = idiom, score
 
-    if best_score < SNAP_SIMILARITY:
-        return kept, False
+    if best_idiom is None or best_score < SNAP_SIMILARITY:
+        return kept, False, None
+    best_positions = best_idiom.positions
     if best_score >= 1.0 and len(positions) == len(best_positions):
-        return kept, False              # already idiomatic; nothing to snap
-    log.info("strum snapped to %s (%.2f similar): %s → %s", best_name, best_score,
+        # Already idiomatic, so the positions need no correction — but the
+        # fingering still can, since nothing before this point has consulted the
+        # library and the pendulum has already had its say.
+        return kept, False, best_idiom.directions
+    log.info("strum snapped to %s (%.2f similar): %s → %s", best_idiom.name, best_score,
              [round(p, 3) for p in positions], list(best_positions))
 
     mean_support = sum(c.support for c in kept) / len(kept)
@@ -641,8 +877,13 @@ def snap_to_idiom(kept: list[_Cell], *, bar_beats: float,
             support=source.support if near else mean_support,
             strength=source.strength if near else mean_strength,
             prominence=source.prominence if near else 0.0,
+            # A stroke the library *added* was not played, so nothing was measured
+            # about its register and it must not inherit a neighbour's: `FULL` is
+            # the "no claim" value. A stroke that merely moved by a cell keeps what
+            # its own onsets said.
+            band=source.band if near else FULL,
         ))
-    return snapped, True
+    return snapped, True, best_idiom.directions
 
 
 def _supportable(candidate: tuple[float, ...], kept: list[_Cell],
@@ -723,8 +964,17 @@ def _pattern(strokes: list[Stroke], *, time_signature: str, tempo: int, name: st
     strokes are unchanged" — held by construction rather than by bookkeeping.
     Mo's `grid.py` does the same thing for the same reason.
     """
+    # The register joins the fingerprint **only when a stroke has one**, so every
+    # pattern that predates §14.1 — and every ordinary strummed song, which emits
+    # no registers at all — hashes to exactly the id it hashed to before. Two
+    # grooves that differ only in which hand plays them are genuinely different
+    # grooves, though, and content-addressing has to see that or §12.5's promise
+    # ("an unchanged groove keeps its id") quietly becomes "a groove we happened
+    # to hash the same".
     body = f"{time_signature}|" + ";".join(
-        f"{s.beat:.4f},{s.direction},{int(s.accent)}" for s in strokes
+        f"{s.beat:.4f},{s.direction},{int(s.accent)}"
+        + (f",{s.band}" if s.band else "")
+        for s in strokes
     )
     fingerprint = hashlib.sha1(body.encode("utf-8")).hexdigest()[:12]
     pattern_id = f"{PATTERN_PREFIX}{fingerprint}"

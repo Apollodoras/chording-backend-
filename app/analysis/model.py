@@ -59,6 +59,27 @@ log = logging.getLogger("chords.model")
 # start collapsing together.
 GROOVE_SIMILARITY = 0.5
 
+# ...and a groove may not swallow one at half its density, however similar
+# Jaccard says they are.
+#
+# The threshold above is a measurement and is left where it was. What it cannot
+# see is *which* pairs sit on it, and one whole family does: when one groove's
+# strokes are a strict subset of another's, Jaccard is just the ratio of their
+# sizes, so a groove of exactly half the density scores exactly 0.5 and clears
+# the bar by rounding. Measured, that is half notes against quarters (0.500) and
+# quarters against straight eighths (0.500) — both merged, and neither is one
+# groove measured twice. They are the same groove at half and double time, which
+# in this repertoire is not a detail: a verse strummed in halves opening into a
+# chorus in driving eighths is *the* dynamic contrast most guitar arrangements
+# have, and consolidating it told the player the song had one strum throughout.
+#
+# So density is a second, independent question, asked the way the ear asks it —
+# how many strokes are in the bar — and a candidate at or below half the anchor's
+# stroke count is a different groove whatever its positions overlap. Pairs that
+# are merely *shaped* differently are untouched: the campfire pattern against
+# eighths is 6 strokes to 8, and still merges.
+GROOVE_DENSITY_RATIO = 0.5
+
 # The **bound** on §21's fixed-point loop, not the number of rounds it takes. Each
 # round canonicalizes the current groups and then re-finds them, and `form.detect`
 # re-derives the period and the phase to do it — so the blocks it comes back with
@@ -659,10 +680,25 @@ def _consolidate(patterns: dict[str, ExtractedPattern],
             if other in claimed:
                 continue
             candidate = [s.beat for s in patterns[other].pattern.strokes]
+            if not _same_density(anchor, candidate):
+                continue
             if stroke_similarity(anchor, candidate) >= GROOVE_SIMILARITY:
                 out[other] = patterns[label]
                 claimed.add(other)
     return out
+
+
+def _same_density(anchor: list[float], candidate: list[float]) -> bool:
+    """Whether two grooves put comparably many strokes in the bar.
+
+    The half-time/double-time guard — see `GROOVE_DENSITY_RATIO`. Asked before
+    the similarity so that a groove of half the density is never merged on a
+    score it only reaches *because* it is half the density.
+    """
+    if not anchor or not candidate:
+        return False
+    fewer, more = sorted((len(anchor), len(candidate)))
+    return fewer / more > GROOVE_DENSITY_RATIO
 
 
 def _rename_shared_grooves(patterns: dict[str, ExtractedPattern],

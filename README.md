@@ -19,7 +19,7 @@ mirrors deliberately — §16).
 
 **Working end to end, in the deployed shape, and now measured on the thing that
 actually matters.** A YouTube id (or an uploaded file) goes in; a linted
-`CompositionPayload` v2 and a `videoSync` sidecar come out. 745 tests, green, no
+`CompositionPayload` v2 and a `videoSync` sidecar come out. 764 tests, green, no
 audio and no network required to run them.
 
 That last clause is new and it was the important one. Every number this repo
@@ -31,6 +31,47 @@ engines so any error had to be the pipeline's own, the answer was **0.768** — 
 23-point loss before any engine had made a mistake, on charts that all linted
 clean and all shipped a sidecar. It is **0.939** now. See
 [Measuring the deliverable](#measuring-the-deliverable-not-the-engine).
+
+### The accompaniment's two hands (§14.1)
+
+A piano accompaniment is a left hand and a right hand doing different things on
+different beats. The app now has a piano in it, so the analysis had to stop
+describing every song as if a hand were sweeping six strings.
+
+It turned out to be a small change, because **the extraction was already
+instrument-neutral**: onset positions, subdivision and accent are facts about the
+song's rhythm. Exactly one emitted field was guitar-shaped — `direction` — and
+§14 has always said that one is a convention rather than a measurement. What was
+missing was a dimension nobody was reading: **which band the attack arrived in.**
+A bass note and the chord over it are an octave and a half apart, and a split at
+250 Hz finds them.
+
+So a stroke can now say `low` or `mid`; saying neither means both, and travels as
+an absent field. The client decides what that *means* — a `low` stroke is a bass
+note to a guitar and a left hand to a piano — which matters because the catalog is
+shared and **a song is analyzed once**. A piano-specific analysis would double
+every song and fragment the catalog by instrument.
+
+Three constants were measured, not chosen, against a new `oom-pah` specimen in
+`bench/synth.py` (every previous specimen strums a chord, so none of them could
+ask this question):
+
+- the split is **250 Hz** — at 320 a third of the chord's energy reads as bass, at
+  180 a strum starts reading as chord-only;
+- presence is judged **per band against that band's own typical attack**, not as a
+  ratio between the two. The ratio test is the obvious rule and it is wrong: it
+  labels every ordinary strum `mid`, because a chord voiced from E3 up really does
+  put most of its energy above the split;
+- **a bar's bands survive only if the bar actually splits.** `mid` means nothing
+  without a `low` to mean it against, and a song whose bass is merely quiet would
+  otherwise report that it has no left hand.
+
+Finding it also surfaced a defect in §14 proper: contrast compared every cell
+against the loudest cell **in the bar**, which deletes a bass note quieter than
+the chord over it. On the oom-pah that emitted the two chord stabs as the entire
+pattern. Contrast is measured within a band now; on unbanded material the two are
+the same number, so nothing about a strummed song moved — including its
+content-addressed id, which a test pins against the pre-§14.1 hash.
 
 The rights posture — what is stored, what is not, which Chordify surfaces are
 deliberately not cloned, and the two rules the **client** repo has to keep so
@@ -45,6 +86,7 @@ App Review 5.2.3 stays a non-event — is [`RIGHTS.md`](RIGHTS.md).
 | §5.5 difficulty tiers | ⛔ **removed** — the chart states what was played ([below](#the-chart-states-what-was-played-55-withdrawn)) |
 | §15 sections | ✅ superseded by §20.3 — fuzzy, global, phase-aligned repeat groups |
 | §14 strumming patterns | ✅ fold/histogram/convention + quarter-note fallback, pooled per repeat group (§20.4) |
+| §14.1 bands (bass vs chordal) | ✅ per-onset band split at 250 Hz → `Stroke.band`, so one analysis serves a strummed guitar **and** a tapped piano ([below](#the-accompaniments-two-hands-141)) |
 | §13 `videoSync` sidecar | ✅ beat anchors + the §13.2 invariant, enforced by lint — **shipped on every song from a recording** ([§13.3 amended](#every-song-plays-with-its-recording-133-amended)) |
 | §16 API | ✅ Mo-shaped: Firebase bearer, `{message, code}` errors, job-id + poll |
 | §16.5 contract fixtures | ✅ emitted and byte-stable; the app-side test is a small follow-up (below) |

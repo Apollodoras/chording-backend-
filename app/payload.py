@@ -136,6 +136,13 @@ def bar_beats(time_signature: str) -> float | None:
     return n * 4.0 / d
 
 
+# The bands a stroke may claim (§14.1). `None` — the field absent — is the
+# third state and the default: "both bands, or nobody looked". It is spelled as
+# an absent field rather than as "full" so that a song which is simply strummed
+# serializes to exactly the bytes it did before registers existed.
+STROKE_BANDS = ("low", "mid")
+
+
 class Stroke(BaseModel):
     id: str = Field(default_factory=new_uuid)
     beat: float
@@ -143,6 +150,11 @@ class Stroke(BaseModel):
     accent: bool = False
     msOffset: int = 0
     strings: Optional[list[int]] = None
+    # Which band of the recording this stroke's attack arrived in (§14.1) — the
+    # instrument-neutral half of an accompaniment. The app turns it into a hand:
+    # a guitar plays a `low` stroke as its bass note, a piano as its left hand.
+    # Absent means both bands moved, which is what a strum is.
+    band: Optional[str] = None
 
 
 class ChordSpan(BaseModel):

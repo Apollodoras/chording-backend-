@@ -12,14 +12,17 @@ from __future__ import annotations
 from app.analysis.strumming import (
     CONVENTION_TAGS,
     SNAPPED_TAG,
+    FoldedOnset,
+    _band_of,
     beat_position,
     choose_subdivision,
     direction_for,
+    directions_for,
     extract,
     fallback,
     fold_onsets,
 )
-from app.analysis.types import Onset
+from app.analysis.types import FULL, LOW, MID, Onset
 from app.chords import MAJOR  # noqa: F401  (keeps the import surface honest)
 from tests.conftest import (
     BAR_BEATS,
@@ -407,3 +410,184 @@ def test_a_quiet_hi_hat_is_still_cut_on_a_grid_where_everything_is_struck():
         "every cell of the grid carries an onset — support cannot discriminate"
     result = extract(saturated, bar_beats=BAR_BEATS, bars=16, tempo=120, name="x")
     assert [s.beat for s in result.pattern.strokes] == DDUUDU
+
+
+# --- the convention on a triple grid ----------------------------------------
+#
+# The rule above is a rule about *grid cells*, and it is right on a duple grid
+# because the hand really does cross the strings once per cell there whether or
+# not the cell is struck. A triple grid has no such pendulum, and reading parity
+# off it produced a shuffle strummed Down-Down.
+
+def test_a_shuffle_is_down_up_and_not_down_down():
+    """The single most common triple feel there is — the beat and the "let",
+    nothing in between — and every chart in the world notates it D-U. Parity over
+    a 3-cell beat makes cell 2 a downstroke and got this exactly wrong; the hand
+    cannot take two downstrokes in a row at tempo without a wasted pass."""
+    shuffle = [0.0, 2 / 3, 1.0, 1 + 2 / 3, 2.0, 2 + 2 / 3, 3.0, 3 + 2 / 3]
+    assert directions_for(shuffle, 3) == ["down", "up"] * 4
+
+
+def test_a_full_triplet_is_down_up_down():
+    """Three strokes to the beat leaves the hand where it started, so the next
+    beat is a downstroke again. Parity happened to get this one right and the
+    alternation has to keep getting it right."""
+    assert directions_for([0.0, 1 / 3, 2 / 3], 3) == ["down", "up", "down"]
+    assert directions_for([0.0, 1 / 3, 2 / 3, 1.0], 3)[-1] == "down"
+
+
+def test_a_triple_grid_restarts_downward_on_every_beat():
+    """The half of the convention nobody argues about: whatever happened inside
+    the last beat, the hand comes back down on the next one."""
+    assert directions_for([0.0, 1.0, 2.0, 3.0], 3) == ["down"] * 4
+
+
+def test_a_duple_grid_still_answers_from_the_grid_and_not_the_neighbours():
+    """The pendulum is not replaced, and must not be. On a 16th grid the "&" is
+    a *downstroke* — 1 e & a is D-U-D-U — so a bar holding only 1, & and a is
+    D-D-U. Alternating over the sounded strokes instead would call the "&" an
+    upstroke, which is the bug this rule exists to avoid."""
+    assert directions_for([0.0, 0.5, 0.75], 4) == ["down", "down", "up"]
+    assert directions_for([0.0, 0.5, 1.0, 1.5], 2) == ["down", "up", "down", "up"]
+    assert directions_for(list(DDUUDU), 2) == ["down", "down", "up", "up", "down", "up"]
+
+
+def test_six_eight_in_two_is_two_downstrokes():
+    """Both strokes are the bar's own dotted-quarter pulses — main beats, both
+    played downward. They sit on cells 0 and 3 of a 2-per-beat grid, where the
+    pendulum reads cell 3 as an offbeat and hands back an upstroke; nothing in
+    the grid can see the difference, so the idiom carries its own fingering."""
+    onsets = [FoldedOnset(bar=bar, position=position, strength=1.0)
+              for bar in range(12) for position in (0.0, 1.5)]
+    result = extract(onsets, bar_beats=3.0, bars=12, tempo=90, name="Verse",
+                     time_signature="6/8")
+    assert [(s.beat, s.direction) for s in result.pattern.strokes] == [
+        (0.0, "down"), (1.5, "down"),
+    ]
+
+
+# --- §14.1 bands: what was struck, in which half of the spectrum -------------
+#
+# The band is the one dimension of an accompaniment that is both measurable and
+# instrument-neutral, so these tests are about two separate claims and keep them
+# separate: that a bar with two hands in it comes out with two hands, and that a
+# bar with one comes out **exactly** as it did before bands existed.
+
+def _banded_onsets(layout: dict[float, str], *, bars: int = 8,
+                   strengths: dict[str, float] | None = None) -> list[Onset]:
+    """`bars` bars of one accompaniment: {bar-local beat: band}.
+
+    The default strengths are the shape that matters — the bass quieter than the
+    chord over it, which is what a left hand actually is and what a bar-wide
+    contrast test throws away.
+    """
+    levels = strengths or {LOW: 0.5, MID: 1.0, FULL: 1.0}
+    out: list[Onset] = []
+    for bar in range(bars):
+        start = bar * BAR_BEATS * MS_PER_BEAT
+        for offset, band in layout.items():
+            out.append(Onset(t_ms=int(start + offset * MS_PER_BEAT),
+                             strength=levels[band], band=band))
+    return sorted(out, key=lambda o: o.t_ms)
+
+
+def _extract(onsets, *, bars: int = 8, name: str = "Verse"):
+    folded = fold_onsets(onsets, known_beats(), bar_beats=BAR_BEATS,
+                         first_beat=0, last_beat=bars * BAR_BEATS)
+    return extract(folded, bar_beats=BAR_BEATS, bars=bars, tempo=120, name=name)
+
+
+def test_a_band_is_claimed_only_when_two_thirds_of_the_onsets_agree():
+    """`BAND_MAJORITY` gates *presence*, so it is what decides `FULL` too."""
+    low_only = [FoldedOnset(bar=b, position=0.0, strength=1.0, band=LOW) for b in range(9)]
+    assert _band_of(low_only) == LOW
+    # Six of nine bars caught the bass alone, three caught the whole band: two
+    # thirds exactly is not *more* than two thirds, so the chord band is not
+    # claimed and this stays a bass stroke.
+    mixed = ([FoldedOnset(bar=b, position=0.0, strength=1.0, band=LOW) for b in range(6)]
+             + [FoldedOnset(bar=b, position=0.0, strength=1.0, band=FULL) for b in range(6, 9)])
+    assert _band_of(mixed) == LOW
+    assert _band_of([]) == FULL
+
+
+def test_a_full_onset_is_evidence_for_both_bands():
+    """`FULL` means both bands moved, so it has to vote in both tallies — a cell
+    struck by the whole band every bar is not a bass stroke and not a chord
+    stroke, it is both."""
+    every_bar = [FoldedOnset(bar=b, position=0.0, strength=1.0, band=FULL)
+                 for b in range(8)]
+    assert _band_of(every_bar) == FULL
+
+
+def test_folding_carries_the_band_from_the_onset():
+    onsets = _banded_onsets({0.0: LOW, 1.0: MID})
+    folded = fold_onsets(onsets, known_beats(), bar_beats=BAR_BEATS,
+                         first_beat=0, last_beat=32)
+    assert {round(f.position, 3): f.band for f in folded} == {0.0: LOW, 1.0: MID}
+
+
+def test_an_oom_pah_extracts_as_a_bass_and_a_chord():
+    """§14.1's specimen: a root on 1 and 3, a chord on 2 and 4 — the shape of
+    nearly every piano accompaniment there is."""
+    result = _extract(_banded_onsets({0.0: LOW, 1.0: MID, 2.0: LOW, 3.0: MID}))
+    assert not result.is_fallback
+    assert [(s.beat, s.band) for s in result.pattern.strokes] == [
+        (0.0, LOW), (1.0, MID), (2.0, LOW), (3.0, MID)
+    ]
+
+
+def test_a_quiet_bass_stroke_survives_beside_a_loud_chord():
+    """Contrast is measured **within** a band (`_with_contrast`).
+
+    Against one bar-wide peak the bass strokes here are less than half the
+    loudness of the chord over them, so the rule that separates a hand from a
+    hi-hat deletes them and the pattern comes back as the two chord stabs — the
+    measured failure that made contrast band-relative in the first place.
+    """
+    quiet_bass = _banded_onsets({0.0: LOW, 1.0: MID, 2.0: LOW, 3.0: MID},
+                                strengths={LOW: 0.3, MID: 1.0, FULL: 1.0})
+    beats = [s.beat for s in _extract(quiet_bass).pattern.strokes]
+    assert beats == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_a_strummed_bar_emits_no_bands_at_all():
+    """The commonest case, and the one that must not move: every stroke covers
+    the whole spectrum, so nothing is claimed and the wire stays as it was."""
+    result = _extract(_banded_onsets({0.0: FULL, 1.0: FULL, 2.0: FULL, 3.0: FULL}))
+    assert [s.band for s in result.pattern.strokes] == [None, None, None, None]
+
+
+def test_chord_band_labels_collapse_without_a_bass_to_mean_them_against():
+    """`_hands_apart` — a bar of chord-band-only strokes is a song whose bass is
+    quiet, not a song played with no left hand, and the honest label for every
+    one of its strokes is "the whole range"."""
+    result = _extract(_banded_onsets({0.0: MID, 1.0: MID, 2.0: MID, 3.0: MID}))
+    assert [s.band for s in result.pattern.strokes] == [None, None, None, None]
+
+
+def test_an_unbanded_pattern_keeps_the_id_it_had_before_bands_existed():
+    """§12.5 — a groove that has not changed keeps its id.
+
+    Bands join the content-addressed fingerprint only when a stroke carries one,
+    so every song analyzed before §14.1 and every song that is simply strummed
+    hashes to exactly what it hashed to. The literal is the point: if this test
+    has to be updated, every cached song in the catalog has been invalidated.
+
+    The literal is not a copy of what the code currently prints — that would pin
+    the behaviour to itself and pass no matter what. It is sha1 of the body the
+    fingerprint had *before* bands existed, computed from the old formula:
+
+        "4/4|0.0000,down,0;1.0000,down,0;2.0000,down,0;3.0000,down,0"
+    """
+    result = _extract(_banded_onsets({0.0: FULL, 1.0: FULL, 2.0: FULL, 3.0: FULL}))
+    assert result.pattern.id == "yt:pat-8b3c163231b9"
+
+
+def test_two_grooves_that_differ_only_in_hand_get_different_ids():
+    """...and the other half of §12.5: a groove that *has* changed must not keep
+    it. Same beats, same directions, different hands — different music."""
+    strummed = _extract(_banded_onsets({0.0: FULL, 1.0: FULL, 2.0: FULL, 3.0: FULL}))
+    oom_pah = _extract(_banded_onsets({0.0: LOW, 1.0: MID, 2.0: LOW, 3.0: MID}))
+    assert [s.beat for s in strummed.pattern.strokes] == \
+        [s.beat for s in oom_pah.pattern.strokes]
+    assert strummed.pattern.id != oom_pah.pattern.id

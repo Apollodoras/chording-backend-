@@ -291,3 +291,104 @@ def test_repeats_of_one_chord_do_not_vote():
                             confidence=0.9) for i in range(40)]
     meter = reconcile(grid(2), flicker)
     assert meter.phase_shift == 0
+
+
+# --- the meter moves the bar lines, or it does not move ---------------------
+#
+# Relabelling `bar_beats` while leaving the tracker's downbeats where they were
+# is not a smaller intervention than moving both. It is a broken one: every bar
+# then holds the wrong number of beats and `axis` resamples all of them, so the
+# whole song is quantized against a grid running at the ratio of the two meters.
+
+def in_two(count: int = 64, *, confidence: float = 0.4) -> BeatGrid:
+    """A genuine 2/4 — cut time, a march, a polka — tracked correctly, but with
+    the low confidence that invites the harmony's second opinion."""
+    all_beats = beats(count)
+    return BeatGrid(
+        beats_ms=all_beats, downbeats_ms=all_beats[::2],
+        bpm=120.0, confidence=confidence, time_signature="2/4",
+    )
+
+
+def changes_every(n_beats: int, *, bars: int = 24) -> list[RawChordSpan]:
+    names = ["C", "G", "Am", "F"]
+    span = n_beats * BEAT_MS
+    return [RawChordSpan(start_ms=i * span, end_ms=(i + 1) * span,
+                         label=names[i % len(names)])
+            for i in range(bars)]
+
+
+def test_a_tracked_two_four_is_not_overruled_by_evidence_that_agrees_with_it():
+    """The tracker's own meter used to be absent from the candidate list, so its
+    score was read as 0.0 and any candidate clearing the margin beat it by
+    default. A 2/4 song changes chord every second beat, which lands half its
+    changes on residue 0 of a 4-beat bar and hands meter 4 a free 0.5."""
+    meter = reconcile(in_two(), changes_every(2))
+    assert meter.bar_beats == 2
+    assert meter.time_signature == "2/4"
+    assert meter.meter_source == "tracker"
+
+
+def test_an_arbitrated_meter_takes_the_bar_lines_with_it():
+    """A waltz mis-tracked as 4/4: the harmony says three, and the downbeats
+    have to become three-beat bars. Leaving them at four gave an axis beat of
+    667 ms on a 500 ms song."""
+    all_beats = beats(96)
+    tracked = BeatGrid(beats_ms=all_beats, downbeats_ms=all_beats[::4],
+                       bpm=120.0, confidence=0.4, time_signature="4/4")
+    meter = reconcile(tracked, changes_every(3, bars=30))
+
+    assert meter.bar_beats == 3
+    assert meter.meter_source == "harmony"
+    downbeats = meter.grid.downbeats_ms
+    gaps = {b - a for a, b in zip(downbeats, downbeats[1:])}
+    assert gaps == {3 * BEAT_MS}, "the bar lines must be three beats apart, not four"
+
+
+def test_an_arbitrated_meter_leaves_the_axis_on_the_recordings_own_beat():
+    """The failure the rebuild exists to prevent, asserted where it was visible:
+    the beats the chart is quantized against are the beats the tracker found,
+    not a resampling of them."""
+    from app.analysis.axis import build_axis
+
+    all_beats = beats(96)
+    tracked = BeatGrid(beats_ms=all_beats, downbeats_ms=all_beats[::4],
+                       bpm=120.0, confidence=0.4, time_signature="4/4")
+    axis = build_axis(reconcile(tracked, changes_every(3, bars=30)).grid)
+
+    assert axis is not None
+    assert axis.times_ms[:6] == all_beats[:6]
+
+
+def test_the_reported_meter_always_matches_the_bar_lines_it_ships_with():
+    """The invariant all three of these defects broke, stated once.
+
+    `bar_beats` and the downbeat spacing are two halves of one claim. Whenever
+    they disagree `axis` resamples every bar in the song, and the chart is
+    quantized against a grid running at the ratio between them — silently, since
+    both `lint` and `lint_sync` check the song against itself and a uniformly
+    stretched chart is perfectly self-consistent. This asserts the halves agree
+    across every meter the tracker can hand over, including the ones it cannot
+    chart."""
+    for tracked_bar, signature, change_every in [
+        (2, "2/4", 2),      # cut time, overruled by evidence that agreed with it
+        (3, "3/4", 3),
+        (4, "4/4", 4),
+        (5, "5/4", 5),      # unchartable, and not ours to renumber
+        (8, "8/4", 4),      # a 4/4 song whose downbeats fired every other bar
+    ]:
+        all_beats = beats(96)
+        raw = [RawChordSpan(start_ms=i * change_every * BEAT_MS,
+                            end_ms=(i + 1) * change_every * BEAT_MS,
+                            label=["C:maj", "G:maj", "A:min", "F:maj"][i % 4])
+               for i in range(96 // change_every)]
+        tracked = BeatGrid(beats_ms=all_beats, downbeats_ms=all_beats[::tracked_bar],
+                           bpm=120.0, confidence=0.0, time_signature=signature)
+
+        meter = reconcile(tracked, raw)
+        downbeats = meter.grid.downbeats_ms
+        gaps = {b - a for a, b in zip(downbeats, downbeats[1:])}
+        assert gaps == {meter.bar_beats * BEAT_MS}, (
+            f"{signature}: reported {meter.bar_beats} beats to the bar but shipped "
+            f"bar lines {gaps} apart"
+        )

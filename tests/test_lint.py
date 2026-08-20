@@ -231,3 +231,30 @@ def test_a_bar_rhythm_serializes_as_swifts_enum_union():
     assert bars[0]["rhythm"] == {"inherit": {}}
     assert bars[1]["rhythm"] == {"pattern": {"_0": "yt:pat-test"}}
     assert bars[2]["rhythm"]["custom"]["_0"][0]["beat"] == 0.0
+
+
+# --- §14.1 bands -------------------------------------------------------------
+
+def _with_band(band):
+    return song(patterns=[PatternPayload(
+        id="yt:pat-test", name="Test strum", timeSignature="4/4", tempo=120,
+        strokes=[Stroke(id="s1", beat=0.0, band=band), Stroke(id="s2", beat=2.0)],
+    )])
+
+
+def test_a_stroke_may_name_the_band_it_was_struck_in():
+    for band in ("low", "mid"):
+        assert not any("band" in p for p in lint(_with_band(band))), band
+
+
+def test_a_stroke_with_an_invented_band_is_caught():
+    assert any("has band" in p for p in lint(_with_band("bass")))
+
+
+def test_full_is_not_a_transmissible_band():
+    """`FULL` is a real answer and an absent field is how it travels (§14.1).
+
+    Saying it out loud would be a claim the client has no rule for — and, worse,
+    would change the bytes of every strummed song for no information at all.
+    """
+    assert any("has band" in p for p in lint(_with_band("full")))

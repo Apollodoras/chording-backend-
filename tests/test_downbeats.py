@@ -22,6 +22,7 @@ The first two must be repaired. The third must survive.
 from __future__ import annotations
 
 from app.analysis.adapters.beat_this_tracker import _meter as beat_this_meter
+from app.analysis.adapters.beat_this_tracker import _representable
 from app.analysis.downbeats import repair
 from app.analysis.model import build
 from app.analysis.types import BeatGrid
@@ -244,3 +245,33 @@ def test_the_repair_is_reported_on_the_model():
     assert model.meter.downbeats.dropped == 1
     assert model.meter.downbeats.inserted == 1
     assert model.meter.downbeats.ran
+
+
+# --- what the adapter is allowed to call a meter ----------------------------
+#
+# `modal_bar_beats` is unbounded on purpose: the repair needs the grid's *true*
+# mode to know which bars are irregular. The adapter has no such need, and used
+# to pass whatever it got straight through as the song's time signature.
+
+def test_a_bar_length_this_service_cannot_chart_is_not_reported_confidently():
+    """Nothing downstream refuses "13/4": `lint` parses any `n/4` and `axis`
+    lays thirteen-beat bars. What such a grid must not be is *confident*, so the
+    agreement goes to zero and `meter.reconcile` gets the deciding vote."""
+    for unrepresentable in (5, 7, 8, 9, 11, 13):
+        assert _representable(unrepresentable, 0.9) == (unrepresentable, 0.0)
+
+
+def test_an_unchartable_meter_is_never_renumbered_in_place():
+    """The tempting fix — round the mode down to 4 — is the defect
+    `meter._rebuild_downbeats` exists to prevent, arriving one stage earlier.
+    The reported meter and the downbeat spacing are two halves of one claim, and
+    this function holds only one of them, so it may not contradict the other:
+    relabelling a 5-beat grid as 4/4 put the song on a 625 ms beat over a 500 ms
+    recording."""
+    assert _representable(5, 0.9)[0] == 5, "the number is the grid's, not ours to move"
+    assert _representable(8, 0.9)[0] == 8
+
+
+def test_the_meters_this_service_can_chart_pass_through_untouched():
+    for good in (2, 3, 4, 6):
+        assert _representable(good, 0.87) == (good, 0.87)

@@ -569,6 +569,7 @@ per-string picking (the field exists; don't use it), no swing parameter.
 | **Onset positions** | Yes | onset detection (`librosa.onset`, or madmom's) folded onto the beat grid |
 | **Subdivision** (8ths vs 16ths) | Yes | quantize onsets modulo the bar; pick the coarsest grid they sit on |
 | **Accent** | Roughly | onset strength relative to the bar's mean |
+| **Band** (bass vs chordal) | **Yes** | split the onset envelope at 250 Hz — see §14.1 |
 | **Direction (down/up)** | **No — infer by convention** | see below |
 | **Mute / percussive** | Not reliably in a full mix | **don't emit `mute`** |
 
@@ -610,6 +611,89 @@ the player strums through it; a 16-onset syncopated transcription of a strummed
 acoustic is less playable — and less *true to the song* — than the D-DU-UD-U everyone
 actually plays. Per-bar variation exists in the model (`bars[].rhythm.custom`) but
 should be the exception.
+
+### 14.1 Bands — the accompaniment's two hands (2026-08-19)
+
+**The ask.** The app grew a second instrument: a piano, played by tapping rather
+than strumming (`ROSETTA_GP.md` §3.3). A piano accompaniment is not a strum — it
+is a **left hand and a right hand doing different things on different beats**, and
+the owner's direction is that the analysis should serve that rather than assume a
+guitar.
+
+**What actually changes, and it is smaller than it sounds.** Everything §14 above
+extracts is already instrument-neutral: onset positions, subdivision, accent are
+facts about the *song's* rhythm, not about a guitar. Exactly one field in the
+emitted pattern is guitar-shaped — `direction` — and §14 already says it is a
+convention rather than a measurement. So this is not a second extraction: it is
+the same one, told to stop throwing away a dimension it was already measuring
+over.
+
+**The dimension is the band.** A bass note and a chord over it are separated by an
+octave and a half, and a band split finds them where no amount of processing can
+find which way a hand moved. Each detected attack is labelled:
+
+| `band` | Meaning |
+|---|---|
+| `low` | the attack is in the bass band alone |
+| `mid` | in the chordal band alone |
+| *absent* | both — a strum, a block chord, or nothing was decided |
+
+`Stroke.band` carries it. **Only `low` and `mid` go on the wire**; "both" travels
+as an absent field, so a song that is simply strummed serializes to exactly the
+bytes it did before this existed, and its content-addressed id (§12.5) is
+unchanged. The lint rejects any other value, including a literal `"full"`.
+
+**The reading belongs to the client, not here.** A `low` stroke is a bass note to
+a guitar (boom-chick, the `bass` stroke kind the app has always had and the
+analysis has never once emitted) and a left hand to a piano. The backend says
+what was struck; the app says who struck it. That split is not tidiness — **the
+catalog is shared and a song is analyzed once**, so one payload has to serve both
+instruments or the catalog fragments by instrument and every song is analyzed
+twice.
+
+**Three things were measured rather than chosen** (`bench/synth.py` gained an
+`oom-pah` specimen — a root octave on 1 and 3, a right hand on 2 and 4 — because
+every previous specimen strums a chord and so could not ask this question at all):
+
+- **The split is 250 Hz.** At 320 a third of the chord's energy arrives as bass;
+  at 180 an ordinary strum starts reading as chord-only.
+- **Presence is judged per band, against that band's own typical attack** — not
+  as a ratio between the two. The ratio test separates a bass note from a chord
+  stab beautifully *and* labels every ordinary strum `mid`, because a chord voiced
+  from E3 up genuinely puts most of its energy above the split. A rule that calls
+  a plain strum right-hand-only would hand a piano a song with no bass in it.
+- **A bar's bands survive only if the bar actually splits** — something in the
+  bass band alone, and something else not. `mid` means nothing without a `low` to
+  mean it against: a song whose bass is merely quiet would otherwise report that
+  it has no left hand. This is also what makes the whole feature a no-op on
+  strummed material, including the contrast rule.
+
+**One dependency fell out of it, and it is the interesting part.** §14's contrast
+rule compares every cell against the loudest cell in the bar — which deletes a
+bass note that is quieter than the chord over it. Measured on the oom-pah, that
+rule emitted *the two chord stabs as the whole pattern* and dropped both bass
+strokes. Contrast is now measured **within a band**. On unbanded material every
+cell shares one band and the reference is the bar's peak exactly as before, so
+the rule generalizes without moving.
+
+**The client half landed 2026-08-19** (app `ROSETTA_GP.md` §3.4), so the field is no
+longer inert: `StrokeBand` is parsed tolerantly (an unknown value reads as both hands),
+each voicer marks which of *its* notes are the low band, and the compiler joins the two
+by equality — a guitar plays a `low` stroke as its bass string, a piano as its
+left-hand octave, and its audio engine releases per hand so a right-hand stab leaves
+the bass ringing. `tests/fixtures/valid/banded-oom-pah.json` is a banded payload for
+the app's own contract test, which asserts the chart **splits into hands** rather than
+merely that the field decoded. Emitting it left every existing fixture byte-identical,
+which is this section's back-compat claim proved rather than asserted.
+
+**Not done, and blocked here rather than skipped:** carrying the *actual bass
+pitch* (slash chords — `C/G`), which would be the other half of a real left hand.
+`app/chords.py` discards the slash bass deliberately, and the 2026-08-18 audit
+already considered keeping inversions (F34) and declined: **the app's chord
+grammar has no field for a bass note** and voices every chord from its root, so a
+bass emitted here is a chord the client cannot parse. That one needs a client
+change first (`ChordSymbol` gains a bass), and the loss stays counted in
+`exactRatio` rather than papered over.
 
 ---
 

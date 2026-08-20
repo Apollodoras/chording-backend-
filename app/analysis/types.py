@@ -70,6 +70,17 @@ class BeatGrid:
         return len(self.beats_ms) >= 2 and len(self.downbeats_ms) >= 2
 
 
+# The three bands an attack can be labelled with (§14.1). Deliberately a
+# fact about the recording — which band the energy arrived in — and not an
+# interpretation of it: "the bass moved here" is measurable, "the left hand
+# played here" is a reading of that measurement, and the reading belongs to
+# whichever instrument the player chose in the app.
+LOW = "low"         # the attack is in the bass band alone
+MID = "mid"         # in the chordal band alone
+FULL = "full"       # in both — a strum, a block chord, or an unlabelled onset
+BANDS = (LOW, MID, FULL)
+
+
 @dataclass(frozen=True)
 class Onset:
     """A detected attack — the raw material of strumming-pattern extraction (§14).
@@ -77,10 +88,23 @@ class Onset:
     ``strength`` is relative within the track (a normalized onset-envelope peak),
     not an absolute level: accent is decided by comparing a stroke against its own
     bar's mean, so only the ordering has to be meaningful.
+
+    ``band`` is which frequency band the attack arrived in (§14.1). It is the
+    one dimension of an accompaniment that is genuinely instrument-neutral *and*
+    genuinely recoverable: a bass note and a chord stab are separable in a mix in
+    a way that a downstroke and an upstroke are not. A guitar reads it as
+    bass-note-versus-strum (boom-chick); a piano reads it as left hand versus
+    right. Neither reading is stored here.
+
+    It defaults to ``FULL`` so that an onset nobody labelled behaves exactly as
+    every onset did before this existed — one undifferentiated attack — and so a
+    detector that cannot split bands is a supported configuration rather than a
+    broken one.
     """
 
     t_ms: int
     strength: float = 1.0
+    band: str = FULL
 
 
 @dataclass(frozen=True)

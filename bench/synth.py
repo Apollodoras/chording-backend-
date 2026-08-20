@@ -79,6 +79,18 @@ class Spec:
     # dominant pattern: one groove per repeat group is §14's design, and a
     # turnaround is variation on the section's pattern rather than a second one.
     vary: tuple[int, tuple[float, ...]] | None = None
+    # Positions where a **bass note alone** is struck — the left hand of a real
+    # accompaniment, and the only thing in this generator that puts two different
+    # registers on two different beats.
+    #
+    # It exists for §14.1. Every other specimen here strums a chord, which covers
+    # the whole spectrum at once, so a band split measured on them can only ever
+    # answer "is a strum a strum" — the interesting question, *can the bass be
+    # told apart from the chord over it*, has no specimen at all without this.
+    # When set, `pattern`'s strokes are voiced an octave higher (a right hand)
+    # and these get the root in C2–B2 plus its octave, so the two really are in
+    # different bands rather than nominally so.
+    bass: tuple[float, ...] = ()
     # 0…1, adds a drum kit at this level relative to the guitar. **The one thing
     # broadband hiss cannot stand in for.** Hiss raises the noise floor evenly, so
     # an onset detector still sees the guitar's attacks as the only peaks; a kit
@@ -101,6 +113,9 @@ class Truth:
     downbeats_ms: list[int] = field(default_factory=list)
     chords: list[dict] = field(default_factory=list)     # {startMs, endMs, name}
     onsets_ms: list[int] = field(default_factory=list)
+    # Which band each onset was played in, aligned with `onsets_ms` (§14.1):
+    # "low", "mid", or "full" for a stroke that covers both.
+    onset_bands: list[str] = field(default_factory=list)
     pattern_beats: list[float] = field(default_factory=list)
 
     def to_json(self) -> str:
@@ -141,7 +156,9 @@ def render(spec: Spec) -> tuple[list[float], Truth]:
 
     for bar_index, chord_name in enumerate(bars):
         bar_start_beat = bar_index * spec.bar_beats
-        notes = voice(chord_name, spec.octave_root)
+        # A left hand pushes the chord up into a right hand's register; without
+        # one the voicing stays where a guitar sits.
+        notes = voice(chord_name, spec.octave_root + (12 if spec.bass else 0))
         truth.chords.append({
             "startMs": int(bar_start_beat * seconds_per_beat * 1000),
             "endMs": int((bar_start_beat + spec.bar_beats) * seconds_per_beat * 1000),
@@ -156,8 +173,23 @@ def render(spec: Spec) -> tuple[list[float], Truth]:
             truth.onsets_ms.append(start_ms)
             # An upstroke rakes high-to-low, so its lowest string speaks last —
             # audible as a slightly later, slightly quieter attack.
+            truth.onset_bands.append("mid" if spec.bass else "full")
             upstroke = round((offset - int(offset)) * 2) % 2 == 1
             _pluck(buffer, notes, start_ms, seconds_per_beat, upstroke=upstroke)
+
+        # The left hand: the root in C2–B2 and the octave above it, struck alone.
+        # A fixed register rather than an interval below the chord, for the reason
+        # the app's own `PianoVoicer` fixes one — it is where a bass actually
+        # lives, and it keeps the whole octave under the band split whatever the
+        # chord's root happens to be.
+        for offset in spec.bass:
+            beat = bar_start_beat + offset
+            start_ms = int(beat * seconds_per_beat * 1000)
+            truth.onsets_ms.append(start_ms)
+            truth.onset_bands.append("low")
+            root = 36 + (min(notes) % 12)
+            _pluck(buffer, [root, root + 12], start_ms, seconds_per_beat,
+                   upstroke=False)
 
     _normalize(buffer)
     if spec.kit > 0:
@@ -355,6 +387,36 @@ SPECS = [
     Spec(name="folk-kit-human", chords=["G", "D", "Em", "C"], kit=0.5,
          pattern=(0.0, 1.0, 1.5, 2.5, 3.0),
          vary=(2, (0.0, 1.0, 2.5, 3.0, 3.5))),
+    # **A shuffle**, which until now this set could not ask about at all: every
+    # other specimen here divides the beat in two, so `choose_subdivision`'s
+    # triplet grid — and everything downstream that reads it — was measured on
+    # nothing. That gap is not hypothetical; it is how a shuffle came to be
+    # fingered Down-Down (see `strumming.directions_for`) behind a green bench.
+    #
+    # The beat and the "let", the commonest triple feel there is, and the strokes
+    # sit at thirds of a beat where a duple grid has nothing to offer them — so
+    # this is also the sharpest test that the subdivision vote picks 3 rather
+    # than quantizing a swung eighth onto a straight one.
+    Spec(name="shuffle-blues", chords=["A7", "D7", "A7", "E7"], tempo=92,
+         pattern=(0.0, 2 / 3, 1.0, 1 + 2 / 3, 2.0, 2 + 2 / 3, 3.0, 3 + 2 / 3)),
+    # ...and the same feel with a kit on it, for the reason the folk-kit pair
+    # exists: a swung ride pattern is the thing most likely to drag the vote back
+    # onto a straight grid.
+    Spec(name="shuffle-kit", chords=["A7", "D7", "A7", "E7"], tempo=92, kit=0.5,
+         pattern=(0.0, 2 / 3, 1.0, 1 + 2 / 3, 2.0, 2 + 2 / 3, 3.0, 3 + 2 / 3)),
+    # **The oom-pah** — a root on 1 and 3, a chord on 2 and 4. §14.1's specimen,
+    # and the shape of nearly every piano accompaniment ever written. Two things
+    # are being asked at once: that the band split labels the two apart, and that
+    # the extraction keeps the bass strokes at all — they are quieter than the
+    # chord over them, which is precisely what a bar-wide contrast test deletes
+    # (see `strumming._with_contrast`).
+    Spec(name="oom-pah", chords=["C", "Am", "F", "G"], tempo=112,
+         pattern=(1.0, 3.0), bass=(0.0, 2.0)),
+    # The same hands in 3/4, where the left plays the "one" and the right the two
+    # beats after it — the other accompaniment everyone knows, and a check that
+    # nothing here assumes four beats or an even split between the hands.
+    Spec(name="oom-pah-pah", chords=["C", "G", "Am", "F"], tempo=132,
+         bar_beats=3, pattern=(1.0, 2.0), bass=(0.0,)),
 ]
 
 
